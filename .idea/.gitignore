@@ -1,0 +1,8 @@
+.env
+*.pem
+*.key
+data/positions.json
+data/trade_log.json
+data/paper_trades.json
+__pycache__/
+*.pyc
