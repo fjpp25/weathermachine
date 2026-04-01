@@ -1,6 +1,6 @@
-# kalshi_weather
+# The Weather Machine
 
-A momentum + forecast-informed trading system for Kalshi temperature markets.
+A momentum + forecast-informed trading system designed for the daily Kalshi city temperature markets.
 
 ## Strategy overview
 
