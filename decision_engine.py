@@ -54,8 +54,10 @@ TRADE_WINDOW_START  = 9        # local hour (inclusive) — widened for testing
 TRADE_WINDOW_END    = 23       # local hour (exclusive) — widened for testing
 MAX_SPREAD          = 0.03     # max acceptable bid-ask spread ($)
 MIN_DEPTH           = 500      # min contracts on the side we're buying
-BOUNDARY_BUFFER     = 4.0      # °F — forecast must be this far inside bracket edges
-                               # tightened from 2.0 after NYC 76-77° lesson (Mar 31 2026)
+BOUNDARY_BUFFER     = 3.0      # °F — forecast must be this far inside bracket edges
+                               # 2.0 → too loose (NYC 76-77° loss, Mar 31 2026)
+                               # 4.0 → too strict (blocks ~67% of bracket range)
+                               # 3.0 → balanced starting point, revisit with backtest data
 
 # NO trade parameters
 NO_MAX_YES_PRICE    = 0.20     # only buy NO if YES is priced at or below this

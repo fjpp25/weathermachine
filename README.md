@@ -157,6 +157,7 @@ All key parameters are at the top of `decision_engine.py` and `trader.py`:
 | Date | Parameter | Old | New | Reason |
 |---|---|---|---|---|
 | 2026-03-31 | `BOUNDARY_BUFFER` | 2.0°F | 4.0°F | NYC 76–77° bracket loss — forecast sat at bracket edge |
+| 2026-04-01 | `BOUNDARY_BUFFER` | 4.0°F | 3.0°F | 4°F too strict — blocks ~67% of bracket range on 2°F brackets |
 | 2026-04-01 | `NO_MAX_ENTRY_PRICE` | $0.90 | $0.87 | Reconcile showed positions above $0.93 were fee-neutral |
 
 ---
