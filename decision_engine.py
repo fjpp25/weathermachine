@@ -52,7 +52,8 @@ import kalshi_scanner
 # Gate thresholds
 TRADE_WINDOW_START  = 9        # local hour (inclusive) — widened for testing
 TRADE_WINDOW_END    = 23       # local hour (exclusive) — widened for testing
-MAX_SPREAD          = 0.03     # max acceptable bid-ask spread ($)
+MAX_SPREAD          = 0.05     # max acceptable bid-ask spread ($)
+                               # relaxed from 0.03 — was blocking too many valid signals
 MIN_DEPTH           = 500      # min contracts on the side we're buying
 BOUNDARY_BUFFER     = 3.0      # °F — forecast must be this far inside bracket edges
                                # 2.0 → too loose (NYC 76-77° loss, Mar 31 2026)
@@ -65,6 +66,9 @@ NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_ENTRY_PRICE  = 0.87     # never pay more than this for a NO contract
                                # tightened from 0.90 — positions above this are
                                # often fee-neutral or worse after settlement
+NO_MAX_YES_PRICE    = 0.25     # re-introduced — never enter NO if YES is above this
+                               # must stay below NO_STOP_LOSS_YES_THRESHOLD (0.40)
+                               # prevents entering positions already near stop-loss boundary
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
                                # prevents carpet-bombing every bracket in a market
 
@@ -223,38 +227,63 @@ def evaluate_bracket(
         signal["skip_reason"] = f"Insufficient depth (yes={yes_depth}, no={no_depth})"
         return signal
 
-    # --- Gate 3: Boundary buffer (only for forecast bracket YES trades) ---
+    # --- Gate 3: Boundary buffer ---
+    # For YES trades: forecast must be inside the bracket by BOUNDARY_BUFFER°F
+    # For NO trades: bracket must not be adjacent to the forecast bracket
+    #   i.e. the bracket edge closest to the forecast must be >= BOUNDARY_BUFFER°F away
     if is_forecast_bracket:
         if not is_forecast_inside_boundary(bracket, forecast_high):
             signal["skip_reason"] = f"Forecast too close to bracket edge (buffer={BOUNDARY_BUFFER}°F)"
+            return signal
+    else:
+        # For NO trades, check that the nearest edge of this bracket is far enough
+        # from the corrected forecast — prevents entering brackets adjacent to forecast
+        corrected = forecast_high + FORECAST_BIAS_CORRECTION
+        floor = bracket.get("floor")
+        cap   = bracket.get("cap")
+        # Distance from forecast to the nearest bracket edge
+        distances = []
+        if floor is not None:
+            distances.append(abs(corrected - floor))
+        if cap is not None:
+            distances.append(abs(corrected - cap))
+        if distances and min(distances) < BOUNDARY_BUFFER:
+            signal["skip_reason"] = f"NO bracket too close to forecast (buffer={BOUNDARY_BUFFER}°F)"
             return signal
 
     # --- Signal scoring ---
     score = 0
     details = []
 
-    # +1 forecast signal
+    # +1 forecast signal (YES trades only — forecast points here)
     if is_forecast_bracket:
         score += 1
         details.append("forecast_match")
 
-    # +1 observed floor signal: if we've already seen temps that rule this bracket in or out
+    # +1 observed high signal
     if observed_high is not None:
         floor = bracket.get("floor")
         cap   = bracket.get("cap")
 
-        # For YES: observed high already in bracket or above floor = bullish
-        if is_forecast_bracket and floor is not None and observed_high >= floor:
-            score += 1
-            details.append("obs_floor_cleared")
-
-        # For NO: observed high already above cap = bracket is dead
-        if cap is not None and observed_high >= cap:
-            score += 1
-            details.append("obs_eliminates_bracket")
+        if is_forecast_bracket:
+            # YES trade: observed high already above bracket floor = bullish
+            if floor is not None and observed_high >= floor:
+                score += 1
+                details.append("obs_floor_cleared")
+        else:
+            # NO trade: observed high already above bracket cap = bracket is eliminated
+            # (temperature has passed the cap, so YES is impossible)
+            if cap is not None and observed_high >= cap:
+                score += 1
+                details.append("obs_eliminates_bracket")
+            # NO trade: observed high still well below bracket floor = bracket unlikely
+            # (temperature hasn't reached the floor with little time remaining)
+            elif floor is not None and observed_high < floor - BOUNDARY_BUFFER:
+                score += 1
+                details.append("obs_below_floor")
 
     # +1 momentum signal
-    candles = bracket.get("candles", [])
+    candles  = bracket.get("candles", [])
     momentum = score_momentum(candles)
     if momentum:
         score += 1
@@ -276,19 +305,19 @@ def evaluate_bracket(
 
     elif (
         not is_forecast_bracket
-        and yes_ask is not None
-        and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_ask is not None
         and no_ask <= NO_MAX_ENTRY_PRICE
+        and yes_ask is not None
+        and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
     ):
-        # NO trade: bracket is unlikely, collect premium
-        # Exit target: either hold to resolution ($1.00) or exit early
-        # if price moves 3-4 cents in our favor before resolution
+        # NO trade: bracket is far enough from forecast (enforced by boundary buffer above)
+        # and entry price is within acceptable range
+        # Exit: hold to resolution at $1.00, no take-profit needed
         signal["trade_type"]    = "NO"
         signal["entry_price"]   = no_ask
         signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
-        signal["stop_loss"]     = None   # NO trades held to resolution typically
+        signal["stop_loss"]     = None
 
     return signal
 

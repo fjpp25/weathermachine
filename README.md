@@ -153,15 +153,16 @@ All key parameters are at the top of `decision_engine.py` and `trader.py`:
 |---|---|---|---|
 | `TRADE_WINDOW_START` | decision_engine | 10 | Trading window open (local hour) |
 | `TRADE_WINDOW_END` | decision_engine | 14 | Trading window close (local hour) |
-| `BOUNDARY_BUFFER` | decision_engine | 4.0°F | Min distance from bracket edge |
+| `BOUNDARY_BUFFER` | decision_engine | 3.0°F | Min distance from bracket edge — applies to YES and NO trades |
 | `NO_MAX_ENTRY_PRICE` | decision_engine | $0.87 | Max price to pay for NO contract |
-| `NO_MAX_YES_PRICE` | decision_engine | $0.20 | Max YES price to trigger NO trade |
+| `NO_MIN_YES_PRICE` | decision_engine | $0.02 | Skip if YES is basically zero (bracket already dead) |
+| `NO_MAX_YES_PRICE` | decision_engine | $0.25 | Skip if YES is above this — prevents entering near stop-loss boundary |
 | `MAX_NO_PER_CITY` | decision_engine | 2 | Max NO positions per city per day |
+| `MAX_SPREAD` | decision_engine | $0.05 | Max bid-ask spread |
+| `MIN_DEPTH` | decision_engine | 500 | Min orderbook depth |
 | `FORECAST_BIAS_CORRECTION` | decision_engine | -1.0°F | NWS warm bias correction |
 | `NO_STOP_LOSS_YES_THRESHOLD` | trader | $0.40 | Cut NO if YES rises above this |
 | `BASE_CONTRACTS` | trader | 1 | Contracts per signal |
-| `MAX_SPREAD` | decision_engine | $0.03 | Max bid-ask spread |
-| `MIN_DEPTH` | decision_engine | 500 | Min orderbook depth |
 
 ---
 
@@ -172,6 +173,10 @@ All key parameters are at the top of `decision_engine.py` and `trader.py`:
 | 2026-03-31 | `BOUNDARY_BUFFER` | 2.0°F | 4.0°F | NYC 76–77° bracket loss — forecast sat at bracket edge |
 | 2026-04-01 | `BOUNDARY_BUFFER` | 4.0°F | 3.0°F | 4°F too strict — blocks ~67% of bracket range on 2°F brackets |
 | 2026-04-01 | `NO_MAX_ENTRY_PRICE` | $0.90 | $0.87 | Reconcile showed positions above $0.93 were fee-neutral |
+| 2026-04-01 | `MAX_SPREAD` | $0.03 | $0.05 | Too strict — blocking valid signals on Philadelphia and others |
+| 2026-04-01 | `BOUNDARY_BUFFER` | YES only | YES + NO | NO trades adjacent to forecast were entering dangerously close brackets |
+| 2026-04-01 | `NO_MAX_YES_PRICE` | $0.20 | removed | Replaced by distance-based boundary buffer on NO trades |
+| 2026-04-01 | `NO_MAX_YES_PRICE` | removed | $0.25 | Re-introduced — boundary buffer alone insufficient, need YES price cap below stop-loss threshold |
 
 ---
 
