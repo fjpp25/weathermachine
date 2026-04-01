@@ -65,6 +65,8 @@ NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_ENTRY_PRICE  = 0.87     # never pay more than this for a NO contract
                                # tightened from 0.90 — positions above this are
                                # often fee-neutral or worse after settlement
+MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
+                               # prevents carpet-bombing every bracket in a market
 
 # Exit targets
 YES_EXIT_TARGET     = 0.25     # take profit when YES price rises 25%
@@ -355,6 +357,36 @@ def evaluate_city(
         )
         if signal:
             result["signals"].append(signal)
+
+    # Limit NO signals to MAX_NO_PER_CITY, keeping those furthest from forecast
+    # Furthest = largest distance between forecast high and bracket midpoint
+    # This prioritises the safest, most clear-cut trades
+    no_signals = [s for s in result["signals"] if s.get("trade_type") == "NO"]
+    if len(no_signals) > MAX_NO_PER_CITY:
+        corrected_forecast = (forecast_high or 0) + FORECAST_BIAS_CORRECTION
+
+        def distance_from_forecast(signal):
+            floor = signal.get("floor")
+            cap   = signal.get("cap")
+            if floor is not None and cap is not None:
+                midpoint = (floor + cap) / 2
+            elif floor is not None:
+                midpoint = floor + 1
+            elif cap is not None:
+                midpoint = cap - 1
+            else:
+                midpoint = corrected_forecast
+            return abs(midpoint - corrected_forecast)
+
+        no_signals.sort(key=distance_from_forecast, reverse=True)
+        allowed_tickers = {s["ticker"] for s in no_signals[:MAX_NO_PER_CITY]}
+
+        # Mark excess NO signals as skipped
+        for signal in result["signals"]:
+            if (signal.get("trade_type") == "NO"
+                    and signal["ticker"] not in allowed_tickers):
+                signal["trade_type"] = None
+                signal["skip_reason"] = f"Exceeded MAX_NO_PER_CITY ({MAX_NO_PER_CITY})"
 
     return result
 
