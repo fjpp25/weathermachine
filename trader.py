@@ -61,16 +61,21 @@ POSITIONS_FILE  = Path("data/positions.json")
 TRADE_LOG_FILE  = Path("data/trade_log.json")
 
 # Max contracts per single order — hard safety cap
-MAX_CONTRACTS_PER_ORDER = 100
+MAX_CONTRACTS_PER_ORDER = 10
 
-# Default contracts per signal (will be sized by score later)
-BASE_CONTRACTS = 20
+# Default contracts per signal
+BASE_CONTRACTS = 1
 
 # Score-based position sizing multiplier
-SCORE_SIZING = {1: 0.5, 2: 1.0, 3: 1.5}
+# Kept flat at 1x for now — with a small account, size consistency matters more than scaling
+SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
 
 # Exit monitor poll interval (seconds)
 MONITOR_INTERVAL = 60
+
+# NO trade stop-loss: if the YES price on a bracket we hold NO on rises above
+# this threshold, the market is pricing it as likely — cut the loss and move on
+NO_STOP_LOSS_YES_THRESHOLD = 0.40
 
 
 # ---------------------------------------------------------------------------
@@ -371,12 +376,19 @@ def save_positions(positions: list[dict]):
 def record_entry(signal: dict, contracts: int, order_result: dict):
     """Add a new position to the local store after entry."""
     positions = load_positions()
+
+    # For NO trades: exit target is either the early-exit price or resolution ($1.00)
+    # Resolution is the natural exit — the early-exit target is just a bonus
+    trade_type  = signal["trade_type"].lower()
+    exit_target = signal["exit_target"] if trade_type == "yes" else 1.00
+
     positions.append({
         "id":           order_result.get("order", {}).get("client_order_id", "paper"),
         "ticker":       signal["ticker"],
-        "side":         signal["trade_type"].lower(),
+        "side":         trade_type,
         "entry_price":  signal["entry_price"],
-        "exit_target":  signal["exit_target"],
+        "exit_target":  exit_target,
+        "early_exit":   signal["exit_target"] if trade_type == "no" else None,
         "stop_loss":    signal.get("stop_loss"),
         "contracts":    contracts,
         "score":        signal["score"],
@@ -430,82 +442,100 @@ def log_trade(event: str, data: dict):
 
 def check_exits(client: KalshiClient, paper: bool = False):
     """
-    Check all open positions against current Kalshi prices.
-    Trigger exits when exit_target or stop_loss is hit.
+    Check all open positions and trigger exits where appropriate.
+
+    YES trades:
+      - Take profit when price rises YES_EXIT_TARGET% from entry
+      - Stop loss when price falls YES_STOP_LOSS% from entry
+
+    NO trades:
+      - Hold to resolution ($1.00) — no take-profit exit needed
+      - Stop loss if YES price rises above NO_STOP_LOSS_YES_THRESHOLD
+        (market is now pricing the bracket as likely — cut and move on)
     """
     positions = [p for p in load_positions() if p["status"] == "open"]
     if not positions:
         return
 
     for pos in positions:
-        ticker = pos["ticker"]
-        side   = pos["side"]
+        ticker      = pos["ticker"]
+        side        = pos["side"]
+        entry_price = pos["entry_price"]
+        contracts   = pos["contracts"]
 
         try:
-            # Get current market price
             market_data = requests.get(
                 f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
                 timeout=10,
             ).json().get("market", {})
 
-            if side == "yes":
-                current_price = float(market_data.get("yes_bid_dollars") or 0)
-            else:
-                current_price = float(market_data.get("no_bid_dollars") or 0)
+            yes_price = float(market_data.get("yes_bid_dollars") or 0)
+            no_price  = float(market_data.get("no_bid_dollars")  or 0)
 
-            entry_price  = pos["entry_price"]
-            exit_target  = pos["exit_target"]
-            stop_loss    = pos.get("stop_loss")
+        except Exception as e:
+            print(f"  Error fetching price for {ticker}: {e}")
+            continue
 
-            # Check exit target
-            if current_price >= exit_target:
-                print(f"  EXIT TARGET hit: {ticker} {side.upper()} "
-                      f"entry=${entry_price:.2f} current=${current_price:.2f} "
-                      f"target=${exit_target:.2f}")
-                if not paper:
-                    # Place market sell order (limit at best bid)
+        exit_reason  = None
+        exit_price   = None
+
+        if side == "yes":
+            current_price = yes_price
+            take_profit   = round(entry_price * (1 + YES_EXIT_TARGET), 2)
+            stop_loss     = round(entry_price * (1 - YES_STOP_LOSS),   2)
+
+            if current_price >= take_profit:
+                exit_reason = "take_profit"
+                exit_price  = current_price
+                print(f"  TAKE PROFIT: {ticker} YES "
+                      f"entry=${entry_price:.2f} → ${current_price:.2f} "
+                      f"(target was ${take_profit:.2f})")
+
+            elif current_price <= stop_loss:
+                exit_reason = "stop_loss"
+                exit_price  = current_price
+                print(f"  STOP LOSS: {ticker} YES "
+                      f"entry=${entry_price:.2f} → ${current_price:.2f} "
+                      f"(stop was ${stop_loss:.2f})")
+
+        else:  # NO trade
+            # Stop loss: exit if YES price has risen above threshold
+            # meaning the market now thinks this bracket is likely
+            if yes_price >= NO_STOP_LOSS_YES_THRESHOLD:
+                exit_reason = "no_stop_loss"
+                exit_price  = no_price   # sell NO at current NO bid
+                print(f"  NO STOP LOSS: {ticker} NO "
+                      f"YES price rose to ${yes_price:.2f} "
+                      f"(threshold ${NO_STOP_LOSS_YES_THRESHOLD:.2f}) — cutting loss")
+                print(f"    Entry=${entry_price:.2f} → Exit=${exit_price:.2f} "
+                      f"PnL=${round((exit_price - entry_price) * contracts, 2):+.2f}")
+
+        if exit_reason:
+            if not paper:
+                try:
                     place_order(
-                        client    = client,
-                        ticker    = ticker,
-                        side      = side,
-                        price_dollars = current_price,
-                        contracts = pos["contracts"],
-                        paper     = paper,
+                        client        = client,
+                        ticker        = ticker,
+                        side          = side,
+                        price_dollars = exit_price,
+                        contracts     = contracts,
+                        paper         = False,
                     )
-                record_exit(pos["id"], current_price, "exit_target")
-                log_trade("exit_target", {
-                    "ticker":        ticker,
-                    "side":          side,
-                    "entry_price":   entry_price,
-                    "exit_price":    current_price,
-                    "contracts":     pos["contracts"],
-                })
+                except Exception as e:
+                    print(f"  Exit order failed for {ticker}: {e}")
+                    continue
 
-            # Check stop loss (YES trades only — NO trades held to resolution)
-            elif stop_loss and current_price <= stop_loss:
-                print(f"  STOP LOSS hit: {ticker} {side.upper()} "
-                      f"entry=${entry_price:.2f} current=${current_price:.2f} "
-                      f"stop=${stop_loss:.2f}")
-                if not paper:
-                    place_order(
-                        client    = client,
-                        ticker    = ticker,
-                        side      = side,
-                        price_dollars = current_price,
-                        contracts = pos["contracts"],
-                        paper     = paper,
-                    )
-                record_exit(pos["id"], current_price, "stop_loss")
-                log_trade("stop_loss", {
+                record_exit(pos["id"], exit_price, exit_reason)
+                log_trade(exit_reason, {
                     "ticker":      ticker,
                     "side":        side,
                     "entry_price": entry_price,
-                    "exit_price":  current_price,
-                    "contracts":   pos["contracts"],
+                    "exit_price":  exit_price,
+                    "contracts":   contracts,
                 })
-
-        except Exception as e:
-            print(f"  Error checking exit for {ticker}: {e}")
+            else:
+                print(f"    [PAPER] Would exit {ticker} {side.upper()} "
+                      f"@ ${exit_price:.2f}  reason={exit_reason}")
 
         time.sleep(0.2)
 
@@ -522,6 +552,9 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     balance = get_balance(client)
     print(f"\n  Account balance: ${balance:.2f}")
 
+    # Build set of tickers we already hold open positions on — no duplicates
+    open_tickers = {p["ticker"] for p in load_positions() if p["status"] == "open"}
+
     executed = 0
     for ev in evaluations:
         city    = ev["city"]
@@ -533,9 +566,14 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             price     = signal["entry_price"]
             ticker    = signal["ticker"]
 
+            # Skip if we already hold this ticker
+            if ticker in open_tickers:
+                print(f"  Skipping {ticker} — already holding this position")
+                continue
+
             cost = price * contracts
-            if cost > balance * 0.15:   # never risk more than 15% of balance on one trade
-                print(f"  Skipping {ticker} — cost ${cost:.2f} exceeds 15% balance cap")
+            if cost > balance * 0.50:
+                print(f"  Skipping {ticker} — cost ${cost:.2f} exceeds 50% balance cap")
                 continue
 
             print(f"\n  Executing: {city} {ticker}")
@@ -552,6 +590,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     paper         = paper,
                 )
                 record_entry(signal, contracts, result)
+                open_tickers.add(ticker)   # prevent re-entry within same poll cycle
                 log_trade("entry", {
                     "city":        city,
                     "ticker":      ticker,
@@ -593,11 +632,16 @@ def display_positions():
         print(f"  {'Ticker':<30} {'Side':>5} {'Entry':>7} {'Target':>8} {'Qty':>5}")
         print(f"  {'-'*58}")
         for p in open_pos:
+            # For NO trades: target is $1.00 (resolution), show early exit if set
+            if p["side"] == "no" and p.get("early_exit"):
+                target_str = f"${p['exit_target']:.2f} (early: ${p['early_exit']:.2f})"
+            else:
+                target_str = f"${p['exit_target']:.2f}"
             print(
                 f"  {p['ticker']:<30} "
                 f"{p['side'].upper():>5} "
                 f"${p['entry_price']:.2f}  "
-                f"${p['exit_target']:.2f}   "
+                f"{target_str:<18} "
                 f"{p['contracts']:>5}"
             )
 

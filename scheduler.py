@@ -11,6 +11,11 @@ Interval schedule (per city local time):
   1pm–2pm      →  5 min  (approaching cutoff)
   After 2pm    → 10 min  (exit monitoring only)
 
+P&L registry:
+  pnl_registry.run() is called at the end of every poll cycle to keep
+  data/trades.csv and data/daily_summary.csv current throughout the day.
+  A full report is also printed to the terminal when the session ends.
+
 Usage:
   python scheduler.py                   # live, dynamic interval
   python scheduler.py --paper           # paper mode, no real orders
@@ -27,6 +32,7 @@ from pathlib import Path
 
 import trader
 import decision_engine
+import pnl_registry
 
 # ---------------------------------------------------------------------------
 # Config
@@ -45,7 +51,6 @@ CITY_TIMEZONES = {
     "Denver":        "America/Denver",
     "Philadelphia":  "America/New_York",
 }
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -122,8 +127,29 @@ def dynamic_interval(city_filter: str = None) -> int:
 
 
 def fmt_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    utc_now    = datetime.now(timezone.utc)
+    lisbon_now = utc_now.astimezone(ZoneInfo("Europe/Lisbon"))
+    return (f"{utc_now.strftime('%H:%M UTC')} "
+            f"/ {lisbon_now.strftime('%H:%M %Z')}")
 
+# ---------------------------------------------------------------------------
+# P&L registry refresh
+# ---------------------------------------------------------------------------
+
+def refresh_registry(label: str = ""):
+    """
+    Regenerate trades.csv and daily_summary.csv from current position data.
+    Errors are caught and printed so a registry failure never crashes the loop.
+    """
+    tag = f"  [{label}] " if label else "  "
+    try:
+        trade_rows, summary_rows = pnl_registry.run(verbose=False)
+        closed = sum(1 for r in trade_rows if True)   # all rows are closed trades
+        print(f"{tag}P&L registry updated — "
+              f"{len(trade_rows)} trades, {len(summary_rows)} days "
+              f"→ data/trades.csv, data/daily_summary.csv")
+    except Exception as e:
+        print(f"{tag}P&L registry error: {e}")
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -212,15 +238,28 @@ def run_scheduler(
 
         print(f"\n  Positions: {len(open_pos)} open | "
               f"{len(closed_pos)} closed | "
-              f"total PnL: ${total_pnl:+.2f}")
+              f"total gross P&L: ${total_pnl:+.2f}")
+
+        # ── Refresh P&L registry after every cycle ───────────────────────
+        refresh_registry(label=f"poll #{poll_count}")
 
         # ── Sleep ────────────────────────────────────────────────────────
         next_poll = datetime.now(timezone.utc) + timedelta(seconds=interval_secs)
         print(f"  Next poll: {next_poll.strftime('%H:%M UTC')}")
         time.sleep(interval_secs)
 
-    print(f"\n[{fmt_now()}] Scheduler finished.")
+    # ── End-of-day: full report ───────────────────────────────────────────
+    print(f"\n{'='*65}")
+    print(f"  End-of-day Report  [{fmt_now()}]")
+    print(f"{'='*65}")
+
+    trade_rows, summary_rows = pnl_registry.run(verbose=True)
+
+    pnl_registry.display_summary(summary_rows)
+    pnl_registry.display_score_report(trade_rows)
     trader.display_positions()
+
+    print(f"\n[{fmt_now()}] Scheduler finished.")
 
 
 # ---------------------------------------------------------------------------
@@ -244,5 +283,8 @@ if __name__ == "__main__":
             interval_override = args.interval,
         )
     except KeyboardInterrupt:
-        print(f"\n\n  Interrupted. Final position summary:")
+        print(f"\n\n  Interrupted. Generating final report...")
+        trade_rows, summary_rows = pnl_registry.run(verbose=True)
+        pnl_registry.display_summary(summary_rows)
+        pnl_registry.display_score_report(trade_rows)
         trader.display_positions()

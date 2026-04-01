@@ -50,15 +50,19 @@ import kalshi_scanner
 # ---------------------------------------------------------------------------
 
 # Gate thresholds
-TRADE_WINDOW_START  = 10       # local hour (inclusive) — don't trade before this
-TRADE_WINDOW_END    = 14       # local hour (exclusive) — don't trade after this
+TRADE_WINDOW_START  = 9        # local hour (inclusive) — widened for testing
+TRADE_WINDOW_END    = 23       # local hour (exclusive) — widened for testing
 MAX_SPREAD          = 0.03     # max acceptable bid-ask spread ($)
 MIN_DEPTH           = 500      # min contracts on the side we're buying
-BOUNDARY_BUFFER     = 2.0      # °F — forecast must be this far inside bracket edges
+BOUNDARY_BUFFER     = 4.0      # °F — forecast must be this far inside bracket edges
+                               # tightened from 2.0 after NYC 76-77° lesson (Mar 31 2026)
 
 # NO trade parameters
 NO_MAX_YES_PRICE    = 0.20     # only buy NO if YES is priced at or below this
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
+NO_MAX_ENTRY_PRICE  = 0.87     # never pay more than this for a NO contract
+                               # tightened from 0.90 — positions above this are
+                               # often fee-neutral or worse after settlement
 
 # Exit targets
 YES_EXIT_TARGET     = 0.25     # take profit when YES price rises 25%
@@ -271,12 +275,15 @@ def evaluate_bracket(
         and yes_ask is not None
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_ask is not None
+        and no_ask <= NO_MAX_ENTRY_PRICE
         and no_depth >= MIN_DEPTH
     ):
         # NO trade: bracket is unlikely, collect premium
+        # Exit target: either hold to resolution ($1.00) or exit early
+        # if price moves 3-4 cents in our favor before resolution
         signal["trade_type"]    = "NO"
         signal["entry_price"]   = no_ask
-        signal["exit_target"]   = round(no_ask * (1 + NO_EXIT_TARGET), 2)
+        signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
         signal["stop_loss"]     = None   # NO trades held to resolution typically
 
     return signal

@@ -23,7 +23,7 @@ Usage:
 import json
 import time
 import argparse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from decimal import Decimal
@@ -68,15 +68,28 @@ def get(url: str, params: dict = None, timeout: int = 15) -> dict:
 
 def get_todays_markets(series_ticker: str) -> list[dict]:
     """
-    Fetch all currently open markets for a series.
-    For daily temperature markets there should be exactly one open market.
-    Returns a list of market dicts (usually just one).
+    Fetch all currently open markets for a series, filtered to today only.
+    Uses the event ticker date suffix to match today's date.
+    Ticker format: KXHIGHNY-26MAR31-B74.5 → date portion is 26MAR31
     """
     data = get(
         f"{API_BASE}/markets",
         params={"series_ticker": series_ticker, "status": "open"}
     )
-    return data.get("markets", [])
+    markets = data.get("markets", [])
+
+    # Build today's date suffix in Kalshi's format: e.g. "26APR01"
+    today = datetime.now(timezone.utc)
+    date_suffix = today.strftime("%y%b%d").upper()   # e.g. "26APR01"
+
+    today_markets = [
+        m for m in markets
+        if date_suffix in m.get("event_ticker", "")
+    ]
+
+    # Fall back to all open markets if date filtering yields nothing
+    # (handles timezone edge cases near midnight)
+    return today_markets if today_markets else markets
 
 
 # ---------------------------------------------------------------------------
