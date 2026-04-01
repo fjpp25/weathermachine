@@ -1,28 +1,45 @@
 # The Weather Machine
 
-A momentum + forecast-informed trading system designed for the daily Kalshi city temperature markets.
+An algorithmic trading system for Kalshi temperature prediction markets.
 
 ## Strategy overview
 
-1. **City profiles** (static, cached) — 30-year NOAA climate normals per city/month
-2. **NWS live feed** (polled hourly) — current observations + today's forecast high
-3. **Kalshi scanner** (polled every few minutes) — live bracket prices
-4. **Decision engine** — compares forecast-implied probabilities to market prices
+The system buys NO contracts on temperature brackets that are unlikely to resolve YES, using NWS weather forecasts and historical climate data to identify mispriced markets.
 
-## Station map
+**Entry logic (NO trades):**
+- Forecast must place the expected high comfortably outside the target bracket (≥4°F boundary buffer)
+- NO contract must be priced between $0.02 and $0.87 (fee-adjusted floor)
+- Minimum orderbook depth of 500 contracts
+- Bid-ask spread ≤ $0.03
+- Only trades today's markets (not tomorrow's pre-listed markets)
+
+**Exit logic:**
+- NO trades held to resolution ($1.00 payout) — natural exit
+- Stop-loss: if YES price on a held NO bracket rises above $0.40, cut the position early
+
+**Signal scoring (0–3):**
+- +1 if NWS forecast high falls in the target bracket
+- +1 if today's observed high has already cleared the bracket floor
+- +1 if price momentum is upward in recent candles
+
+---
+
+## Settlement stations
+
+Each city maps to the exact NWS ASOS station Kalshi uses for CLI report resolution:
 
 | City | ICAO | Settlement note |
 |---|---|---|
 | New York | KNYC | Central Park — NOT JFK or LGA |
 | Chicago | KMDW | Midway Airport — NOT O'Hare |
-| Miami | KMIA | Miami International |
+| Miami | KMIA | Miami International Airport |
 | Austin | KAUS | Bergstrom Airport |
 | Los Angeles | KLAX | LAX Airport |
 | San Francisco | KSFO | SFO Airport |
-| Denver | KDEN | Denver International |
-| Philadelphia | KPHL | Philadelphia International |
+| Denver | KDEN | Denver International Airport |
+| Philadelphia | KPHL | Philadelphia International Airport |
 
-> ⚠️ Using the wrong station can cause 1–2°F errors that push you into the wrong bracket.
+---
 
 ## Key resolution facts
 
@@ -30,36 +47,126 @@ A momentum + forecast-informed trading system designed for the daily Kalshi city
 - CLI uses **raw sensor values**, not the F→C→F rounded values shown in real-time feeds
 - Reporting period is **midnight to midnight Local Standard Time** (ignores DST)
 - Settlement typically happens **6–9 AM ET** the following morning
+- NWS forecasts carry a consistent **~1°F warm bias** — corrected in the model
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-```bash
-# Step 1: Fetch and cache city profiles (run once)
-python city_profiles.py
-python city_profiles.py --show     # inspect the data
-
-# Step 2: Live feed (coming soon)
-# python nws_feed.py
-
-# Step 3: Kalshi scanner (coming soon)
-# python kalshi_scanner.py
-```
+---
 
 ## Project structure
 
 ```
 kalshi_weather/
-├── city_profiles.py       # Step 1: NOAA 30yr normals
-├── nws_feed.py            # Step 2: Live observations + forecast (TODO)
-├── kalshi_scanner.py      # Step 3: Live market prices (TODO)
-├── decision_engine.py     # Step 4: Signal generation (TODO)
+├── city_profiles.py       # Fetches and caches 30yr NOAA climate normals
+├── nws_feed.py            # Live NWS observations + forecast high, LST-aware
+├── kalshi_scanner.py      # Live bracket prices, orderbook depth, candlesticks
+├── decision_engine.py     # Signal generation — gates, scoring, YES/NO logic
+├── trader.py              # Auth, order execution, position store, exit monitor
+├── scheduler.py           # Main loop — runs everything on a dynamic poll interval
+├── reconcile.py           # Morning reconciliation against Kalshi settlements
 ├── requirements.txt
+├── .env.template
+├── .gitignore
 └── data/
-    └── city_profiles.json # Cached after first run
+    ├── city_profiles.json     # Cached NOAA normals (fetch once, never expires)
+    ├── nws_grid_cache.json    # Cached NWS forecast grid endpoints per city
+    ├── positions.json         # Local position tracker
+    ├── trade_log.json         # Full trade history
+    └── paper_trades.json      # Paper trade log
 ```
+
+---
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+
+cp .env.template .env
+# Edit .env — add KALSHI_KEY_ID and KALSHI_KEY_FILE path
+# Keep KALSHI_DEMO=true until ready for live trading
+
+# Fetch and cache city climate profiles (run once)
+python city_profiles.py
+```
+
+---
+
+## Daily workflow
+
+```bash
+# Morning — reconcile yesterday's settled positions
+python reconcile.py
+
+# Start today's trading loop
+python scheduler.py
+
+# Paper mode — signals logged but no real orders placed
+python scheduler.py --paper
+```
+
+---
+
+## Scheduler behaviour
+
+The scheduler polls on a dynamic interval that tightens around the peak trading window:
+
+| City local time | Interval | Reason |
+|---|---|---|
+| Before 10am | 15 min | Waiting for window |
+| 10am–11am | 5 min | Window just opened |
+| 11am–1pm | 3 min | Peak — forecasts updating |
+| 1pm–2pm | 5 min | Approaching cutoff |
+| After 2pm | 10 min | Exit monitoring only |
+
+The scheduler exits automatically once all cities have passed their 3pm local activity window.
+
+---
+
+## Utility commands
+
+```bash
+python trader.py --balance              # check account balance
+python trader.py --positions            # show open and closed positions
+python trader.py --test-order           # place + immediately cancel a $0.01 test order
+python decision_engine.py               # preview signals without executing
+python decision_engine.py --city Miami  # single city
+```
+
+---
+
+## Tunable parameters
+
+All key parameters are at the top of `decision_engine.py` and `trader.py`:
+
+| Parameter | Location | Default | Description |
+|---|---|---|---|
+| `TRADE_WINDOW_START` | decision_engine | 10 | Trading window open (local hour) |
+| `TRADE_WINDOW_END` | decision_engine | 14 | Trading window close (local hour) |
+| `BOUNDARY_BUFFER` | decision_engine | 4.0°F | Min distance from bracket edge |
+| `NO_MAX_ENTRY_PRICE` | decision_engine | $0.87 | Max price to pay for NO contract |
+| `NO_MAX_YES_PRICE` | decision_engine | $0.20 | Max YES price to trigger NO trade |
+| `FORECAST_BIAS_CORRECTION` | decision_engine | -1.0°F | NWS warm bias correction |
+| `NO_STOP_LOSS_YES_THRESHOLD` | trader | $0.40 | Cut NO if YES rises above this |
+| `BASE_CONTRACTS` | trader | 1 | Contracts per signal |
+| `MAX_SPREAD` | decision_engine | $0.03 | Max bid-ask spread |
+| `MIN_DEPTH` | decision_engine | 500 | Min orderbook depth |
+
+---
+
+## Parameter history
+
+| Date | Parameter | Old | New | Reason |
+|---|---|---|---|---|
+| 2026-03-31 | `BOUNDARY_BUFFER` | 2.0°F | 4.0°F | NYC 76–77° bracket loss — forecast sat at bracket edge |
+| 2026-04-01 | `NO_MAX_ENTRY_PRICE` | $0.90 | $0.87 | Reconcile showed positions above $0.93 were fee-neutral |
+
+---
+
+## Notes on Kalshi API
+
+- Market data endpoints are **public** — no auth needed for prices, orderbook, candlesticks
+- Use `portfolio/settlements` for reconciliation — not individual market status fields
+- Market status values are: `initialized`, `inactive`, `active`, `closed`, `determined`, `disputed`, `amended`, `finalized` — there is no `settled` status at the market level
+- Prices are in dollars ($0.01–$0.99), not cents
+- Order body requires only `yes_price` — do not send both `yes_price` and `no_price`
+- Date filter: Kalshi pre-lists tomorrow's markets while today's are still active — always filter by today's date suffix in the event ticker
+- Kalshi returns `"canceled"` (one L) not `"cancelled"` in order status responses
