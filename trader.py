@@ -550,12 +550,14 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     decision_engine.display(evaluations)
 
     balance = get_balance(client)
-    print(f"\n  Account balance: ${balance:.2f}")
+    deployable = round(balance * 0.70, 2)   # keep 30% in reserve
+    print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
 
     # Build set of tickers we already hold open positions on — no duplicates
     open_tickers = {p["ticker"] for p in load_positions() if p["status"] == "open"}
 
-    executed = 0
+    executed    = 0
+    deployed    = 0.0   # track how much we've spent this session
     for ev in evaluations:
         city    = ev["city"]
         signals = [s for s in ev.get("signals", []) if s.get("trade_type")]
@@ -572,8 +574,9 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 continue
 
             cost = price * contracts
-            if cost > balance * 0.50:
-                print(f"  Skipping {ticker} — cost ${cost:.2f} exceeds 50% balance cap")
+            if deployed + cost > deployable:
+                print(f"  Skipping {ticker} — would exceed 70% deployable cap "
+                      f"(deployed=${deployed:.2f} + cost=${cost:.2f} > ${deployable:.2f})")
                 continue
 
             print(f"\n  Executing: {city} {ticker}")
@@ -590,7 +593,8 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     paper         = paper,
                 )
                 record_entry(signal, contracts, result)
-                open_tickers.add(ticker)   # prevent re-entry within same poll cycle
+                open_tickers.add(ticker)
+                deployed += cost   # track cumulative spend this session
                 log_trade("entry", {
                     "city":        city,
                     "ticker":      ticker,
