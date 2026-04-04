@@ -92,10 +92,16 @@ PROFILES_FILE = Path("data/city_profiles.json")
 
 def load_profiles() -> dict:
     if not PROFILES_FILE.exists():
-        raise FileNotFoundError(
-            f"City profiles not found at {PROFILES_FILE}. "
-            "Run: python city_profiles.py"
-        )
+        print(f"City profiles not found at {PROFILES_FILE} — generating now...")
+        try:
+            import city_profiles
+            city_profiles.build_profiles()
+            print("City profiles generated successfully.")
+        except Exception as e:
+            raise FileNotFoundError(
+                f"City profiles not found at {PROFILES_FILE} and auto-generation failed: {e}\n"
+                "Run manually: python city_profiles.py"
+            )
     with open(PROFILES_FILE) as f:
         return json.load(f)
 

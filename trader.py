@@ -168,7 +168,7 @@ class KalshiClient:
         return resp.json()
 
 
-def make_client() -> KalshiClient:
+def make_client(skip_confirmation: bool = False) -> KalshiClient:
     """Build KalshiClient from environment variables."""
     key_id   = os.environ.get("KALSHI_KEY_ID")
     key_file = os.environ.get("KALSHI_KEY_FILE")
@@ -187,7 +187,7 @@ def make_client() -> KalshiClient:
             "  KALSHI_KEY_FILE=path/to/kalshi_private_key.pem"
         )
 
-    if not demo:
+    if not demo and not skip_confirmation:
         confirm = input(
             "\n  *** LIVE TRADING MODE — real money at risk ***\n"
             "  Type 'yes' to confirm: "
@@ -211,9 +211,74 @@ def get_balance(client: KalshiClient) -> float:
 
 
 def get_positions(client: KalshiClient) -> list[dict]:
-    """Returns all open market positions."""
-    data = client.get("portfolio/positions")
+    """Returns all open market positions from Kalshi."""
+    data = client.get("portfolio/positions", params={"count_filter": "position"})
     return data.get("market_positions", [])
+
+
+def sync_from_kalshi(client: KalshiClient) -> list[dict]:
+    """
+    Fetch live positions directly from Kalshi and enrich with market data.
+    Returns a list of dicts ready for display — this is the source of truth,
+    not positions.json.
+
+    Each returned dict contains:
+      ticker, side, contracts, avg_cost, current_price,
+      unrealised_pnl, fees_paid, last_updated
+    """
+    raw_positions = get_positions(client)
+
+    # Filter to temperature markets only (KX prefix)
+    temp_positions = [
+        p for p in raw_positions
+        if p.get("ticker", "").startswith("KX")
+    ]
+
+    enriched = []
+    for pos in temp_positions:
+        ticker       = pos["ticker"]
+        # position_fp is a signed string: positive = long YES, negative = long NO
+        position_fp  = float(pos.get("position_fp") or 0)
+        fees_paid    = float(pos.get("fees_paid_dollars") or 0)
+        total_cost   = float(pos.get("total_traded_dollars") or 0)
+        last_updated = pos.get("last_updated_ts", "")
+
+        if position_fp == 0:
+            continue
+
+        side      = "yes" if position_fp > 0 else "no"
+        contracts = int(abs(position_fp))
+        avg_cost  = round(total_cost / contracts, 4) if contracts else 0
+
+        # Fetch current market price for unrealised PnL
+        try:
+            market_data = requests.get(
+                f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
+                timeout=10,
+            ).json().get("market", {})
+
+            if side == "yes":
+                current_price = float(market_data.get("yes_bid_dollars") or 0)
+            else:
+                current_price = float(market_data.get("no_bid_dollars") or 0)
+
+            unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
+        except Exception:
+            current_price  = 0
+            unrealised_pnl = 0
+
+        enriched.append({
+            "ticker":         ticker,
+            "side":           side,
+            "contracts":      contracts,
+            "avg_cost":       avg_cost,
+            "current_price":  current_price,
+            "unrealised_pnl": unrealised_pnl,
+            "fees_paid":      fees_paid,
+            "last_updated":   last_updated[:16].replace("T", " ") if last_updated else "",
+        })
+
+    return enriched
 
 
 # ---------------------------------------------------------------------------
