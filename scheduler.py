@@ -11,11 +11,6 @@ Interval schedule (per city local time):
   1pm–2pm      →  5 min  (approaching cutoff)
   After 2pm    → 10 min  (exit monitoring only)
 
-P&L registry:
-  pnl_registry.run() is called at the end of every poll cycle to keep
-  data/trades.csv and data/daily_summary.csv current throughout the day.
-  A full report is also printed to the terminal when the session ends.
-
 Usage:
   python scheduler.py                   # live, dynamic interval
   python scheduler.py --paper           # paper mode, no real orders
@@ -32,7 +27,6 @@ from pathlib import Path
 
 import trader
 import decision_engine
-import pnl_registry
 
 # ---------------------------------------------------------------------------
 # Config
@@ -51,6 +45,7 @@ CITY_TIMEZONES = {
     "Denver":        "America/Denver",
     "Philadelphia":  "America/New_York",
 }
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -132,24 +127,6 @@ def fmt_now() -> str:
     return (f"{utc_now.strftime('%H:%M UTC')} "
             f"/ {lisbon_now.strftime('%H:%M %Z')}")
 
-# ---------------------------------------------------------------------------
-# P&L registry refresh
-# ---------------------------------------------------------------------------
-
-def refresh_registry(label: str = ""):
-    """
-    Regenerate trades.csv and daily_summary.csv from current position data.
-    Errors are caught and printed so a registry failure never crashes the loop.
-    """
-    tag = f"  [{label}] " if label else "  "
-    try:
-        trade_rows, summary_rows = pnl_registry.run(verbose=False)
-        closed = sum(1 for r in trade_rows if True)   # all rows are closed trades
-        print(f"{tag}P&L registry updated — "
-              f"{len(trade_rows)} trades, {len(summary_rows)} days "
-              f"→ data/trades.csv, data/daily_summary.csv")
-    except Exception as e:
-        print(f"{tag}P&L registry error: {e}")
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -160,12 +137,27 @@ def run_scheduler(
     city_filter:       str  = None,
     interval_override: int  = None,
 ):
-    env_file = Path(".env")
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+    # Load credentials from config file if present, fall back to env vars
+    config_file = Path("data/config.json")
+    if config_file.exists():
+        try:
+            import json
+            config = json.loads(config_file.read_text())
+            if config.get("key_id"):
+                os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
+            if config.get("key_file"):
+                os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
+            os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+        except Exception:
+            pass
+    else:
+        # Fall back to .env file for terminal use
+        env_file = Path(".env")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip())
 
     client   = trader.make_client()
     mode_str = "PAPER" if paper else ("DEMO" if client.demo else "LIVE")
@@ -218,46 +210,29 @@ def run_scheduler(
         except Exception as e:
             print(f"  Pipeline error: {e}")
 
-        # ── Check exits on all open positions ────────────────────────────
+        # ── Check exits — count from Kalshi, not local file ───────────────
         try:
-            open_positions = [p for p in trader.load_positions()
-                              if p["status"] == "open"]
-            if open_positions:
-                print(f"\n  Checking exits ({len(open_positions)} open positions)...")
+            live_positions = trader.sync_from_kalshi(client)
+            if live_positions:
+                print(f"\n  Checking exits ({len(live_positions)} open positions)...")
                 trader.check_exits(client, paper=paper)
             else:
                 print(f"  No open positions to monitor.")
         except Exception as e:
             print(f"  Exit check error: {e}")
 
-        # ── Position summary ─────────────────────────────────────────────
-        positions  = trader.load_positions()
-        open_pos   = [p for p in positions if p["status"] == "open"]
-        closed_pos = [p for p in positions if p["status"] == "closed"]
-        total_pnl  = sum(p.get("pnl") or 0 for p in closed_pos)
-
-        print(f"\n  Positions: {len(open_pos)} open | "
-              f"{len(closed_pos)} closed | "
-              f"total gross P&L: ${total_pnl:+.2f}")
-
-        # ── Refresh P&L registry after every cycle ───────────────────────
-        refresh_registry(label=f"poll #{poll_count}")
+        # ── Balance summary ───────────────────────────────────────────────
+        try:
+            balance    = trader.get_balance(client)
+            deployable = round(balance * 0.70, 2)
+            print(f"\n  Balance: ${balance:.2f}  |  Deployable: ${deployable:.2f}")
+        except Exception:
+            pass
 
         # ── Sleep ────────────────────────────────────────────────────────
         next_poll = datetime.now(timezone.utc) + timedelta(seconds=interval_secs)
         print(f"  Next poll: {next_poll.strftime('%H:%M UTC')}")
         time.sleep(interval_secs)
-
-    # ── End-of-day: full report ───────────────────────────────────────────
-    print(f"\n{'='*65}")
-    print(f"  End-of-day Report  [{fmt_now()}]")
-    print(f"{'='*65}")
-
-    trade_rows, summary_rows = pnl_registry.run(verbose=True)
-
-    pnl_registry.display_summary(summary_rows)
-    pnl_registry.display_score_report(trade_rows)
-    trader.display_positions()
 
     print(f"\n[{fmt_now()}] Scheduler finished.")
 
@@ -283,8 +258,5 @@ if __name__ == "__main__":
             interval_override = args.interval,
         )
     except KeyboardInterrupt:
-        print(f"\n\n  Interrupted. Generating final report...")
-        trade_rows, summary_rows = pnl_registry.run(verbose=True)
-        pnl_registry.display_summary(summary_rows)
-        pnl_registry.display_score_report(trade_rows)
+        print(f"\n\n  Interrupted. Final position summary:")
         trader.display_positions()

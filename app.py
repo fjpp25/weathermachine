@@ -28,7 +28,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QFrame, QScrollArea, QSizePolicy,
-    QTextEdit, QSplitter, QMessageBox,
+    QTextEdit, QSplitter, QMessageBox, QLineEdit,
+    QFileDialog, QDialog, QDialogButtonBox, QCheckBox,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QObject
@@ -45,6 +46,7 @@ except ImportError:
 # Paths
 # ---------------------------------------------------------------------------
 DATA_DIR        = Path("data")
+CONFIG_FILE     = DATA_DIR / "config.json"   # stores credentials locally
 POSITIONS_FILE  = DATA_DIR / "positions.json"
 SUMMARY_CSV     = DATA_DIR / "daily_summary.csv"
 TRADES_CSV      = DATA_DIR / "trades.csv"
@@ -141,6 +143,223 @@ QFrame[frameShape="4"], QFrame[frameShape="5"] {{
 
 
 # ---------------------------------------------------------------------------
+# Config helpers — persist credentials in data/config.json
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """Load saved credentials from config file."""
+    DATA_DIR.mkdir(exist_ok=True)
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(config: dict):
+    """Save credentials to config file."""
+    DATA_DIR.mkdir(exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def apply_config(config: dict):
+    """Apply config values to environment variables."""
+    if config.get("key_id"):
+        os.environ["KALSHI_KEY_ID"] = config["key_id"]
+    if config.get("key_file"):
+        os.environ["KALSHI_KEY_FILE"] = config["key_file"]
+    # demo=false means live trading
+    os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+
+
+# ---------------------------------------------------------------------------
+# Credential setup dialog
+# ---------------------------------------------------------------------------
+
+class CredentialDialog(QDialog):
+    """
+    Shown on first launch or when credentials are missing.
+    Collects Key ID, PEM file path, and live/demo mode.
+    Saves to data/config.json for future launches.
+    """
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("WeatherMachine — Setup")
+        self.setMinimumWidth(520)
+        self.setStyleSheet(f"""
+            QDialog {{
+                background: {BG_PANEL};
+            }}
+            QLabel {{
+                color: {TEXT_PRI};
+            }}
+            QLineEdit {{
+                background: {BG_DARK};
+                color: {TEXT_PRI};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 8px;
+                font-family: 'Consolas', monospace;
+                font-size: 12px;
+            }}
+            QLineEdit:focus {{
+                border-color: {ACCENT};
+            }}
+            QPushButton {{
+                background: {BG_DARK};
+                color: {TEXT_PRI};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 6px 16px;
+                min-width: 80px;
+            }}
+            QPushButton:hover {{
+                border-color: {ACCENT};
+                color: {ACCENT};
+            }}
+            QCheckBox {{
+                color: {TEXT_PRI};
+                spacing: 8px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border: 1px solid {BORDER};
+                border-radius: 3px;
+                background: {BG_DARK};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {ACCENT};
+                border-color: {ACCENT};
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(32, 28, 32, 24)
+        layout.setSpacing(20)
+
+        # Title
+        title = QLabel("Kalshi API Credentials")
+        title.setStyleSheet(f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+        subtitle = QLabel(
+            "Your credentials are stored locally in data/config.json\n"
+            "and never transmitted anywhere except to Kalshi's API."
+        )
+        subtitle.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {BORDER};")
+        layout.addWidget(sep)
+
+        # Key ID field
+        layout.addWidget(self._field_label("API Key ID"))
+        self.key_id_edit = QLineEdit(config.get("key_id", ""))
+        self.key_id_edit.setPlaceholderText("e.g. 4a1f9cc9-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+        layout.addWidget(self.key_id_edit)
+
+        # PEM file field
+        layout.addWidget(self._field_label("Private Key File  (.pem)"))
+        pem_row = QHBoxLayout()
+        self.pem_edit = QLineEdit(config.get("key_file", ""))
+        self.pem_edit.setPlaceholderText("Path to your kalshi_private_key.pem file")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setFixedWidth(90)
+        browse_btn.clicked.connect(self._browse_pem)
+        pem_row.addWidget(self.pem_edit)
+        pem_row.addWidget(browse_btn)
+        layout.addLayout(pem_row)
+
+        # Live mode toggle
+        self.live_check = QCheckBox("Enable live trading  (uncheck for demo/paper mode)")
+        self.live_check.setChecked(config.get("live_mode", False))
+        self.live_check.setStyleSheet(
+            self.live_check.styleSheet() +
+            f"QCheckBox {{ color: {YELLOW}; }}"
+        )
+        layout.addWidget(self.live_check)
+
+        # Warning
+        self.warning = QLabel("⚠  Live mode will use real money.")
+        self.warning.setStyleSheet(f"color: {YELLOW}; font-size: 11px;")
+        self.warning.setVisible(self.live_check.isChecked())
+        self.live_check.toggled.connect(self.warning.setVisible)
+        layout.addWidget(self.warning)
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        # Style the OK button as accent
+        ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT};
+                color: {BG_DARK};
+                border: none;
+                border-radius: 4px;
+                padding: 6px 20px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {ACCENT_DIM}; }}
+        """)
+        layout.addWidget(btns)
+
+    def _field_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 1px;")
+        return lbl
+
+    def _browse_pem(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Private Key File", "",
+            "PEM Files (*.pem);;All Files (*)"
+        )
+        if path:
+            self.pem_edit.setText(path)
+
+    def _on_accept(self):
+        key_id   = self.key_id_edit.text().strip()
+        key_file = self.pem_edit.text().strip()
+
+        if not key_id:
+            QMessageBox.warning(self, "Missing Field", "Please enter your API Key ID.")
+            return
+        if not key_file:
+            QMessageBox.warning(self, "Missing Field", "Please select your private key file.")
+            return
+        if not Path(key_file).exists():
+            QMessageBox.warning(self, "File Not Found",
+                                f"Private key file not found:\n{key_file}")
+            return
+
+        config = {
+            "key_id":    key_id,
+            "key_file":  key_file,
+            "live_mode": self.live_check.isChecked(),
+        }
+        save_config(config)
+        apply_config(config)
+        self.accept()
+
+    def get_config(self) -> dict:
+        return {
+            "key_id":    self.key_id_edit.text().strip(),
+            "key_file":  self.pem_edit.text().strip(),
+            "live_mode": self.live_check.isChecked(),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Scheduler worker thread
 # ---------------------------------------------------------------------------
 
@@ -175,18 +394,9 @@ class SchedulerWorker(QObject):
     def run(self):
         self._stop_event.clear()
 
-        # Load .env
-        env_file = Path(".env")
-        if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip())
-
         try:
             import trader
             import decision_engine
-            import pnl_registry
 
             client = trader.make_client(skip_confirmation=True)
             self.client_ready.emit(client)
@@ -249,11 +459,11 @@ class SchedulerWorker(QObject):
                 if not self.is_running():
                     break
 
-                # Check exits
+                # Check exits — use live Kalshi positions, not local file
                 try:
-                    open_pos = [p for p in trader.load_positions() if p["status"] == "open"]
-                    if open_pos:
-                        self.log_line.emit(f"Checking exits ({len(open_pos)} open)...")
+                    live_pos = trader.sync_from_kalshi(client)
+                    if live_pos:
+                        self.log_line.emit(f"Checking exits ({len(live_pos)} open)...")
                         trader.check_exits(client, paper=self.paper)
                         self.positions_updated.emit()
                 except Exception as e:
@@ -263,12 +473,6 @@ class SchedulerWorker(QObject):
                 try:
                     bal = trader.get_balance(client)
                     self.balance_updated.emit(bal, bal * 0.70)
-                except Exception:
-                    pass
-
-                # Update PnL registry
-                try:
-                    pnl_registry.run()
                 except Exception:
                     pass
 
@@ -377,11 +581,13 @@ class HomeTab(QWidget):
         """)
         self.start_btn.clicked.connect(self.toggle_scheduler)
 
-        self.mode_label = QLabel("LIVE")
+        self.mode_label = QLabel("LIVE" if os.environ.get("KALSHI_DEMO", "true") == "false" else "DEMO")
+        live = os.environ.get("KALSHI_DEMO", "true") == "false"
+        _mode_color = YELLOW if live else ACCENT
         self.mode_label.setStyleSheet(f"""
-            color: {YELLOW}; font-size: 11px; letter-spacing: 2px;
+            color: {_mode_color}; font-size: 11px; letter-spacing: 2px;
             padding: 4px 10px;
-            border: 1px solid {YELLOW};
+            border: 1px solid {_mode_color};
             border-radius: 4px;
         """)
 
@@ -550,8 +756,7 @@ class HomeTab(QWidget):
             self._stop_scheduler()
         else:
             # Check if live mode — show confirmation dialog
-            demo = os.environ.get("KALSHI_DEMO", "true").lower() != "false"
-            if not demo:
+            demo = os.environ.get("KALSHI_DEMO", "true").lower() != "false"            if not demo:
                 dlg = QMessageBox(self)
                 dlg.setWindowTitle("Live Trading Confirmation")
                 dlg.setText("⚠  LIVE TRADING MODE")
@@ -651,6 +856,9 @@ class HomeTab(QWidget):
 
     def _on_client_ready(self, client):
         self._client = client
+        # Notify any registered callbacks (e.g. PnL tab)
+        for cb in getattr(self, '_client_ready_callbacks', []):
+            cb(client)
         self.sync_positions_from_kalshi()
 
     def _on_poll_started(self, poll_num: int):
@@ -693,13 +901,6 @@ class HomeTab(QWidget):
             try:
                 import reconcile
                 import trader
-
-                env_file = Path(".env")
-                if env_file.exists():
-                    for line in env_file.read_text().splitlines():
-                        if "=" in line and not line.startswith("#"):
-                            k, v = line.split("=", 1)
-                            os.environ.setdefault(k.strip(), v.strip())
 
                 client = trader.make_client(skip_confirmation=True)
                 settlements = reconcile.fetch_settlements(client)
@@ -872,6 +1073,7 @@ class HomeTab(QWidget):
 class PnLTab(QWidget):
     def __init__(self):
         super().__init__()
+        self._client = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -881,6 +1083,7 @@ class PnLTab(QWidget):
         hdr_row = QHBoxLayout()
         title = QLabel("PERFORMANCE  //  Temperature Markets")
         title.setStyleSheet(f"color: {TEXT_PRI}; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
+
         self.refresh_btn = QPushButton("↻  Refresh")
         self.refresh_btn.setFixedWidth(120)
         self.refresh_btn.setStyleSheet(f"""
@@ -892,24 +1095,30 @@ class PnLTab(QWidget):
                 padding: 6px 12px;
             }}
             QPushButton:hover {{ background: {ACCENT_DIM}; color: {BG_DARK}; }}
+            QPushButton:disabled {{ border-color: {BORDER}; color: {TEXT_SEC}; }}
         """)
         self.refresh_btn.clicked.connect(self.load_data)
+
+        self.status_label = QLabel("Connect to Kalshi to load performance data")
+        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
         hdr_row.addWidget(title)
+        hdr_row.addSpacing(16)
+        hdr_row.addWidget(self.status_label)
         hdr_row.addStretch()
         hdr_row.addWidget(self.refresh_btn)
         layout.addLayout(hdr_row)
 
         # ── Summary stats row ─────────────────────────────────────────────
-        self.stats_row = QHBoxLayout()
+        stats_row = QHBoxLayout()
         self.stat_labels = {}
-        for key in ["Total Trades", "Win Rate", "Net PnL", "Total Fees", "Best Day", "Worst Day"]:
+        for key in ["Settled Trades", "Win Rate", "Net PnL", "Total Fees", "Best Day", "Worst Day"]:
             frame = QFrame()
             frame.setStyleSheet(f"""
                 QFrame {{
                     background: {BG_PANEL};
                     border: 1px solid {BORDER};
                     border-radius: 6px;
-                    padding: 4px;
                 }}
             """)
             fl = QVBoxLayout(frame)
@@ -921,11 +1130,11 @@ class PnLTab(QWidget):
             fl.addWidget(lbl_key)
             fl.addWidget(lbl_val)
             self.stat_labels[key] = lbl_val
-            self.stats_row.addWidget(frame)
-        layout.addLayout(self.stats_row)
+            stats_row.addWidget(frame)
+        layout.addLayout(stats_row)
 
         # ── Equity curve ──────────────────────────────────────────────────
-        curve_label = QLabel("EQUITY CURVE  —  Cumulative Net PnL")
+        curve_label = QLabel("EQUITY CURVE  —  Cumulative Net PnL  (temperature markets only)")
         curve_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
         layout.addWidget(curve_label)
 
@@ -946,69 +1155,156 @@ class PnLTab(QWidget):
             no_chart.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(no_chart)
 
-        # ── Tabs: Daily summary | Score breakdown ─────────────────────────
+        # ── Settlements table ─────────────────────────────────────────────
         inner_tabs = QTabWidget()
-        inner_tabs.setStyleSheet(f"""
-            QTabBar::tab {{ padding: 6px 18px; font-size: 11px; }}
-        """)
+        inner_tabs.setStyleSheet("QTabBar::tab { padding: 6px 18px; font-size: 11px; }")
 
-        # Daily summary table
-        self.daily_table = QTableWidget()
-        self.daily_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.daily_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.daily_table.setAlternatingRowColors(True)
-        self.daily_table.setStyleSheet(
-            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
-        )
-        inner_tabs.addTab(self.daily_table, "Daily Summary")
+        self.daily_table = self._make_table()
+        inner_tabs.addTab(self.daily_table, "By Day")
 
-        # Score breakdown table
-        self.score_table = QTableWidget()
-        self.score_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.score_table.setAlternatingRowColors(True)
-        self.score_table.setStyleSheet(
-            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
-        )
-        inner_tabs.addTab(self.score_table, "Score Breakdown")
+        self.settlements_table = self._make_table()
+        inner_tabs.addTab(self.settlements_table, "All Settlements")
 
         layout.addWidget(inner_tabs, stretch=1)
 
-        self.load_data()
+    def _make_table(self) -> QTableWidget:
+        t = QTableWidget()
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        t.setStyleSheet(f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}")
+        return t
+
+    def set_client(self, client):
+        self._client = client
+        self.status_label.setText("Kalshi connected — click Refresh to load")
+        self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
 
     def load_data(self):
-        self._load_daily_summary()
-        self._load_score_breakdown()
-
-    def _load_daily_summary(self):
-        if not SUMMARY_CSV.exists():
+        if self._client is None:
+            self.status_label.setText("Not connected — start the scheduler first")
             return
 
-        import csv
-        rows = []
-        try:
-            with open(SUMMARY_CSV) as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-        except Exception:
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("Loading...")
+        self.status_label.setText("Fetching settlements from Kalshi...")
+
+        import threading
+        def worker():
+            try:
+                # Fetch all settlements, paginate if needed
+                all_settlements = []
+                cursor = None
+                while True:
+                    params = {"limit": 200}
+                    if cursor:
+                        params["cursor"] = cursor
+                    data   = self._client.get("portfolio/settlements", params=params)
+                    batch  = data.get("settlements", [])
+                    all_settlements.extend(batch)
+                    cursor = data.get("cursor")
+                    if not cursor or not batch:
+                        break
+
+                # Filter to temperature markets only
+                temp = [
+                    s for s in all_settlements
+                    if s.get("ticker", "").startswith("KX")
+                    and ("HIGH" in s.get("ticker", "") or "LOWT" in s.get("ticker", ""))
+                ]
+
+                from PyQt6.QtCore import QTimer
+                def finish():
+                    self._populate(temp)
+                    self.refresh_btn.setEnabled(True)
+                    self.refresh_btn.setText("↻  Refresh")
+                    self.status_label.setText(
+                        f"Loaded {len(temp)} temperature settlements  •  "
+                        f"Last updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+                    )
+                    self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+                QTimer.singleShot(0, finish)
+
+            except Exception as e:
+                from PyQt6.QtCore import QTimer
+                def finish():
+                    self.refresh_btn.setEnabled(True)
+                    self.refresh_btn.setText("↻  Refresh")
+                    self.status_label.setText(f"Error: {e}")
+                    self.status_label.setStyleSheet(f"color: {RED}; font-size: 11px;")
+                QTimer.singleShot(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _populate(self, settlements: list):
+        """Build all views from raw settlement data."""
+        from collections import defaultdict
+
+        # ── Per-settlement enrichment ─────────────────────────────────
+        enriched = []
+        for s in settlements:
+            ticker   = s.get("ticker", "")
+            result   = s.get("market_result", "").lower()
+            yes_fp   = float(s.get("yes_count_fp") or 0)
+            no_fp    = float(s.get("no_count_fp") or 0)
+            fee      = float(s.get("fee_cost") or 0)
+            revenue  = float(s.get("revenue") or 0) / 100   # revenue in cents
+            settled  = s.get("settled_time", "")[:10]
+
+            # Determine side held and contracts
+            if yes_fp > 0:
+                side      = "yes"
+                contracts = int(yes_fp)
+            elif no_fp > 0:
+                side      = "no"
+                contracts = int(no_fp)
+            else:
+                continue
+
+            won     = (result == side)
+            payout  = revenue - fee   # actual cash received net of fees
+            # Cost = total paid for the contracts
+            cost    = float(s.get("yes_total_cost") or s.get("no_total_cost") or 0) / 100
+            net_pnl = round(payout - cost, 4) if won else round(-cost - fee, 4)
+
+            enriched.append({
+                "ticker":    ticker,
+                "date":      settled,
+                "side":      side.upper(),
+                "contracts": contracts,
+                "result":    result.upper(),
+                "won":       won,
+                "cost":      cost,
+                "payout":    round(payout, 4),
+                "fee":       fee,
+                "net_pnl":   net_pnl,
+            })
+
+        if not enriched:
             return
 
-        if not rows:
-            return
+        # ── Summary stats ─────────────────────────────────────────────
+        total      = len(enriched)
+        wins       = [e for e in enriched if e["won"]]
+        win_rate   = round(len(wins) / total * 100, 1) if total else 0
+        net_pnl    = round(sum(e["net_pnl"] for e in enriched), 2)
+        total_fees = round(sum(e["fee"] for e in enriched), 2)
 
-        # Summary stats
-        total_trades = sum(int(r.get("trades_closed", 0)) for r in rows)
-        total_wins   = sum(int(r.get("wins", 0)) for r in rows)
-        win_rate     = round(total_wins / total_trades * 100, 1) if total_trades else 0
-        net_pnl      = sum(float(r.get("net_pnl", 0)) for r in rows)
-        total_fees   = sum(float(r.get("total_fees", 0)) for r in rows)
-        daily_pnls   = [float(r.get("net_pnl", 0)) for r in rows]
-        best_day     = max(daily_pnls) if daily_pnls else 0
-        worst_day    = min(daily_pnls) if daily_pnls else 0
+        by_day = defaultdict(list)
+        for e in enriched:
+            by_day[e["date"]].append(e)
+        daily_pnls = [round(sum(t["net_pnl"] for t in v), 2) for v in by_day.values()]
+        best_day   = max(daily_pnls) if daily_pnls else 0
+        worst_day  = min(daily_pnls) if daily_pnls else 0
 
-        self.stat_labels["Total Trades"].setText(str(total_trades))
+        self.stat_labels["Settled Trades"].setText(str(total))
         self.stat_labels["Win Rate"].setText(f"{win_rate}%")
-        color = ACCENT if net_pnl >= 0 else RED
+        self.stat_labels["Win Rate"].setStyleSheet(
+            f"color: {ACCENT if win_rate >= 70 else YELLOW if win_rate >= 50 else RED}; "
+            f"font-size: 18px; font-weight: bold;"
+        )
         sign  = "+" if net_pnl >= 0 else ""
+        color = ACCENT if net_pnl >= 0 else RED
         self.stat_labels["Net PnL"].setText(f"{sign}${net_pnl:.2f}")
         self.stat_labels["Net PnL"].setStyleSheet(f"color: {color}; font-size: 18px; font-weight: bold;")
         self.stat_labels["Total Fees"].setText(f"${total_fees:.2f}")
@@ -1017,112 +1313,91 @@ class PnLTab(QWidget):
         self.stat_labels["Worst Day"].setText(f"${worst_day:.2f}")
         self.stat_labels["Worst Day"].setStyleSheet(f"color: {RED}; font-size: 18px; font-weight: bold;")
 
-        # Equity curve
-        if HAS_PYQTGRAPH and rows:
-            cum_pnls = [float(r.get("cumulative_net_pnl", 0)) for r in rows]
-            x = list(range(len(cum_pnls)))
+        # ── Equity curve ─────────────────────────────────────────────
+        if HAS_PYQTGRAPH:
+            sorted_days = sorted(by_day.keys())
+            cum, curve  = 0.0, []
+            for day in sorted_days:
+                cum += sum(e["net_pnl"] for e in by_day[day])
+                curve.append(round(cum, 4))
+
             self.chart.clear()
+            x   = list(range(len(curve)))
             pen = pg.mkPen(color=ACCENT, width=2)
-            self.chart.plot(x, cum_pnls, pen=pen)
+            self.chart.plot(x, curve, pen=pen)
             fill_color = QColor(ACCENT)
             fill_color.setAlpha(30)
             fill = pg.FillBetweenItem(
                 self.chart.plot(x, [0]*len(x), pen=pg.mkPen(None)),
-                self.chart.plot(x, cum_pnls, pen=pen),
-                brush=fill_color
+                self.chart.plot(x, curve, pen=pen),
+                brush=fill_color,
             )
             self.chart.addItem(fill)
 
-        # Daily table
-        cols = ["date", "trades_closed", "wins", "total_losses",
-                "win_rate_pct", "capital_deployed", "gross_pnl",
-                "total_fees", "net_pnl", "net_roi_pct", "cumulative_net_pnl"]
-        headers = ["Date", "Trades", "Wins", "Losses", "Win%",
-                   "Capital", "Gross PnL", "Fees", "Net PnL", "ROI%", "Cum PnL"]
+        # ── By-day table ─────────────────────────────────────────────
+        day_rows = []
+        cum = 0.0
+        for day in sorted(by_day.keys(), reverse=True):
+            trades    = by_day[day]
+            day_wins  = [t for t in trades if t["won"]]
+            day_pnl   = round(sum(t["net_pnl"] for t in trades), 2)
+            day_fees  = round(sum(t["fee"] for t in trades), 2)
+            cum      += day_pnl
+            day_rows.append({
+                "date":    day,
+                "trades":  len(trades),
+                "wins":    len(day_wins),
+                "losses":  len(trades) - len(day_wins),
+                "win%":    f"{round(len(day_wins)/len(trades)*100,1)}%",
+                "fees":    f"${day_fees:.2f}",
+                "net_pnl": day_pnl,
+                "cum_pnl": round(cum, 2),
+            })
 
-        self.daily_table.setColumnCount(len(cols))
-        self.daily_table.setHorizontalHeaderLabels(headers)
-        self.daily_table.setRowCount(len(rows))
-        self.daily_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.daily_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Fixed
-        )
-        self.daily_table.setColumnWidth(0, 100)
+        hdrs = ["Date", "Trades", "Wins", "Losses", "Win%", "Fees", "Net PnL", "Cum PnL"]
+        self.daily_table.setColumnCount(len(hdrs))
+        self.daily_table.setHorizontalHeaderLabels(hdrs)
+        self.daily_table.setRowCount(len(day_rows))
+        self.daily_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
-        for row_idx, row in enumerate(reversed(rows)):
-            for col_idx, col in enumerate(cols):
-                val = row.get(col, "")
-                item = QTableWidgetItem(str(val))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-
-                # Color net PnL column
-                if col == "net_pnl":
-                    try:
-                        v = float(val)
-                        item.setForeground(QColor(ACCENT if v >= 0 else RED))
-                    except Exception:
-                        pass
-                if col == "win_rate_pct":
-                    try:
-                        v = float(val)
-                        item.setForeground(QColor(ACCENT if v >= 70 else
-                                                  YELLOW if v >= 50 else RED))
-                    except Exception:
-                        pass
-
-                self.daily_table.setItem(row_idx, col_idx, item)
-
-    def _load_score_breakdown(self):
-        if not TRADES_CSV.exists():
-            return
-
-        import csv
-        from collections import defaultdict
-
-        buckets = defaultdict(list)
-        try:
-            with open(TRADES_CSV) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        score = int(row.get("score", 0))
-                        net   = float(row.get("net_pnl", 0))
-                        buckets[score].append(net)
-                    except Exception:
-                        pass
-        except Exception:
-            return
-
-        cols    = ["Score", "Trades", "Wins", "Win %", "Avg Net PnL", "Total Net PnL"]
-        self.score_table.setColumnCount(len(cols))
-        self.score_table.setHorizontalHeaderLabels(cols)
-        self.score_table.setRowCount(len(buckets))
-        self.score_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-
-        for row_idx, score in enumerate(sorted(buckets.keys())):
-            trades    = buckets[score]
-            wins      = [t for t in trades if t > 0]
-            win_rate  = round(len(wins) / len(trades) * 100, 1) if trades else 0
-            avg_net   = round(sum(trades) / len(trades), 4) if trades else 0
-            total_net = round(sum(trades), 4)
-
-            values = [str(score), str(len(trades)), str(len(wins)),
-                      f"{win_rate}%", f"${avg_net:+.4f}", f"${total_net:+.4f}"]
-
-            for col_idx, val in enumerate(values):
+        for ri, row in enumerate(day_rows):
+            vals = [row["date"], str(row["trades"]), str(row["wins"]),
+                    str(row["losses"]), row["win%"], row["fees"],
+                    f"${row['net_pnl']:+.2f}", f"${row['cum_pnl']:+.2f}"]
+            for ci, val in enumerate(vals):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if col_idx in (4, 5):
-                    try:
-                        v = float(val.replace("$", "").replace("+", ""))
-                        item.setForeground(QColor(ACCENT if v >= 0 else RED))
-                    except Exception:
-                        pass
-                self.score_table.setItem(row_idx, col_idx, item)
+                if ci == 6:
+                    item.setForeground(QColor(ACCENT if row["net_pnl"] >= 0 else RED))
+                if ci == 7:
+                    item.setForeground(QColor(ACCENT if row["cum_pnl"] >= 0 else RED))
+                self.daily_table.setItem(ri, ci, item)
+
+        # ── All settlements table ─────────────────────────────────────
+        s_hdrs = ["Date", "Ticker", "Side", "Qty", "Result", "Fee", "Net PnL"]
+        self.settlements_table.setColumnCount(len(s_hdrs))
+        self.settlements_table.setHorizontalHeaderLabels(s_hdrs)
+        self.settlements_table.setRowCount(len(enriched))
+        self.settlements_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in [0, 2, 3, 4, 5, 6]:
+            self.settlements_table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+
+        for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
+            won_str = "WON ✓" if e["won"] else "LOST ✗"
+            vals    = [e["date"], e["ticker"], e["side"], str(e["contracts"]),
+                       won_str, f"${e['fee']:.2f}", f"${e['net_pnl']:+.2f}"]
+            for ci, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if ci == 2:
+                    item.setForeground(QColor(ACCENT if e["side"] == "NO" else YELLOW))
+                if ci == 4:
+                    item.setForeground(QColor(ACCENT if e["won"] else RED))
+                if ci == 6:
+                    item.setForeground(QColor(ACCENT if e["net_pnl"] >= 0 else RED))
+                self.settlements_table.setItem(ri, ci, item)
 
 
 # ---------------------------------------------------------------------------
@@ -1130,26 +1405,68 @@ class PnLTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, config: dict):
         super().__init__()
+        self._config = config
         self.setWindowTitle("WeatherMachine  //  Kalshi Temperature Trader")
         self.setMinimumSize(1100, 760)
 
         tabs = QTabWidget()
         self.home_tab = HomeTab()
         self.pnl_tab  = PnLTab()
+
+        # Settings button in the tab bar corner
+        settings_btn = QPushButton("⚙  Settings")
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                color: {TEXT_SEC};
+                border: none;
+                padding: 6px 12px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ color: {ACCENT}; }}
+        """)
+        settings_btn.clicked.connect(self._open_settings)
+        tabs.setCornerWidget(settings_btn, Qt.Corner.TopRightCorner)
+
         tabs.addTab(self.home_tab, "  Home  ")
         tabs.addTab(self.pnl_tab,  "  Performance  ")
         tabs.currentChanged.connect(self._on_tab_changed)
 
+        # Pass client to PnL tab when scheduler connects
+        self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
+
         self.setCentralWidget(tabs)
 
+    def _open_settings(self):
+        """Open credential dialog — only when scheduler is not running."""
+        if self.home_tab._running:
+            QMessageBox.information(
+                self, "Scheduler Running",
+                "Please stop the scheduler before changing credentials."
+            )
+            return
+        dlg = CredentialDialog(self._config, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._config = load_config()
+            apply_config(self._config)
+            # Update live/demo indicator on home tab
+            mode = "LIVE" if self._config.get("live_mode") else "DEMO"
+            self.home_tab.mode_label.setText(mode)
+            color = YELLOW if self._config.get("live_mode") else ACCENT
+            self.home_tab.mode_label.setStyleSheet(f"""
+                color: {color}; font-size: 11px; letter-spacing: 2px;
+                padding: 4px 10px;
+                border: 1px solid {color};
+                border-radius: 4px;
+            """)
+
     def _on_tab_changed(self, idx: int):
-        if idx == 1:
+        if idx == 1 and self.pnl_tab._client is not None:
             self.pnl_tab.load_data()
 
     def closeEvent(self, event):
-        # Stop scheduler cleanly on window close
         if self.home_tab._worker:
             self.home_tab._worker.stop()
         event.accept()
@@ -1176,6 +1493,21 @@ if __name__ == "__main__":
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor(BG_DARK))
     app.setPalette(palette)
 
-    window = MainWindow()
+    # Load saved credentials
+    config = load_config()
+
+    # Show setup dialog if credentials are missing or incomplete
+    needs_setup = not config.get("key_id") or not config.get("key_file")
+    if needs_setup:
+        dlg = CredentialDialog(config)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)   # user cancelled — exit cleanly
+        config = load_config()   # reload after save
+
+    # Apply credentials to environment
+    apply_config(config)
+
+    # Show main window with a settings button to re-open credential dialog
+    window = MainWindow(config)
     window.show()
     sys.exit(app.exec())

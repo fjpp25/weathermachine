@@ -11,7 +11,7 @@ Auth:
     - KALSHI_KEY_ID    : your API key ID (from Kalshi dashboard)
     - KALSHI_KEY_FILE  : path to your private key PEM file
 
-  Set these as environment variables or in a .env file:
+  Set these via the app's Settings dialog, or as environment variables:
     KALSHI_KEY_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
     KALSHI_KEY_FILE=kalshi_private_key.pem
     KALSHI_DEMO=true   # use demo environment (default: true for safety)
@@ -73,10 +73,6 @@ SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
 # Exit monitor poll interval (seconds)
 MONITOR_INTERVAL = 60
 
-# NO trade stop-loss: if the YES price on a bracket we hold NO on rises above
-# this threshold, the market is pricing it as likely — cut the loss and move on
-NO_STOP_LOSS_YES_THRESHOLD = 0.40
-
 
 # ---------------------------------------------------------------------------
 # Auth client
@@ -135,36 +131,87 @@ class KalshiClient:
         """Return just the path portion for signing."""
         return f"/trade-api/v2/{endpoint.lstrip('/')}"
 
+    def _request_with_backoff(self, method: str, url: str,
+                              headers: dict, timeout: int,
+                              params: dict = None, json: dict = None) -> requests.Response:
+        """
+        Execute an HTTP request with exponential backoff retry.
+        Retries on: connection errors, timeouts, 429 rate-limit, 5xx server errors.
+        Does NOT retry on 4xx client errors (bad request, auth failure etc).
+        """
+        MAX_RETRIES = 4
+        BASE_DELAY  = 2   # seconds
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                resp = requests.request(
+                    method, url,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    timeout=timeout,
+                )
+                # Retry on rate-limit or server error
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    if attempt < MAX_RETRIES - 1:
+                        delay = BASE_DELAY * (2 ** attempt)
+                        print(f"  [{resp.status_code}] Retrying in {delay}s "
+                              f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                        time.sleep(delay)
+                        continue
+                resp.raise_for_status()
+                return resp
+
+            except requests.exceptions.Timeout:
+                if attempt < MAX_RETRIES - 1:
+                    delay = BASE_DELAY * (2 ** attempt)
+                    print(f"  [timeout] Retrying in {delay}s "
+                          f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+            except requests.exceptions.ConnectionError:
+                if attempt < MAX_RETRIES - 1:
+                    delay = BASE_DELAY * (2 ** attempt)
+                    print(f"  [connection error] Retrying in {delay}s "
+                          f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+        raise RuntimeError("Max retries exceeded")
+
     def get(self, endpoint: str, params: dict = None) -> dict:
         path = self._api_path(endpoint)
-        resp = requests.get(
+        resp = self._request_with_backoff(
+            "GET",
             self.base_url + "/" + endpoint.lstrip("/"),
             headers=self._headers("GET", path),
-            params=params,
             timeout=15,
+            params=params,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def post(self, endpoint: str, body: dict) -> dict:
         path = self._api_path(endpoint)
-        resp = requests.post(
+        resp = self._request_with_backoff(
+            "POST",
             self.base_url + "/" + endpoint.lstrip("/"),
             headers=self._headers("POST", path),
-            json=body,
             timeout=15,
+            json=body,
         )
-        resp.raise_for_status()
         return resp.json()
 
     def delete(self, endpoint: str) -> dict:
         path = self._api_path(endpoint)
-        resp = requests.delete(
+        resp = self._request_with_backoff(
+            "DELETE",
             self.base_url + "/" + endpoint.lstrip("/"),
             headers=self._headers("DELETE", path),
             timeout=15,
         )
-        resp.raise_for_status()
         return resp.json()
 
 
@@ -505,6 +552,10 @@ def log_trade(event: str, data: dict):
 # Exit monitor
 # ---------------------------------------------------------------------------
 
+NO_STOP_LOSS_RISE   = 0.15   # exit NO if YES rises more than this above entry YES price
+                              # e.g. entered when YES=$0.20, stop fires at YES=$0.35
+                              # replaces the old absolute $0.40 threshold
+
 def check_exits(client: KalshiClient, paper: bool = False):
     """
     Check all open positions and trigger exits where appropriate.
@@ -515,34 +566,50 @@ def check_exits(client: KalshiClient, paper: bool = False):
 
     NO trades:
       - Hold to resolution ($1.00) — no take-profit exit needed
-      - Stop loss if YES price rises above NO_STOP_LOSS_YES_THRESHOLD
-        (market is now pricing the bracket as likely — cut and move on)
+      - Stop loss if YES price has risen NO_STOP_LOSS_RISE above entry YES price
+        (relative threshold — more meaningful than an absolute level)
+
+    Prices are batch-fetched in a single API call rather than one call per position.
     """
     positions = [p for p in load_positions() if p["status"] == "open"]
     if not positions:
         return
 
+    # ── Batch fetch all prices in one API call ────────────────────────────
+    tickers    = [p["ticker"] for p in positions]
+    ticker_csv = ",".join(tickers)
+    prices     = {}   # ticker → {yes_bid, no_bid}
+
+    try:
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"tickers": ticker_csv},
+            timeout=15,
+        ).json()
+        for m in resp.get("markets", []):
+            prices[m["ticker"]] = {
+                "yes_bid": float(m.get("yes_bid_dollars") or 0),
+                "no_bid":  float(m.get("no_bid_dollars")  or 0),
+            }
+    except Exception as e:
+        print(f"  Batch price fetch failed: {e} — skipping exit check")
+        return
+
+    # ── Evaluate each position ────────────────────────────────────────────
     for pos in positions:
         ticker      = pos["ticker"]
         side        = pos["side"]
         entry_price = pos["entry_price"]
         contracts   = pos["contracts"]
 
-        try:
-            market_data = requests.get(
-                f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
-                timeout=10,
-            ).json().get("market", {})
-
-            yes_price = float(market_data.get("yes_bid_dollars") or 0)
-            no_price  = float(market_data.get("no_bid_dollars")  or 0)
-
-        except Exception as e:
-            print(f"  Error fetching price for {ticker}: {e}")
+        if ticker not in prices:
             continue
 
-        exit_reason  = None
-        exit_price   = None
+        yes_price = prices[ticker]["yes_bid"]
+        no_price  = prices[ticker]["no_bid"]
+
+        exit_reason = None
+        exit_price  = None
 
         if side == "yes":
             current_price = yes_price
@@ -564,14 +631,17 @@ def check_exits(client: KalshiClient, paper: bool = False):
                       f"(stop was ${stop_loss:.2f})")
 
         else:  # NO trade
-            # Stop loss: exit if YES price has risen above threshold
-            # meaning the market now thinks this bracket is likely
-            if yes_price >= NO_STOP_LOSS_YES_THRESHOLD:
+            # Relative stop-loss: entry YES price is 1 - entry_no_price
+            entry_yes_price = round(1.0 - entry_price, 2)
+            stop_threshold  = round(entry_yes_price + NO_STOP_LOSS_RISE, 2)
+
+            if yes_price >= stop_threshold:
                 exit_reason = "no_stop_loss"
-                exit_price  = no_price   # sell NO at current NO bid
+                exit_price  = no_price
                 print(f"  NO STOP LOSS: {ticker} NO "
-                      f"YES price rose to ${yes_price:.2f} "
-                      f"(threshold ${NO_STOP_LOSS_YES_THRESHOLD:.2f}) — cutting loss")
+                      f"YES rose to ${yes_price:.2f} "
+                      f"(entry YES=${entry_yes_price:.2f} + {NO_STOP_LOSS_RISE:.2f} "
+                      f"= threshold ${stop_threshold:.2f})")
                 print(f"    Entry=${entry_price:.2f} → Exit=${exit_price:.2f} "
                       f"PnL=${round((exit_price - entry_price) * contracts, 2):+.2f}")
 
@@ -602,8 +672,6 @@ def check_exits(client: KalshiClient, paper: bool = False):
                 print(f"    [PAPER] Would exit {ticker} {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
 
-        time.sleep(0.2)
-
 
 # ---------------------------------------------------------------------------
 # Full pipeline: signals → execute
@@ -618,8 +686,14 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     deployable = round(balance * 0.70, 2)   # keep 30% in reserve
     print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
 
-    # Build set of tickers we already hold open positions on — no duplicates
-    open_tickers = {p["ticker"] for p in load_positions() if p["status"] == "open"}
+    # Build set of tickers we already hold open positions on — sourced from Kalshi
+    # This is more reliable than positions.json which may be stale
+    try:
+        live_positions = sync_from_kalshi(client)
+        open_tickers = {p["ticker"] for p in live_positions}
+    except Exception:
+        # Fall back to local file if sync fails
+        open_tickers = {p["ticker"] for p in load_positions() if p["status"] == "open"}
 
     executed    = 0
     deployed    = 0.0   # track how much we've spent this session

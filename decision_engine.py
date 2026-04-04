@@ -61,14 +61,13 @@ BOUNDARY_BUFFER     = 3.0      # °F — forecast must be this far inside bracke
                                # 3.0 → balanced starting point, revisit with backtest data
 
 # NO trade parameters
-NO_MAX_YES_PRICE    = 0.20     # only buy NO if YES is priced at or below this
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
+NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
+                               # must stay comfortably below NO_STOP_LOSS_RISE threshold
+                               # prevents entering positions already near stop-loss boundary
 NO_MAX_ENTRY_PRICE  = 0.87     # never pay more than this for a NO contract
                                # tightened from 0.90 — positions above this are
                                # often fee-neutral or worse after settlement
-NO_MAX_YES_PRICE    = 0.25     # re-introduced — never enter NO if YES is above this
-                               # must stay below NO_STOP_LOSS_YES_THRESHOLD (0.40)
-                               # prevents entering positions already near stop-loss boundary
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
                                # prevents carpet-bombing every bracket in a market
 
@@ -211,6 +210,11 @@ def evaluate_bracket(
         "trade_type":   None,
         "skip_reason":  None,
     }
+
+    # --- Gate 0: Market must be active ---
+    if bracket.get("status") not in (None, "active"):
+        signal["skip_reason"] = f"Market not active (status={bracket.get('status')})"
+        return signal
 
     # --- Gate 1: Timing ---
     if not (TRADE_WINDOW_START <= city_local_hour < TRADE_WINDOW_END):
