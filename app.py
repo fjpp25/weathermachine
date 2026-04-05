@@ -42,6 +42,11 @@ try:
 except ImportError:
     HAS_PYQTGRAPH = False
 
+# Pre-import trading modules so they're ready before any button is clicked
+# This avoids slow lazy imports when Reconcile or Start Trading is first clicked
+import trader as _trader_preload
+import reconcile as _reconcile_preload
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -360,6 +365,51 @@ class CredentialDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Generic background worker — uses Qt signals for thread-safe UI updates
+# ---------------------------------------------------------------------------
+
+class BackgroundWorker(QObject):
+    """
+    Runs a callable in a QThread and emits result/error back to the main thread.
+    Safer than threading.Thread + QTimer.singleShot on Windows.
+    """
+    finished = pyqtSignal(object)   # emits result
+    errored  = pyqtSignal(str)      # emits error message
+
+    def __init__(self, fn, *args, **kwargs):
+        super().__init__()
+        self._fn     = fn
+        self._args   = args
+        self._kwargs = kwargs
+
+    def run(self):
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+            self.finished.emit(result)
+        except Exception as e:
+            import traceback
+            self.errored.emit(f"{e}\n{traceback.format_exc()}")
+
+
+def run_in_background(fn, on_done, on_error=None, *args, **kwargs):
+    """
+    Helper: run fn(*args, **kwargs) in a QThread,
+    call on_done(result) on success, on_error(msg) on failure.
+    Returns the thread so the caller can keep a reference.
+    """
+    worker = BackgroundWorker(fn, *args, **kwargs)
+    thread = QThread()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.finished.connect(on_done)
+    worker.finished.connect(lambda _: thread.quit())
+    worker.errored.connect(on_error or (lambda e: None))
+    worker.errored.connect(lambda _: thread.quit())
+    thread.start()
+    return thread, worker   # caller must hold reference to prevent GC
+
+
+# ---------------------------------------------------------------------------
 # Scheduler worker thread
 # ---------------------------------------------------------------------------
 
@@ -374,6 +424,7 @@ class SchedulerWorker(QObject):
     positions_updated = pyqtSignal()
     balance_updated   = pyqtSignal(float, float)
     client_ready      = pyqtSignal(object)
+    session_entry     = pyqtSignal(dict)   # emitted each time an order is placed
     stopped           = pyqtSignal()
 
     def __init__(self, paper: bool = False):
@@ -397,9 +448,36 @@ class SchedulerWorker(QObject):
         try:
             import trader
             import decision_engine
+            import reconcile as reconcile_mod
 
             client = trader.make_client(skip_confirmation=True)
             self.client_ready.emit(client)
+
+            # ── Auto-reconcile on startup ─────────────────────────────────
+            # Close any locally tracked positions that have already settled
+            try:
+                self.log_line.emit("  Auto-reconciling settled positions...")
+                settlements       = reconcile_mod.fetch_settlements(client)
+                settled_by_ticker = {s["ticker"]: s for s in settlements}
+                local_open        = [p for p in trader.load_positions()
+                                     if p["status"] == "open"]
+                reconciled = 0
+                for pos in local_open:
+                    ticker = pos.get("ticker")
+                    if not ticker or ticker not in settled_by_ticker:
+                        continue
+                    s          = settled_by_ticker[ticker]
+                    result     = s.get("market_result", "").lower()
+                    fee_cost   = float(s.get("fee_cost") or 0)
+                    won        = (result == pos["side"])
+                    exit_price = 1.00 if won else 0.00
+                    trader.record_exit(pos["id"], exit_price, f"settled_{result}")
+                    reconciled += 1
+                self.log_line.emit(f"  Reconciled {reconciled} settled position(s).")
+                # Signal UI to refresh performance data
+                self.positions_updated.emit()
+            except Exception as e:
+                self.log_line.emit(f"  Auto-reconcile skipped: {e}")
 
             ACTIVITY_START = 9
             ACTIVITY_END   = 15
@@ -449,9 +527,17 @@ class SchedulerWorker(QObject):
                 now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
                 self.log_line.emit(f"\n[{now_str}] Poll #{poll_count}  ({interval_secs//60} min interval)")
 
-                # Run pipeline
+                # Run pipeline — track new entries for Session Activity tab
                 try:
+                    tickers_before = {p["ticker"] for p in trader.sync_from_kalshi(client)}
                     trader.run_pipeline(client=client, paper=self.paper)
+                    positions_after = trader.sync_from_kalshi(client)
+                    for pos in positions_after:
+                        if pos["ticker"] not in tickers_before:
+                            self.session_entry.emit({
+                                **pos,
+                                "entered_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                            })
                     self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"Pipeline error: {e}")
@@ -597,23 +683,6 @@ class HomeTab(QWidget):
         self.countdown_label = QLabel("")
         self.countdown_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
 
-        self.reconcile_btn = QPushButton("↻  Reconcile")
-        self.reconcile_btn.setFixedHeight(44)
-        self.reconcile_btn.setFixedWidth(140)
-        self.reconcile_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {BG_PANEL};
-                color: {ACCENT};
-                border: 1px solid {ACCENT_DIM};
-                border-radius: 6px;
-                font-size: 13px;
-                letter-spacing: 1px;
-            }}
-            QPushButton:hover {{ background: {ACCENT_DIM}; color: {BG_DARK}; }}
-            QPushButton:disabled {{ border-color: {BORDER}; color: {TEXT_SEC}; }}
-        """)
-        self.reconcile_btn.clicked.connect(self.run_reconcile)
-
         self.sync_btn = QPushButton("⟳  Sync")
         self.sync_btn.setFixedHeight(44)
         self.sync_btn.setFixedWidth(100)
@@ -630,8 +699,6 @@ class HomeTab(QWidget):
         self.sync_btn.clicked.connect(self.sync_positions_from_kalshi)
 
         top_bar.addWidget(self.start_btn)
-        top_bar.addSpacing(8)
-        top_bar.addWidget(self.reconcile_btn)
         top_bar.addSpacing(8)
         top_bar.addWidget(self.sync_btn)
         top_bar.addSpacing(12)
@@ -689,7 +756,7 @@ class HomeTab(QWidget):
         self.pos_table = QTableWidget()
         self.pos_table.setColumnCount(7)
         self.pos_table.setHorizontalHeaderLabels(
-            ["Ticker", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Updated"]
+            ["Ticker", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened"]
         )
         self.pos_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.pos_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
@@ -756,7 +823,8 @@ class HomeTab(QWidget):
             self._stop_scheduler()
         else:
             # Check if live mode — show confirmation dialog
-            demo = os.environ.get("KALSHI_DEMO", "true").lower() != "false"            if not demo:
+            demo = os.environ.get("KALSHI_DEMO", "true").lower() != "false"
+            if not demo:
                 dlg = QMessageBox(self)
                 dlg.setWindowTitle("Live Trading Confirmation")
                 dlg.setText("⚠  LIVE TRADING MODE")
@@ -818,10 +886,15 @@ class HomeTab(QWidget):
         self._worker.poll_finished.connect(self._on_poll_finished)
         self._worker.client_ready.connect(self._on_client_ready)
         self._worker.positions_updated.connect(self.sync_positions_from_kalshi)
+        self._worker.positions_updated.connect(self._on_positions_updated)
         self._worker.balance_updated.connect(self._on_balance_updated)
         self._worker.stopped.connect(self._on_worker_stopped)
 
         self._thread.start()
+
+        # Notify registered start callbacks (e.g. session tab wiring)
+        for cb in getattr(self, '_start_trading_callbacks', []):
+            cb()
 
     def _stop_scheduler(self):
         if self._worker:
@@ -861,6 +934,11 @@ class HomeTab(QWidget):
             cb(client)
         self.sync_positions_from_kalshi()
 
+    def _on_positions_updated(self):
+        """Notify registered callbacks that positions changed (e.g. auto-refresh PnL tab)."""
+        for cb in getattr(self, '_positions_updated_callbacks', []):
+            cb()
+
     def _on_poll_started(self, poll_num: int):
         self.status_label.setText(f"Poll #{poll_num} running...")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
@@ -891,99 +969,33 @@ class HomeTab(QWidget):
         sb = self.log_box.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def run_reconcile(self):
-        """Run reconciliation against Kalshi settlements and refresh positions."""
-        self.reconcile_btn.setEnabled(False)
-        self.reconcile_btn.setText("Reconciling...")
-        self.append_log("Running reconciliation...")
-
-        def do_reconcile():
-            try:
-                import reconcile
-                import trader
-
-                client = trader.make_client(skip_confirmation=True)
-                settlements = reconcile.fetch_settlements(client)
-                settled_by_ticker = {s["ticker"]: s for s in settlements}
-
-                local_open = [p for p in trader.load_positions()
-                              if p["status"] == "open"]
-                reconciled = 0
-                for pos in local_open:
-                    ticker = pos["ticker"]
-                    if ticker not in settled_by_ticker:
-                        continue
-                    s        = settled_by_ticker[ticker]
-                    result   = s.get("market_result", "").lower()
-                    fee_cost = float(s.get("fee_cost") or 0)
-                    won      = (result == pos["side"])
-                    exit_price = 1.00 if won else 0.00
-                    trader.record_exit(pos["id"], exit_price, f"settled_{result}")
-                    trader.log_trade("settled", {
-                        "ticker":      ticker,
-                        "side":        pos["side"],
-                        "entry_price": pos["entry_price"],
-                        "exit_price":  exit_price,
-                        "contracts":   pos["contracts"],
-                        "result":      result,
-                        "pnl":         round((exit_price - pos["entry_price"]) * pos["contracts"] - fee_cost, 2),
-                        "fee_cost":    fee_cost,
-                    })
-                    reconciled += 1
-
-                return reconciled, len(local_open)
-
-            except Exception as e:
-                return None, str(e)
-
-        # Run in thread to avoid blocking UI
-        import threading
-        def worker():
-            result, info = do_reconcile()
-            # Use QTimer to update UI from main thread
-            from PyQt6.QtCore import QTimer
-            def finish():
-                self.reconcile_btn.setEnabled(True)
-                self.reconcile_btn.setText("↻  Reconcile")
-                if result is None:
-                    self.append_log(f"Reconcile error: {info}")
-                else:
-                    self.append_log(f"Reconcile complete — {result}/{info} positions settled.")
-                self.refresh_positions()
-            QTimer.singleShot(0, finish)
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def sync_positions_from_kalshi(self):
         """Fetch live positions directly from Kalshi and update the table."""
         if not hasattr(self, '_client') or self._client is None:
-            # No client yet — load from local file as fallback
             self.refresh_positions()
             return
 
         self.sync_btn.setEnabled(False)
         self.sync_btn.setText("Syncing...")
+        client = self._client
 
-        import threading
-        def worker():
-            try:
-                import trader
-                positions = trader.sync_from_kalshi(self._client)
-                from PyQt6.QtCore import QTimer
-                def finish():
-                    self._update_positions_table(positions)
-                    self.sync_btn.setEnabled(True)
-                    self.sync_btn.setText("⟳  Sync")
-                QTimer.singleShot(0, finish)
-            except Exception as e:
-                from PyQt6.QtCore import QTimer
-                def finish():
-                    self.append_log(f"Sync error: {e}")
-                    self.sync_btn.setEnabled(True)
-                    self.sync_btn.setText("⟳  Sync")
-                QTimer.singleShot(0, finish)
+        def fetch():
+            return _trader_preload.sync_from_kalshi(client)
 
-        threading.Thread(target=worker, daemon=True).start()
+        def on_done(positions):
+            self._update_positions_table(positions)
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("⟳  Sync")
+
+        def on_error(msg):
+            self.append_log(f"Sync error: {msg}")
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("⟳  Sync")
+
+        # Keep reference to prevent GC
+        self._sync_thread, self._sync_worker = run_in_background(
+            fetch, on_done, on_error
+        )
 
     def _update_positions_table(self, positions: list):
         """Update the positions table from a list of enriched position dicts."""
@@ -1188,55 +1200,171 @@ class PnLTab(QWidget):
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Loading...")
         self.status_label.setText("Fetching settlements from Kalshi...")
+        client = self._client
 
-        import threading
-        def worker():
-            try:
-                # Fetch all settlements, paginate if needed
-                all_settlements = []
-                cursor = None
-                while True:
-                    params = {"limit": 200}
-                    if cursor:
-                        params["cursor"] = cursor
-                    data   = self._client.get("portfolio/settlements", params=params)
-                    batch  = data.get("settlements", [])
-                    all_settlements.extend(batch)
-                    cursor = data.get("cursor")
-                    if not cursor or not batch:
-                        break
+        def fetch():
+            # Fetch settlements
+            all_settlements = []
+            cursor = None
+            while True:
+                params = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                data   = client.get("portfolio/settlements", params=params)
+                batch  = data.get("settlements", [])
+                all_settlements.extend(batch)
+                cursor = data.get("cursor")
+                if not cursor or not batch:
+                    break
 
-                # Filter to temperature markets only
-                temp = [
-                    s for s in all_settlements
-                    if s.get("ticker", "").startswith("KX")
-                    and ("HIGH" in s.get("ticker", "") or "LOWT" in s.get("ticker", ""))
-                ]
+            temp = [
+                s for s in all_settlements
+                if s.get("ticker", "").startswith("KX")
+                and ("HIGH" in s.get("ticker", "") or "LOWT" in s.get("ticker", ""))
+            ]
+            settled_tickers = {s["ticker"] for s in temp}
 
-                from PyQt6.QtCore import QTimer
-                def finish():
-                    self._populate(temp)
-                    self.refresh_btn.setEnabled(True)
-                    self.refresh_btn.setText("↻  Refresh")
-                    self.status_label.setText(
-                        f"Loaded {len(temp)} temperature settlements  •  "
-                        f"Last updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
-                    )
-                    self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
-                QTimer.singleShot(0, finish)
+            # Fetch fills for accurate entry prices + early exit detection
+            all_fills = []
+            cursor = None
+            while True:
+                params = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                data  = client.get("portfolio/fills", params=params)
+                batch = data.get("fills", [])
+                all_fills.extend(batch)
+                cursor = data.get("cursor")
+                if not cursor or not batch:
+                    break
 
-            except Exception as e:
-                from PyQt6.QtCore import QTimer
-                def finish():
-                    self.refresh_btn.setEnabled(True)
-                    self.refresh_btn.setText("↻  Refresh")
-                    self.status_label.setText(f"Error: {e}")
-                    self.status_label.setStyleSheet(f"color: {RED}; font-size: 11px;")
-                QTimer.singleShot(0, finish)
+            # Filter fills to temperature markets only
+            temp_fills = [
+                f for f in all_fills
+                if f.get("ticker", "").startswith("KX")
+                and ("HIGH" in f.get("ticker", "") or "LOWT" in f.get("ticker", ""))
+            ]
 
-        threading.Thread(target=worker, daemon=True).start()
+            # Index fills by ticker
+            from collections import defaultdict
+            fills_by_ticker = defaultdict(list)
+            for f in temp_fills:
+                fills_by_ticker[f.get("ticker", "")].append(f)
 
-    def _populate(self, settlements: list):
+            # Build settlement date index for comparison
+            settled_dates = {s["ticker"]: s.get("settled_time", "")
+                             for s in all_settlements
+                             if s.get("ticker", "").startswith("KX")}
+
+            # Detect early exits: tickers with sell fills BEFORE settlement
+            # These are stop-losses — we exited before the market resolved
+            early_exits = []
+            for ticker, fills in fills_by_ticker.items():
+                buy_fills  = [f for f in fills if f.get("action") == "buy"]
+                sell_fills = [f for f in fills if f.get("action") == "sell"]
+
+                if not buy_fills or not sell_fills:
+                    continue
+
+                # Check if any sell fill happened before the settlement time
+                settle_time = settled_dates.get(ticker, "")
+                early_sells = [f for f in sell_fills
+                               if not settle_time or
+                               f.get("created_time", "") < settle_time]
+
+                if not early_sells:
+                    continue  # sells were at/after settlement — not an early exit
+
+                # Our side = what we bought
+                sides    = [f.get("side") for f in buy_fills]
+                our_side = max(set(sides), key=sides.count)
+
+                our_buys = [f for f in buy_fills if f.get("side") == our_side]
+
+                # Exit fills use the OPPOSITE side (closing NO = sell YES)
+                exit_side        = "yes" if our_side == "no" else "no"
+                our_early_sells  = [f for f in early_sells
+                                    if f.get("side") == exit_side]
+
+                if not our_early_sells:
+                    continue
+
+                buy_price_field  = ("yes_price_dollars" if our_side == "yes"
+                                    else "no_price_dollars")
+                sell_price_field = ("yes_price_dollars" if exit_side == "yes"
+                                    else "no_price_dollars")
+
+                buy_contracts  = sum(float(f.get("count_fp") or 0) for f in our_buys)
+                sell_contracts = sum(float(f.get("count_fp") or 0)
+                                     for f in our_early_sells)
+
+                if buy_contracts == 0:
+                    continue
+
+                avg_buy_price  = sum(
+                    float(f.get(buy_price_field) or 0) * float(f.get("count_fp") or 0)
+                    for f in our_buys
+                ) / buy_contracts
+
+                avg_sell_price = sum(
+                    float(f.get(sell_price_field) or 0) * float(f.get("count_fp") or 0)
+                    for f in our_early_sells
+                ) / max(sell_contracts, 1)
+
+                contracts = int(min(buy_contracts, sell_contracts))
+                cost      = round(avg_buy_price  * contracts, 4)
+                proceeds  = round(avg_sell_price * contracts, 4)
+                fee       = sum(float(f.get("fee_cost") or 0)
+                                for f in our_buys + our_early_sells)
+                net_pnl   = round(proceeds - cost - fee, 4)
+
+                date = sorted(our_early_sells,
+                              key=lambda f: f.get("created_time", ""),
+                              reverse=True)[0].get("created_time", "")[:10]
+
+                early_exits.append({
+                    "ticker":    ticker,
+                    "date":      date,
+                    "side":      our_side.upper(),
+                    "contracts": contracts,
+                    "avg_buy":   round(avg_buy_price, 4),
+                    "avg_sell":  round(avg_sell_price, 4),
+                    "fee":       round(fee, 4),
+                    "net_pnl":   net_pnl,
+                    "exit_type": "early_exit",
+                })
+
+            # Remove early exit tickers from settled list to avoid double-counting
+            early_exit_tickers = {e["ticker"] for e in early_exits}
+            temp = [s for s in temp if s["ticker"] not in early_exit_tickers]
+
+            return temp, dict(fills_by_ticker), early_exits
+
+        def on_done(result):
+            settlements, fills_by_ticker, early_exits = result
+            self._populate(settlements, fills_by_ticker, early_exits)
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("↻  Refresh")
+            n_settled = len(settlements)
+            n_exits   = len(early_exits)
+            self.status_label.setText(
+                f"Loaded {n_settled} settlements + {n_exits} early exits  •  "
+                f"Last updated {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+            )
+            self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
+        def on_error(msg):
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("↻  Refresh")
+            self.status_label.setText(f"Error loading data")
+            self.status_label.setStyleSheet(f"color: {RED}; font-size: 11px;")
+
+        self._pnl_thread, self._pnl_worker = run_in_background(
+            fetch, on_done, on_error
+        )
+
+    def _populate(self, settlements: list, fills_by_ticker: dict = None,
+                  early_exits: list = None):
         """Build all views from raw settlement data."""
         from collections import defaultdict
 
@@ -1245,39 +1373,70 @@ class PnLTab(QWidget):
         for s in settlements:
             ticker   = s.get("ticker", "")
             result   = s.get("market_result", "").lower()
-            yes_fp   = float(s.get("yes_count_fp") or 0)
-            no_fp    = float(s.get("no_count_fp") or 0)
             fee      = float(s.get("fee_cost") or 0)
-            revenue  = float(s.get("revenue") or 0) / 100   # revenue in cents
+            revenue  = float(s.get("revenue") or 0) / 100   # cents → dollars
             settled  = s.get("settled_time", "")[:10]
 
-            # Determine side held and contracts
-            if yes_fp > 0:
-                side      = "yes"
-                contracts = int(yes_fp)
-            elif no_fp > 0:
-                side      = "no"
-                contracts = int(no_fp)
-            else:
+            # Determine our side and cost purely from fills
+            # Settlement fields for cost are unreliable — they reflect both sides
+            if not fills_by_ticker or ticker not in fills_by_ticker:
+                continue   # skip if no fill data available
+
+            buy_fills = [f for f in fills_by_ticker[ticker]
+                         if f.get("action") == "buy"]
+            if not buy_fills:
                 continue
 
-            won     = (result == side)
-            payout  = revenue - fee   # actual cash received net of fees
-            # Cost = total paid for the contracts
-            cost    = float(s.get("yes_total_cost") or s.get("no_total_cost") or 0) / 100
-            net_pnl = round(payout - cost, 4) if won else round(-cost - fee, 4)
+            # Our side = what we bought
+            sides = [f.get("side") for f in buy_fills]
+            our_side = max(set(sides), key=sides.count)
+
+            our_fills = [f for f in buy_fills if f.get("side") == our_side]
+            contracts = int(sum(float(f.get("count_fp") or 0) for f in our_fills))
+
+            price_field = "yes_price_dollars" if our_side == "yes" else "no_price_dollars"
+            cost = round(sum(
+                float(f.get(price_field) or 0) * float(f.get("count_fp") or 0)
+                for f in our_fills
+            ), 4)
+
+            if contracts == 0 or cost == 0:
+                continue
+
+            won    = (result == our_side)
+
+            # Payout: if we won, we receive $1.00 per contract minus fee
+            # revenue from API is unreliable (sometimes 0 even for wins)
+            if won:
+                payout  = contracts * 1.0
+                net_pnl = round(payout - cost - fee, 4)
+            else:
+                net_pnl = round(-cost - fee, 4)
 
             enriched.append({
                 "ticker":    ticker,
                 "date":      settled,
-                "side":      side.upper(),
+                "side":      our_side.upper(),
                 "contracts": contracts,
                 "result":    result.upper(),
                 "won":       won,
                 "cost":      cost,
-                "payout":    round(payout, 4),
                 "fee":       fee,
                 "net_pnl":   net_pnl,
+            })
+
+        # Add early exits (stop-losses, manual closes) to enriched list
+        for ex in (early_exits or []):
+            enriched.append({
+                "ticker":    ex["ticker"],
+                "date":      ex["date"],
+                "side":      ex["side"],
+                "contracts": ex["contracts"],
+                "result":    "EARLY EXIT",
+                "won":       ex["net_pnl"] > 0,
+                "cost":      ex["avg_buy"] * ex["contracts"],
+                "fee":       ex["fee"],
+                "net_pnl":   ex["net_pnl"],
             })
 
         if not enriched:
@@ -1385,19 +1544,177 @@ class PnLTab(QWidget):
             )
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
-            won_str = "WON ✓" if e["won"] else "LOST ✗"
-            vals    = [e["date"], e["ticker"], e["side"], str(e["contracts"]),
-                       won_str, f"${e['fee']:.2f}", f"${e['net_pnl']:+.2f}"]
+            result  = e.get("result", "")
+            if result == "EARLY EXIT":
+                result_str = "EXIT ↩"
+                result_color = YELLOW
+            elif e["won"]:
+                result_str = "WON ✓"
+                result_color = ACCENT
+            else:
+                result_str = "LOST ✗"
+                result_color = RED
+
+            vals = [e["date"], e["ticker"], e["side"], str(e["contracts"]),
+                    result_str, f"${e['fee']:.2f}", f"${e['net_pnl']:+.2f}"]
             for ci, val in enumerate(vals):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if ci == 2:
                     item.setForeground(QColor(ACCENT if e["side"] == "NO" else YELLOW))
                 if ci == 4:
-                    item.setForeground(QColor(ACCENT if e["won"] else RED))
+                    item.setForeground(QColor(result_color))
                 if ci == 6:
                     item.setForeground(QColor(ACCENT if e["net_pnl"] >= 0 else RED))
                 self.settlements_table.setItem(ri, ci, item)
+
+
+# ---------------------------------------------------------------------------
+# Session Activity tab
+# ---------------------------------------------------------------------------
+
+class SessionTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self._entries = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(16)
+
+        # ── Header ───────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        title = QLabel("SESSION ACTIVITY")
+        title.setStyleSheet(f"color: {TEXT_PRI}; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
+
+        self.clear_btn = QPushButton("✕  Clear")
+        self.clear_btn.setFixedWidth(100)
+        self.clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {BG_PANEL};
+                color: {TEXT_SEC};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{ border-color: {RED}; color: {RED}; }}
+        """)
+        self.clear_btn.clicked.connect(self.clear)
+
+        self.count_label = QLabel("No entries this session")
+        self.count_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
+        hdr.addWidget(title)
+        hdr.addSpacing(16)
+        hdr.addWidget(self.count_label)
+        hdr.addStretch()
+        hdr.addWidget(self.clear_btn)
+        layout.addLayout(hdr)
+
+        # ── Summary bar ───────────────────────────────────────────────────
+        summary_row = QHBoxLayout()
+        self.stat_labels = {}
+        for key in ["Entries", "Open", "Stopped Out", "Avg Score"]:
+            frame = QFrame()
+            frame.setStyleSheet(f"""
+                QFrame {{
+                    background: {BG_PANEL};
+                    border: 1px solid {BORDER};
+                    border-radius: 6px;
+                }}
+            """)
+            fl = QVBoxLayout(frame)
+            fl.setContentsMargins(16, 8, 16, 8)
+            lbl_key = QLabel(key.upper())
+            lbl_key.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 1px;")
+            lbl_val = QLabel("—")
+            lbl_val.setStyleSheet(f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+            fl.addWidget(lbl_key)
+            fl.addWidget(lbl_val)
+            self.stat_labels[key] = lbl_val
+            summary_row.addWidget(frame)
+        layout.addLayout(summary_row)
+
+        # ── Table ─────────────────────────────────────────────────────────
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            ["Time", "Ticker", "Side", "Qty", "Entry", "Score", "Status"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in [0, 2, 3, 4, 5, 6]:
+            self.table.horizontalHeader().setSectionResizeMode(
+                col, QHeaderView.ResizeMode.ResizeToContents
+            )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet(
+            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
+        )
+        layout.addWidget(self.table, stretch=1)
+
+    def add_entry(self, pos: dict):
+        """Add a new position entry from this session."""
+        self._entries.append({**pos, "status": "Open"})
+        self._rebuild()
+
+    def update_status(self, ticker: str, status: str):
+        """Update status of an existing entry (e.g. 'Stopped Out')."""
+        for entry in self._entries:
+            if entry["ticker"] == ticker:
+                entry["status"] = status
+        self._rebuild()
+
+    def clear(self):
+        self._entries.clear()
+        self._rebuild()
+
+    def _rebuild(self):
+        entries = list(reversed(self._entries))  # newest first
+        self.table.setRowCount(len(entries))
+
+        open_count    = sum(1 for e in entries if e["status"] == "Open")
+        stopped_count = sum(1 for e in entries if e["status"] == "Stopped Out")
+        scores        = [e.get("score", 0) for e in entries if isinstance(e.get("score"), (int, float))]
+        avg_score     = f"{sum(scores)/len(scores):.1f}/3" if scores else "—"
+
+        self.stat_labels["Entries"].setText(str(len(entries)))
+        self.stat_labels["Open"].setText(str(open_count))
+        self.stat_labels["Open"].setStyleSheet(f"color: {ACCENT}; font-size: 18px; font-weight: bold;")
+        self.stat_labels["Stopped Out"].setText(str(stopped_count))
+        self.stat_labels["Stopped Out"].setStyleSheet(
+            f"color: {RED if stopped_count else TEXT_PRI}; font-size: 18px; font-weight: bold;"
+        )
+        self.stat_labels["Avg Score"].setText(avg_score)
+
+        self.count_label.setText(
+            f"{len(entries)} entr{'y' if len(entries)==1 else 'ies'} this session"
+        )
+
+        for row, e in enumerate(entries):
+            status     = e.get("status", "Open")
+            side       = e.get("side", "").upper()
+            score      = e.get("score", "?")
+            avg_cost   = e.get("avg_cost", 0)
+
+            status_color = ACCENT if status == "Open" else RED
+
+            vals = [
+                (e.get("entered_at", "—"),   TEXT_SEC),
+                (e.get("ticker", ""),         TEXT_PRI),
+                (side,                        ACCENT if side == "NO" else YELLOW),
+                (str(e.get("contracts", 1)), TEXT_PRI),
+                (f"${avg_cost:.2f}",          TEXT_PRI),
+                (f"{score}/3",                TEXT_PRI),
+                (status,                      status_color),
+            ]
+
+            for col, (val, color) in enumerate(vals):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QColor(color))
+                self.table.setItem(row, col, item)
 
 
 # ---------------------------------------------------------------------------
@@ -1412,10 +1729,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 760)
 
         tabs = QTabWidget()
-        self.home_tab = HomeTab()
-        self.pnl_tab  = PnLTab()
+        self.home_tab    = HomeTab()
+        self.session_tab = SessionTab()
+        self.pnl_tab     = PnLTab()
 
-        # Settings button in the tab bar corner
         settings_btn = QPushButton("⚙  Settings")
         settings_btn.setStyleSheet(f"""
             QPushButton {{
@@ -1430,14 +1747,26 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         tabs.setCornerWidget(settings_btn, Qt.Corner.TopRightCorner)
 
-        tabs.addTab(self.home_tab, "  Home  ")
-        tabs.addTab(self.pnl_tab,  "  Performance  ")
+        tabs.addTab(self.home_tab,    "  Home  ")
+        tabs.addTab(self.session_tab, "  Session  ")
+        tabs.addTab(self.pnl_tab,     "  Performance  ")
         tabs.currentChanged.connect(self._on_tab_changed)
 
-        # Pass client to PnL tab when scheduler connects
+        # Client ready → pass to PnL tab
         self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
+        # Positions updated → refresh PnL tab
+        self.home_tab._positions_updated_callbacks = [self._maybe_refresh_pnl]
+        # Wire session tab when scheduler starts
+        self.home_tab._start_trading_callbacks = [self._wire_session_signals]
 
         self.setCentralWidget(tabs)
+
+    def _wire_session_signals(self):
+        """Connect session_entry signal and clear the session tab."""
+        self.session_tab.clear()
+        worker = self.home_tab._worker
+        if worker:
+            worker.session_entry.connect(self.session_tab.add_entry)
 
     def _open_settings(self):
         """Open credential dialog — only when scheduler is not running."""
@@ -1462,8 +1791,13 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
             """)
 
+    def _maybe_refresh_pnl(self):
+        """Refresh PnL tab if it has a client — called after reconcile on startup."""
+        if self.pnl_tab._client is not None:
+            self.pnl_tab.load_data()
+
     def _on_tab_changed(self, idx: int):
-        if idx == 1 and self.pnl_tab._client is not None:
+        if idx == 2 and self.pnl_tab._client is not None:
             self.pnl_tab.load_data()
 
     def closeEvent(self, event):

@@ -282,6 +282,28 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     ]
 
     enriched = []
+    if not temp_positions:
+        return enriched
+
+    # Batch fetch current prices in one API call
+    tickers    = [pos["ticker"] for pos in temp_positions
+                  if float(pos.get("position_fp") or 0) != 0]
+    prices     = {}
+    if tickers:
+        try:
+            resp = requests.get(
+                "https://api.elections.kalshi.com/trade-api/v2/markets",
+                params={"tickers": ",".join(tickers)},
+                timeout=15,
+            ).json()
+            for m in resp.get("markets", []):
+                prices[m["ticker"]] = {
+                    "yes_bid": float(m.get("yes_bid_dollars") or 0),
+                    "no_bid":  float(m.get("no_bid_dollars")  or 0),
+                }
+        except Exception:
+            pass  # prices will be 0 if fetch fails — still show positions
+
     for pos in temp_positions:
         ticker       = pos["ticker"]
         # position_fp is a signed string: positive = long YES, negative = long NO
@@ -297,20 +319,11 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
         contracts = int(abs(position_fp))
         avg_cost  = round(total_cost / contracts, 4) if contracts else 0
 
-        # Fetch current market price for unrealised PnL
-        try:
-            market_data = requests.get(
-                f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
-                timeout=10,
-            ).json().get("market", {})
-
-            if side == "yes":
-                current_price = float(market_data.get("yes_bid_dollars") or 0)
-            else:
-                current_price = float(market_data.get("no_bid_dollars") or 0)
-
+        # Look up price from batch result
+        if ticker in prices:
+            current_price  = prices[ticker]["yes_bid"] if side == "yes" else prices[ticker]["no_bid"]
             unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
-        except Exception:
+        else:
             current_price  = 0
             unrealised_pnl = 0
 
@@ -559,99 +572,107 @@ NO_STOP_LOSS_RISE   = 0.15   # exit NO if YES rises more than this above entry Y
 def check_exits(client: KalshiClient, paper: bool = False):
     """
     Check all open positions and trigger exits where appropriate.
+    Sources positions directly from Kalshi — not from local positions.json.
+
+    NO trades:
+      - Stop loss if YES price has risen NO_STOP_LOSS_RISE above entry YES price
+        Entry YES price = 1.0 - avg_cost (derived from Kalshi position data)
 
     YES trades:
       - Take profit when price rises YES_EXIT_TARGET% from entry
       - Stop loss when price falls YES_STOP_LOSS% from entry
-
-    NO trades:
-      - Hold to resolution ($1.00) — no take-profit exit needed
-      - Stop loss if YES price has risen NO_STOP_LOSS_RISE above entry YES price
-        (relative threshold — more meaningful than an absolute level)
-
-    Prices are batch-fetched in a single API call rather than one call per position.
     """
-    positions = [p for p in load_positions() if p["status"] == "open"]
-    if not positions:
+    # Get live positions from Kalshi — this catches ALL open positions
+    # regardless of whether they were recorded in positions.json
+    try:
+        live_positions = sync_from_kalshi(client)
+    except Exception as e:
+        print(f"  Could not fetch live positions for exit check: {e}")
         return
 
-    # ── Batch fetch all prices in one API call ────────────────────────────
-    tickers    = [p["ticker"] for p in positions]
-    ticker_csv = ",".join(tickers)
-    prices     = {}   # ticker → {yes_bid, no_bid}
+    if not live_positions:
+        return
 
+    # Prices already fetched by sync_from_kalshi — use current_price directly
+    # But we need yes_bid specifically for NO stop-loss check, so batch fetch
+    tickers   = [p["ticker"] for p in live_positions]
+    prices    = {}
     try:
         resp = requests.get(
             "https://api.elections.kalshi.com/trade-api/v2/markets",
-            params={"tickers": ticker_csv},
+            params={"tickers": ",".join(tickers)},
             timeout=15,
         ).json()
         for m in resp.get("markets", []):
             prices[m["ticker"]] = {
                 "yes_bid": float(m.get("yes_bid_dollars") or 0),
                 "no_bid":  float(m.get("no_bid_dollars")  or 0),
+                "status":  m.get("status", "active"),
             }
     except Exception as e:
         print(f"  Batch price fetch failed: {e} — skipping exit check")
         return
 
-    # ── Evaluate each position ────────────────────────────────────────────
-    for pos in positions:
-        ticker      = pos["ticker"]
-        side        = pos["side"]
-        entry_price = pos["entry_price"]
-        contracts   = pos["contracts"]
+    for pos in live_positions:
+        ticker    = pos["ticker"]
+        side      = pos["side"]           # "yes" or "no"
+        avg_cost  = pos["avg_cost"]       # what we paid per contract
+        contracts = pos["contracts"]
 
         if ticker not in prices:
             continue
 
-        yes_price = prices[ticker]["yes_bid"]
-        no_price  = prices[ticker]["no_bid"]
+        market   = prices[ticker]
+        status   = market["status"]
+        yes_price = market["yes_bid"]
+        no_price  = market["no_bid"]
+
+        # Skip markets that are no longer active
+        if status not in ("active", "initialized"):
+            continue
 
         exit_reason = None
         exit_price  = None
 
-        if side == "yes":
-            current_price = yes_price
-            take_profit   = round(entry_price * (1 + YES_EXIT_TARGET), 2)
-            stop_loss     = round(entry_price * (1 - YES_STOP_LOSS),   2)
-
-            if current_price >= take_profit:
-                exit_reason = "take_profit"
-                exit_price  = current_price
-                print(f"  TAKE PROFIT: {ticker} YES "
-                      f"entry=${entry_price:.2f} → ${current_price:.2f} "
-                      f"(target was ${take_profit:.2f})")
-
-            elif current_price <= stop_loss:
-                exit_reason = "stop_loss"
-                exit_price  = current_price
-                print(f"  STOP LOSS: {ticker} YES "
-                      f"entry=${entry_price:.2f} → ${current_price:.2f} "
-                      f"(stop was ${stop_loss:.2f})")
-
-        else:  # NO trade
-            # Relative stop-loss: entry YES price is 1 - entry_no_price
-            entry_yes_price = round(1.0 - entry_price, 2)
+        if side == "no":
+            # Entry YES price = 1.0 - what we paid for NO
+            entry_yes_price = round(1.0 - avg_cost, 2)
             stop_threshold  = round(entry_yes_price + NO_STOP_LOSS_RISE, 2)
 
             if yes_price >= stop_threshold:
                 exit_reason = "no_stop_loss"
                 exit_price  = no_price
-                print(f"  NO STOP LOSS: {ticker} NO "
+                print(f"  NO STOP LOSS: {ticker} "
                       f"YES rose to ${yes_price:.2f} "
                       f"(entry YES=${entry_yes_price:.2f} + {NO_STOP_LOSS_RISE:.2f} "
                       f"= threshold ${stop_threshold:.2f})")
-                print(f"    Entry=${entry_price:.2f} → Exit=${exit_price:.2f} "
-                      f"PnL=${round((exit_price - entry_price) * contracts, 2):+.2f}")
+                print(f"    Avg cost=${avg_cost:.2f} → Exit=${exit_price:.2f} "
+                      f"PnL=${round((exit_price - avg_cost) * contracts, 2):+.2f}")
+
+        else:  # YES trade
+            take_profit = round(avg_cost * (1 + YES_EXIT_TARGET), 2)
+            stop_loss   = round(avg_cost * (1 - YES_STOP_LOSS),   2)
+
+            if yes_price >= take_profit:
+                exit_reason = "take_profit"
+                exit_price  = yes_price
+                print(f"  TAKE PROFIT: {ticker} YES "
+                      f"${avg_cost:.2f} → ${yes_price:.2f}")
+            elif yes_price <= stop_loss:
+                exit_reason = "stop_loss"
+                exit_price  = yes_price
+                print(f"  STOP LOSS: {ticker} YES "
+                      f"${avg_cost:.2f} → ${yes_price:.2f}")
 
         if exit_reason:
             if not paper:
+                # Place exit order
+                exit_side = "yes" if side == "no" else "no"
                 try:
                     place_order(
                         client        = client,
                         ticker        = ticker,
-                        side          = side,
+                        side          = exit_side,
                         price_dollars = exit_price,
                         contracts     = contracts,
                         paper         = False,
@@ -660,17 +681,25 @@ def check_exits(client: KalshiClient, paper: bool = False):
                     print(f"  Exit order failed for {ticker}: {e}")
                     continue
 
-                record_exit(pos["id"], exit_price, exit_reason)
+                # Update local record if it exists
+                local_positions = load_positions()
+                for p in local_positions:
+                    if p["ticker"] == ticker and p["status"] == "open":
+                        record_exit(p["id"], exit_price, exit_reason)
+                        break
+
                 log_trade(exit_reason, {
                     "ticker":      ticker,
                     "side":        side,
-                    "entry_price": entry_price,
+                    "avg_cost":    avg_cost,
                     "exit_price":  exit_price,
                     "contracts":   contracts,
                 })
             else:
                 print(f"    [PAPER] Would exit {ticker} {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
+
+        time.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
