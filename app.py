@@ -43,18 +43,13 @@ except ImportError:
     HAS_PYQTGRAPH = False
 
 # Pre-import trading modules so they're ready before any button is clicked
-# This avoids slow lazy imports when Reconcile or Start Trading is first clicked
 import trader as _trader_preload
-import reconcile as _reconcile_preload
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-DATA_DIR        = Path("data")
-CONFIG_FILE     = DATA_DIR / "config.json"   # stores credentials locally
-POSITIONS_FILE  = DATA_DIR / "positions.json"
-SUMMARY_CSV     = DATA_DIR / "daily_summary.csv"
-TRADES_CSV      = DATA_DIR / "trades.csv"
+DATA_DIR    = Path("data")
+CONFIG_FILE = DATA_DIR / "config.json"
 
 CITY_TIMEZONES = {
     "New York":      "America/New_York",
@@ -500,36 +495,10 @@ class SchedulerWorker(QObject):
         try:
             import trader
             import decision_engine
-            import reconcile as reconcile_mod
 
             client = trader.make_client(skip_confirmation=True)
             self.client_ready.emit(client)
-
-            # ── Auto-reconcile on startup ─────────────────────────────────
-            # Close any locally tracked positions that have already settled
-            try:
-                self.log_line.emit("  Auto-reconciling settled positions...")
-                settlements       = reconcile_mod.fetch_settlements(client)
-                settled_by_ticker = {s["ticker"]: s for s in settlements}
-                local_open        = [p for p in trader.load_positions()
-                                     if p["status"] == "open"]
-                reconciled = 0
-                for pos in local_open:
-                    ticker = pos.get("ticker")
-                    if not ticker or ticker not in settled_by_ticker:
-                        continue
-                    s          = settled_by_ticker[ticker]
-                    result     = s.get("market_result", "").lower()
-                    fee_cost   = float(s.get("fee_cost") or 0)
-                    won        = (result == pos["side"])
-                    exit_price = 1.00 if won else 0.00
-                    trader.record_exit(pos["id"], exit_price, f"settled_{result}")
-                    reconciled += 1
-                self.log_line.emit(f"  Reconciled {reconciled} settled position(s).")
-                # Signal UI to refresh performance data
-                self.positions_updated.emit()
-            except Exception as e:
-                self.log_line.emit(f"  Auto-reconcile skipped: {e}")
+            self.log_line.emit("  Scheduler started.")
 
             ACTIVITY_START = 9
             ACTIVITY_END   = 15
@@ -973,7 +942,6 @@ class HomeTab(QWidget):
         self._worker.poll_finished.connect(self._on_poll_finished)
         self._worker.client_ready.connect(self._on_client_ready)
         self._worker.positions_updated.connect(self.sync_positions_from_kalshi)
-        self._worker.positions_updated.connect(self._on_positions_updated)
         self._worker.balance_updated.connect(self._on_balance_updated)
         self._worker.stopped.connect(self._on_worker_stopped)
 
@@ -1020,11 +988,6 @@ class HomeTab(QWidget):
         for cb in getattr(self, '_client_ready_callbacks', []):
             cb(client)
         self.sync_positions_from_kalshi()
-
-    def _on_positions_updated(self):
-        """Notify registered callbacks that positions changed (e.g. auto-refresh PnL tab)."""
-        for cb in getattr(self, '_positions_updated_callbacks', []):
-            cb()
 
     def _on_poll_started(self, poll_num: int):
         self.status_label.setText(f"Poll #{poll_num} running...")
@@ -1122,32 +1085,6 @@ class HomeTab(QWidget):
         color = ACCENT if total_unrealised >= 0 else RED
         self.pnl_label.setText(f"Unrealised  {sign}${total_unrealised:.2f}")
         self.pnl_label.setStyleSheet(f"color: {color}; font-size: 14px;")
-
-    def refresh_positions(self):
-        """Fallback: load from local positions.json when no Kalshi client available."""
-        if not POSITIONS_FILE.exists():
-            return
-        try:
-            with open(POSITIONS_FILE) as f:
-                positions = json.load(f)
-        except Exception:
-            return
-
-        open_pos = [p for p in positions if p["status"] == "open"]
-
-        # Convert local format to display format
-        display = []
-        for pos in open_pos:
-            display.append({
-                "ticker":        pos.get("ticker", ""),
-                "side":          pos.get("side", ""),
-                "contracts":     pos.get("contracts", 1),
-                "avg_cost":      pos.get("entry_price", 0),
-                "current_price": 0,
-                "unrealised_pnl":0,
-                "last_updated":  pos.get("opened_at", "")[:16].replace("T", " "),
-            })
-        self._update_positions_table(display)
 
     def _refresh_cities(self):
         for city, tz in CITY_TIMEZONES.items():
@@ -1883,8 +1820,6 @@ class MainWindow(QMainWindow):
 
         # Client ready → pass to PnL tab
         self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
-        # Positions updated → refresh PnL tab
-        self.home_tab._positions_updated_callbacks = [self._maybe_refresh_pnl]
         # Wire session tab when scheduler starts
         self.home_tab._start_trading_callbacks = [self._wire_session_signals]
 
@@ -1925,11 +1860,6 @@ class MainWindow(QMainWindow):
                 border: 1px solid {color};
                 border-radius: 4px;
             """)
-
-    def _maybe_refresh_pnl(self):
-        """Refresh PnL tab if it has a client — called after reconcile on startup."""
-        if self.pnl_tab._client is not None:
-            self.pnl_tab.load_data()
 
     def _on_tab_changed(self, idx: int):
         if idx == 2 and self.pnl_tab._client is not None:

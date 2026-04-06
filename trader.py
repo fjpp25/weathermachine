@@ -57,9 +57,6 @@ import decision_engine
 DEMO_BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
 PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-POSITIONS_FILE  = Path("data/positions.json")
-TRADE_LOG_FILE  = Path("data/trade_log.json")
-
 # Max contracts per single order — hard safety cap
 MAX_CONTRACTS_PER_ORDER = 10
 
@@ -489,86 +486,6 @@ def contracts_for_signal(signal: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Position store (local JSON)
-# ---------------------------------------------------------------------------
-
-def load_positions() -> list[dict]:
-    POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if POSITIONS_FILE.exists():
-        with open(POSITIONS_FILE) as f:
-            return json.load(f)
-    return []
-
-
-def save_positions(positions: list[dict]):
-    with open(POSITIONS_FILE, "w") as f:
-        json.dump(positions, f, indent=2, default=str)
-
-
-def record_entry(signal: dict, contracts: int, order_result: dict):
-    """Add a new position to the local store after entry."""
-    positions = load_positions()
-
-    # For NO trades: exit target is either the early-exit price or resolution ($1.00)
-    # Resolution is the natural exit — the early-exit target is just a bonus
-    trade_type  = signal["trade_type"].lower()
-    exit_target = signal["exit_target"] if trade_type == "yes" else 1.00
-
-    positions.append({
-        "id":           order_result.get("order", {}).get("client_order_id", "paper"),
-        "ticker":       signal["ticker"],
-        "side":         trade_type,
-        "entry_price":  signal["entry_price"],
-        "exit_target":  exit_target,
-        "early_exit":   signal["exit_target"] if trade_type == "no" else None,
-        "stop_loss":    signal.get("stop_loss"),
-        "contracts":    contracts,
-        "score":        signal["score"],
-        "score_detail": signal["score_detail"],
-        "status":       "open",
-        "opened_at":    datetime.now(timezone.utc).isoformat(),
-        "closed_at":    None,
-        "exit_price":   None,
-        "pnl":          None,
-    })
-    save_positions(positions)
-
-
-def record_exit(position_id: str, exit_price: float, reason: str):
-    """Mark a position as closed and compute PnL."""
-    positions = load_positions()
-    for pos in positions:
-        if pos["id"] == position_id and pos["status"] == "open":
-            contracts   = pos["contracts"]
-            entry_price = pos["entry_price"]
-            pnl         = round((exit_price - entry_price) * contracts, 2)
-            pos.update({
-                "status":     "closed",
-                "closed_at":  datetime.now(timezone.utc).isoformat(),
-                "exit_price": exit_price,
-                "exit_reason":reason,
-                "pnl":        pnl,
-            })
-            print(f"  Closed {pos['ticker']} @ ${exit_price:.2f}  PnL: ${pnl:+.2f}  ({reason})")
-    save_positions(positions)
-
-
-# ---------------------------------------------------------------------------
-# Trade log
-# ---------------------------------------------------------------------------
-
-def log_trade(event: str, data: dict):
-    TRADE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    log = json.loads(TRADE_LOG_FILE.read_text()) if TRADE_LOG_FILE.exists() else []
-    log.append({
-        "ts":    datetime.now(timezone.utc).isoformat(),
-        "event": event,
-        **data,
-    })
-    TRADE_LOG_FILE.write_text(json.dumps(log, indent=2, default=str))
-
-
-# ---------------------------------------------------------------------------
 # Exit monitor
 # ---------------------------------------------------------------------------
 
@@ -679,7 +596,6 @@ def check_exits(client: KalshiClient, paper: bool = False):
 
         if exit_reason:
             if not paper:
-                # Place exit order
                 exit_side = "yes" if side == "no" else "no"
                 try:
                     place_order(
@@ -690,24 +606,11 @@ def check_exits(client: KalshiClient, paper: bool = False):
                         contracts     = contracts,
                         paper         = False,
                     )
+                    print(f"  Exit order placed: {ticker} {exit_side.upper()} "
+                          f"@ ${exit_price:.2f}  reason={exit_reason}")
                 except Exception as e:
                     print(f"  Exit order failed for {ticker}: {e}")
                     continue
-
-                # Update local record if it exists
-                local_positions = load_positions()
-                for p in local_positions:
-                    if p["ticker"] == ticker and p["status"] == "open":
-                        record_exit(p["id"], exit_price, exit_reason)
-                        break
-
-                log_trade(exit_reason, {
-                    "ticker":      ticker,
-                    "side":        side,
-                    "avg_cost":    avg_cost,
-                    "exit_price":  exit_price,
-                    "contracts":   contracts,
-                })
             else:
                 print(f"    [PAPER] Would exit {ticker} {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
@@ -724,21 +627,19 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     evaluations = decision_engine.run(city_filter=city_filter, paper=False)
     decision_engine.display(evaluations)
 
-    balance = get_balance(client)
-    deployable = round(balance * 0.70, 2)   # keep 30% in reserve
+    balance    = get_balance(client)
+    deployable = round(balance * 0.70, 2)
     print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
 
-    # Build set of tickers we already hold open positions on — sourced from Kalshi
-    # This is more reliable than positions.json which may be stale
+    # Open tickers sourced directly from Kalshi — no local file
     try:
         live_positions = sync_from_kalshi(client)
-        open_tickers = {p["ticker"] for p in live_positions}
+        open_tickers   = {p["ticker"] for p in live_positions}
     except Exception:
-        # Fall back to local file if sync fails
-        open_tickers = {p["ticker"] for p in load_positions() if p["status"] == "open"}
+        open_tickers = set()
 
-    executed    = 0
-    deployed    = 0.0   # track how much we've spent this session
+    executed = 0
+    deployed = 0.0
     for ev in evaluations:
         city    = ev["city"]
         signals = [s for s in ev.get("signals", []) if s.get("trade_type")]
@@ -749,7 +650,6 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             price     = signal["entry_price"]
             ticker    = signal["ticker"]
 
-            # Skip if we already hold this ticker
             if ticker in open_tickers:
                 print(f"  Skipping {ticker} — already holding this position")
                 continue
@@ -765,7 +665,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                   f"target=${signal['exit_target']:.2f}  score={signal['score']}/3")
 
             try:
-                result = place_order(
+                place_order(
                     client        = client,
                     ticker        = ticker,
                     side          = side,
@@ -773,79 +673,13 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     contracts     = contracts,
                     paper         = paper,
                 )
-                record_entry(signal, contracts, result)
                 open_tickers.add(ticker)
-                deployed += cost   # track cumulative spend this session
-                log_trade("entry", {
-                    "city":        city,
-                    "ticker":      ticker,
-                    "side":        side,
-                    "price":       price,
-                    "contracts":   contracts,
-                    "score":       signal["score"],
-                    "score_detail":signal["score_detail"],
-                    "paper":       paper,
-                })
+                deployed += cost
                 executed += 1
-
             except Exception as e:
                 print(f"  Order failed for {ticker}: {e}")
-                log_trade("entry_failed", {"ticker": ticker, "error": str(e)})
 
     print(f"\n  {executed} order(s) placed.")
-
-
-# ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-def display_positions():
-    positions = load_positions()
-    if not positions:
-        print("No positions on record.")
-        return
-
-    open_pos   = [p for p in positions if p["status"] == "open"]
-    closed_pos = [p for p in positions if p["status"] == "closed"]
-
-    print(f"\n{'='*65}")
-    print(f"  Positions  ({len(open_pos)} open, {len(closed_pos)} closed)")
-    print(f"{'='*65}")
-
-    if open_pos:
-        print(f"\n  Open:")
-        print(f"  {'Ticker':<30} {'Side':>5} {'Entry':>7} {'Target':>8} {'Qty':>5}")
-        print(f"  {'-'*58}")
-        for p in open_pos:
-            # For NO trades: target is $1.00 (resolution), show early exit if set
-            if p["side"] == "no" and p.get("early_exit"):
-                target_str = f"${p['exit_target']:.2f} (early: ${p['early_exit']:.2f})"
-            else:
-                target_str = f"${p['exit_target']:.2f}"
-            print(
-                f"  {p['ticker']:<30} "
-                f"{p['side'].upper():>5} "
-                f"${p['entry_price']:.2f}  "
-                f"{target_str:<18} "
-                f"{p['contracts']:>5}"
-            )
-
-    if closed_pos:
-        total_pnl = sum(p.get("pnl") or 0 for p in closed_pos)
-        print(f"\n  Closed (total PnL: ${total_pnl:+.2f}):")
-        print(f"  {'Ticker':<30} {'Side':>5} {'Entry':>7} {'Exit':>7} {'PnL':>8}  Reason")
-        print(f"  {'-'*65}")
-        for p in closed_pos:
-            print(
-                f"  {p['ticker']:<30} "
-                f"{p['side'].upper():>5} "
-                f"${p['entry_price']:.2f}  "
-                f"${p.get('exit_price') or 0:.2f}  "
-                f"${p.get('pnl') or 0:>+.2f}   "
-                f"{p.get('exit_reason','?')}"
-            )
-
-    print(f"{'='*65}")
 
 
 # ---------------------------------------------------------------------------
@@ -855,7 +689,6 @@ def display_positions():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kalshi weather trader")
     parser.add_argument("--balance",    action="store_true", help="Show account balance")
-    parser.add_argument("--positions",  action="store_true", help="Show open/closed positions")
     parser.add_argument("--monitor",    action="store_true", help="Start exit monitor loop")
     parser.add_argument("--run",        action="store_true", help="Run full pipeline (signals + execute)")
     parser.add_argument("--test-order", action="store_true", help="Place + immediately cancel a $0.01 test order")
@@ -863,7 +696,6 @@ if __name__ == "__main__":
     parser.add_argument("--city",       type=str, default=None, help="Filter to one city")
     args = parser.parse_args()
 
-    # Load .env if present
     env_file = Path(".env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -871,10 +703,7 @@ if __name__ == "__main__":
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-    if args.positions:
-        display_positions()
-
-    elif args.balance or args.run or args.monitor or args.test_order:
+    if args.balance or args.run or args.monitor or args.test_order:
         client = make_client()
 
         if args.balance:
