@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 # ---------------------------------------------------------------------------
 
 POLL_INTERVAL_SECS = 15 * 60   # 15 minutes
-STOP_HOUR_LISBON   = 8         # stop at 8am Lisbon time
+STOP_HOUR_LISBON   = 23         # stop at 8am Lisbon time
 
 OUTPUT_JSON = Path("data/lowt_observations.json")
 OUTPUT_CSV  = Path("data/lowt_observations.csv")

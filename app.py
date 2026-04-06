@@ -81,12 +81,15 @@ TEXT_PRI    = "#e8eaf0"
 TEXT_SEC    = "#7a8099"
 BORDER      = "#232736"
 
-STYLESHEET = f"""
+DEFAULT_FONT_SIZE = 13
+
+def build_stylesheet(font_size: int = DEFAULT_FONT_SIZE) -> str:
+    return f"""
 QMainWindow, QWidget {{
     background-color: {BG_DARK};
     color: {TEXT_PRI};
     font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 13px;
+    font-size: {font_size}px;
 }}
 QTabWidget::pane {{
     border: 1px solid {BORDER};
@@ -98,7 +101,7 @@ QTabBar::tab {{
     padding: 10px 28px;
     border: 1px solid {BORDER};
     border-bottom: none;
-    font-size: 13px;
+    font-size: {font_size}px;
     letter-spacing: 1px;
 }}
 QTabBar::tab:selected {{
@@ -122,7 +125,7 @@ QHeaderView::section {{
     padding: 8px 10px;
     border: none;
     border-bottom: 1px solid {BORDER};
-    font-size: 11px;
+    font-size: {max(font_size - 2, 9)}px;
     letter-spacing: 1px;
     text-transform: uppercase;
 }}
@@ -139,12 +142,14 @@ QTextEdit {{
     color: {TEXT_SEC};
     border: 1px solid {BORDER};
     font-family: 'Consolas', monospace;
-    font-size: 11px;
+    font-size: {max(font_size - 2, 9)}px;
 }}
 QFrame[frameShape="4"], QFrame[frameShape="5"] {{
     color: {BORDER};
 }}
 """
+
+STYLESHEET = build_stylesheet(DEFAULT_FONT_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +302,50 @@ class CredentialDialog(QDialog):
         self.live_check.toggled.connect(self.warning.setVisible)
         layout.addWidget(self.warning)
 
+        # Separator
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(f"color: {BORDER};")
+        layout.addWidget(sep2)
+
+        # Appearance — font size
+        layout.addWidget(self._field_label("Appearance  —  Font Size"))
+        font_row = QHBoxLayout()
+        self.font_size_label = QLabel(f"{config.get('font_size', DEFAULT_FONT_SIZE)}px")
+        self.font_size_label.setStyleSheet(f"color: {ACCENT}; font-size: 13px; min-width: 36px;")
+
+        from PyQt6.QtWidgets import QSlider
+        self.font_slider = QSlider(Qt.Orientation.Horizontal)
+        self.font_slider.setMinimum(10)
+        self.font_slider.setMaximum(18)
+        self.font_slider.setValue(config.get("font_size", DEFAULT_FONT_SIZE))
+        self.font_slider.setTickInterval(1)
+        self.font_slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                background: {BORDER}; height: 4px; border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                background: {ACCENT}; width: 14px; height: 14px;
+                margin: -5px 0; border-radius: 7px;
+            }}
+            QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+        """)
+        self.font_slider.valueChanged.connect(
+            lambda v: self.font_size_label.setText(f"{v}px")
+        )
+
+        small_lbl = QLabel("A")
+        small_lbl.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px;")
+        large_lbl = QLabel("A")
+        large_lbl.setStyleSheet(f"color: {TEXT_SEC}; font-size: 16px;")
+
+        font_row.addWidget(small_lbl)
+        font_row.addWidget(self.font_slider, stretch=1)
+        font_row.addWidget(large_lbl)
+        font_row.addSpacing(8)
+        font_row.addWidget(self.font_size_label)
+        layout.addLayout(font_row)
+
         # Buttons
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
@@ -351,6 +400,7 @@ class CredentialDialog(QDialog):
             "key_id":    key_id,
             "key_file":  key_file,
             "live_mode": self.live_check.isChecked(),
+            "font_size": self.font_slider.value(),
         }
         save_config(config)
         apply_config(config)
@@ -361,6 +411,7 @@ class CredentialDialog(QDialog):
             "key_id":    self.key_id_edit.text().strip(),
             "key_file":  self.pem_edit.text().strip(),
             "live_mode": self.live_check.isChecked(),
+            "font_size": self.font_slider.value(),
         }
 
 
@@ -1136,9 +1187,9 @@ class PnLTab(QWidget):
             fl = QVBoxLayout(frame)
             fl.setContentsMargins(16, 10, 16, 10)
             lbl_key = QLabel(key.upper())
-            lbl_key.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 1px;")
+            lbl_key.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px; letter-spacing: 1px;")
             lbl_val = QLabel("—")
-            lbl_val.setStyleSheet(f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+            lbl_val.setStyleSheet(f"color: {TEXT_PRI}; font-size: 22px; font-weight: bold;")
             fl.addWidget(lbl_key)
             fl.addWidget(lbl_val)
             self.stat_labels[key] = lbl_val
@@ -1153,7 +1204,8 @@ class PnLTab(QWidget):
         if HAS_PYQTGRAPH:
             pg.setConfigOptions(antialias=True, background=BG_PANEL, foreground=TEXT_SEC)
             self.chart = pg.PlotWidget()
-            self.chart.setMinimumHeight(200)
+            self.chart.setMinimumHeight(150)
+            self.chart.setMaximumHeight(200)
             self.chart.showGrid(x=False, y=True, alpha=0.15)
             self.chart.getAxis("left").setTextPen(TEXT_SEC)
             self.chart.getAxis("bottom").setTextPen(TEXT_SEC)
@@ -1728,6 +1780,39 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("WeatherMachine  //  Kalshi Temperature Trader")
         self.setMinimumSize(1100, 760)
 
+        # ── Central widget with header + tabs ────────────────────────────
+        central = QWidget()
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Header bar
+        header = QFrame()
+        header.setFixedHeight(52)
+        header.setStyleSheet(f"""
+            QFrame {{
+                background: {BG_PANEL};
+                border-bottom: 1px solid {BORDER};
+            }}
+        """)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+        logo = QLabel("⛅  The Weather Machine")
+        logo.setStyleSheet(f"""
+            color: {ACCENT};
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 2px;
+        """)
+        subtitle = QLabel("Kalshi Temperature Markets")
+        subtitle.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;")
+        header_layout.addWidget(logo)
+        header_layout.addSpacing(12)
+        header_layout.addWidget(subtitle)
+        header_layout.addStretch()
+        main_layout.addWidget(header)
+
+        # Tabs
         tabs = QTabWidget()
         self.home_tab    = HomeTab()
         self.session_tab = SessionTab()
@@ -1751,6 +1836,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.session_tab, "  Session  ")
         tabs.addTab(self.pnl_tab,     "  Performance  ")
         tabs.currentChanged.connect(self._on_tab_changed)
+        main_layout.addWidget(tabs)
 
         # Client ready → pass to PnL tab
         self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
@@ -1759,7 +1845,7 @@ class MainWindow(QMainWindow):
         # Wire session tab when scheduler starts
         self.home_tab._start_trading_callbacks = [self._wire_session_signals]
 
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(central)
 
     def _wire_session_signals(self):
         """Connect session_entry signal and clear the session tab."""
@@ -1780,10 +1866,13 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._config = load_config()
             apply_config(self._config)
-            # Update live/demo indicator on home tab
-            mode = "LIVE" if self._config.get("live_mode") else "DEMO"
-            self.home_tab.mode_label.setText(mode)
+            # Apply font size
+            font_size = self._config.get("font_size", DEFAULT_FONT_SIZE)
+            QApplication.instance().setStyleSheet(build_stylesheet(font_size))
+            # Update live/demo indicator
+            mode  = "LIVE" if self._config.get("live_mode") else "DEMO"
             color = YELLOW if self._config.get("live_mode") else ACCENT
+            self.home_tab.mode_label.setText(mode)
             self.home_tab.mode_label.setStyleSheet(f"""
                 color: {color}; font-size: 11px; letter-spacing: 2px;
                 padding: 4px 10px;
@@ -1812,7 +1901,11 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyleSheet(STYLESHEET)
+
+    # Load saved credentials first so we can read font size
+    config = load_config()
+    font_size = config.get("font_size", DEFAULT_FONT_SIZE)
+    app.setStyleSheet(build_stylesheet(font_size))
 
     # Dark palette
     palette = QPalette()
@@ -1827,21 +1920,17 @@ if __name__ == "__main__":
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor(BG_DARK))
     app.setPalette(palette)
 
-    # Load saved credentials
-    config = load_config()
-
     # Show setup dialog if credentials are missing or incomplete
     needs_setup = not config.get("key_id") or not config.get("key_file")
     if needs_setup:
         dlg = CredentialDialog(config)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            sys.exit(0)   # user cancelled — exit cleanly
-        config = load_config()   # reload after save
+            sys.exit(0)
+        config = load_config()
 
     # Apply credentials to environment
     apply_config(config)
 
-    # Show main window with a settings button to re-open credential dialog
     window = MainWindow(config)
     window.show()
     sys.exit(app.exec())
