@@ -476,6 +476,7 @@ class SchedulerWorker(QObject):
     balance_updated   = pyqtSignal(float, float)
     client_ready      = pyqtSignal(object)
     session_entry     = pyqtSignal(dict)   # emitted each time an order is placed
+    session_exit      = pyqtSignal(str)    # emitted with ticker when position closes
     stopped           = pyqtSignal()
 
     def __init__(self, paper: bool = False):
@@ -560,6 +561,8 @@ class SchedulerWorker(QObject):
                         min_secs = min(min_secs, 10 * 60)
                 return min_secs
 
+            self._last_scores = {}   # ticker → score, updated each poll
+
             poll_count = 0
 
             while self.is_running():
@@ -580,14 +583,33 @@ class SchedulerWorker(QObject):
 
                 # Run pipeline — track new entries for Session Activity tab
                 try:
-                    tickers_before = {p["ticker"] for p in trader.sync_from_kalshi(client)}
+                    tickers_before = {
+                        p["ticker"] for p in trader.sync_from_kalshi(client)
+                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
+                    }
+                    # Capture scores from decision engine before pipeline runs
+                    try:
+                        evals = decision_engine.run()
+                        for ev in evals:
+                            for sig in ev.get("signals", []):
+                                t = sig.get("ticker")
+                                s = sig.get("score")
+                                if t and s is not None:
+                                    self._last_scores[t] = s
+                    except Exception:
+                        pass
                     trader.run_pipeline(client=client, paper=self.paper)
-                    positions_after = trader.sync_from_kalshi(client)
+                    positions_after = [
+                        p for p in trader.sync_from_kalshi(client)
+                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
+                    ]
                     for pos in positions_after:
                         if pos["ticker"] not in tickers_before:
+                            score = self._last_scores.get(pos["ticker"], "?")
                             self.session_entry.emit({
                                 **pos,
                                 "entered_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                                "score": score,
                             })
                     self.positions_updated.emit()
                 except Exception as e:
@@ -599,10 +621,21 @@ class SchedulerWorker(QObject):
                 # Check exits — use live Kalshi positions, not local file
                 try:
                     live_pos = trader.sync_from_kalshi(client)
+                    climate_before = {
+                        p["ticker"] for p in live_pos
+                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
+                    }
                     if live_pos:
                         self.log_line.emit(f"Checking exits ({len(live_pos)} open)...")
                         trader.check_exits(client, paper=self.paper)
-                        self.positions_updated.emit()
+                        # Detect closed positions
+                        climate_after = {
+                            p["ticker"] for p in trader.sync_from_kalshi(client)
+                            if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
+                        }
+                        for closed_ticker in climate_before - climate_after:
+                            self.session_exit.emit(closed_ticker)
+                    self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"Exit check error: {e}")
 
@@ -809,8 +842,12 @@ class HomeTab(QWidget):
         self.pos_table.setHorizontalHeaderLabels(
             ["Ticker", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened"]
         )
-        self.pos_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.pos_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        hdr = self.pos_table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setStretchLastSection(True)
+        # Default column widths: Ticker, Side, Qty, Avg Cost, Current, Unreal PnL, Opened
+        for col, width in enumerate([260, 60, 50, 90, 90, 100, 120]):
+            self.pos_table.setColumnWidth(col, width)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.pos_table.setAlternatingRowColors(True)
@@ -859,9 +896,8 @@ class HomeTab(QWidget):
         self._countdown_timer.start(1_000)
 
         self._pos_timer = QTimer()
-        self._pos_timer.timeout.connect(self.refresh_positions)
+        self._pos_timer.timeout.connect(self.sync_positions_from_kalshi)
         self._pos_timer.start(15_000)
-        self.refresh_positions()
 
     def _hline(self):
         line = QFrame()
@@ -998,7 +1034,7 @@ class HomeTab(QWidget):
         self._next_poll_ts = time.time() + next_secs
         self.status_label.setText(f"Sleeping — next poll in {next_secs//60} min")
         self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
-        self.refresh_positions()
+        self.sync_positions_from_kalshi()
 
     def _on_balance_updated(self, bal: float, dep: float):
         self.balance_label.setText(f"Balance  ${bal:.2f}")
@@ -1023,8 +1059,7 @@ class HomeTab(QWidget):
     def sync_positions_from_kalshi(self):
         """Fetch live positions directly from Kalshi and update the table."""
         if not hasattr(self, '_client') or self._client is None:
-            self.refresh_positions()
-            return
+            return  # no client yet — wait for scheduler to connect
 
         self.sync_btn.setEnabled(False)
         self.sync_btn.setText("Syncing...")
@@ -1548,7 +1583,7 @@ class PnLTab(QWidget):
         # ── By-day table ─────────────────────────────────────────────
         day_rows = []
         cum = 0.0
-        for day in sorted(by_day.keys(), reverse=True):
+        for day in sorted(by_day.keys()):   # oldest first for correct accumulation
             trades    = by_day[day]
             day_wins  = [t for t in trades if t["won"]]
             day_pnl   = round(sum(t["net_pnl"] for t in trades), 2)
@@ -1564,12 +1599,18 @@ class PnLTab(QWidget):
                 "net_pnl": day_pnl,
                 "cum_pnl": round(cum, 2),
             })
+        day_rows.reverse()   # newest first for display
 
         hdrs = ["Date", "Trades", "Wins", "Losses", "Win%", "Fees", "Net PnL", "Cum PnL"]
         self.daily_table.setColumnCount(len(hdrs))
         self.daily_table.setHorizontalHeaderLabels(hdrs)
         self.daily_table.setRowCount(len(day_rows))
-        self.daily_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        dh = self.daily_table.horizontalHeader()
+        dh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        dh.setStretchLastSection(True)
+        # Date, Trades, Wins, Losses, Win%, Fees, Net PnL, Cum PnL
+        for col, width in enumerate([100, 70, 65, 70, 70, 70, 90, 90]):
+            self.daily_table.setColumnWidth(col, width)
 
         for ri, row in enumerate(day_rows):
             vals = [row["date"], str(row["trades"]), str(row["wins"]),
@@ -1589,11 +1630,12 @@ class PnLTab(QWidget):
         self.settlements_table.setColumnCount(len(s_hdrs))
         self.settlements_table.setHorizontalHeaderLabels(s_hdrs)
         self.settlements_table.setRowCount(len(enriched))
-        self.settlements_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for col in [0, 2, 3, 4, 5, 6]:
-            self.settlements_table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.ResizeToContents
-            )
+        sh = self.settlements_table.horizontalHeader()
+        sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        sh.setStretchLastSection(True)
+        # Date, Ticker, Side, Qty, Result, Fee, Net PnL
+        for col, width in enumerate([100, 280, 60, 50, 90, 60, 90]):
+            self.settlements_table.setColumnWidth(col, width)
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
             result  = e.get("result", "")
@@ -1693,11 +1735,12 @@ class SessionTab(QWidget):
         self.table.setHorizontalHeaderLabels(
             ["Time", "Ticker", "Side", "Qty", "Entry", "Score", "Status"]
         )
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for col in [0, 2, 3, 4, 5, 6]:
-            self.table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.ResizeToContents
-            )
+        th = self.table.horizontalHeader()
+        th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        th.setStretchLastSection(True)
+        # Time, Ticker, Side, Qty, Entry, Score, Status
+        for col, width in enumerate([90, 270, 60, 50, 70, 65, 90]):
+            self.table.setColumnWidth(col, width)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -1848,11 +1891,14 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def _wire_session_signals(self):
-        """Connect session_entry signal and clear the session tab."""
+        """Connect session signals and clear the session tab."""
         self.session_tab.clear()
         worker = self.home_tab._worker
         if worker:
             worker.session_entry.connect(self.session_tab.add_entry)
+            worker.session_exit.connect(
+                lambda ticker: self.session_tab.update_status(ticker, "Stopped Out")
+            )
 
     def _open_settings(self):
         """Open credential dialog — only when scheduler is not running."""

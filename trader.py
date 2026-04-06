@@ -297,9 +297,16 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
                 timeout=15,
             ).json()
             for m in resp.get("markets", []):
+                yes_bid = float(m.get("yes_bid_dollars") or 0)
+                no_bid  = float(m.get("no_bid_dollars")  or 0)
+                # If one side has no resting bid, derive from complement
+                if yes_bid > 0 and no_bid == 0:
+                    no_bid = round(1.0 - yes_bid, 4)
+                elif no_bid > 0 and yes_bid == 0:
+                    yes_bid = round(1.0 - no_bid, 4)
                 prices[m["ticker"]] = {
-                    "yes_bid": float(m.get("yes_bid_dollars") or 0),
-                    "no_bid":  float(m.get("no_bid_dollars")  or 0),
+                    "yes_bid": yes_bid,
+                    "no_bid":  no_bid,
                 }
         except Exception:
             pass  # prices will be 0 if fetch fails — still show positions
@@ -604,9 +611,15 @@ def check_exits(client: KalshiClient, paper: bool = False):
             timeout=15,
         ).json()
         for m in resp.get("markets", []):
+            yes_bid = float(m.get("yes_bid_dollars") or 0)
+            no_bid  = float(m.get("no_bid_dollars")  or 0)
+            if yes_bid > 0 and no_bid == 0:
+                no_bid = round(1.0 - yes_bid, 4)
+            elif no_bid > 0 and yes_bid == 0:
+                yes_bid = round(1.0 - no_bid, 4)
             prices[m["ticker"]] = {
-                "yes_bid": float(m.get("yes_bid_dollars") or 0),
-                "no_bid":  float(m.get("no_bid_dollars")  or 0),
+                "yes_bid": yes_bid,
+                "no_bid":  no_bid,
                 "status":  m.get("status", "active"),
             }
     except Exception as e:
