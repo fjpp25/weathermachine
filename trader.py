@@ -263,16 +263,11 @@ def get_positions(client: KalshiClient) -> list[dict]:
 def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     """
     Fetch live positions directly from Kalshi and enrich with market data.
-    Returns a list of dicts ready for display — this is the source of truth,
-    not positions.json.
-
-    Each returned dict contains:
-      ticker, side, contracts, avg_cost, current_price,
-      unrealised_pnl, fees_paid, last_updated
+    Returns a list of dicts ready for display — this is the source of truth.
     """
     raw_positions = get_positions(client)
 
-    # Filter to temperature markets only (KX prefix)
+    # Filter to temperature markets only
     temp_positions = [
         p for p in raw_positions
         if p.get("ticker", "").startswith("KX")
@@ -282,38 +277,46 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     if not temp_positions:
         return enriched
 
-    # Batch fetch current prices in one API call
-    tickers    = [pos["ticker"] for pos in temp_positions
-                  if float(pos.get("position_fp") or 0) != 0]
-    prices     = {}
-    if tickers:
-        try:
-            resp = requests.get(
-                "https://api.elections.kalshi.com/trade-api/v2/markets",
-                params={"tickers": ",".join(tickers)},
-                timeout=15,
-            ).json()
-            for m in resp.get("markets", []):
-                yes_bid = float(m.get("yes_bid_dollars") or 0)
-                no_bid  = float(m.get("no_bid_dollars")  or 0)
-                # If one side has no resting bid, derive from complement
-                if yes_bid > 0 and no_bid == 0:
-                    no_bid = round(1.0 - yes_bid, 4)
-                elif no_bid > 0 and yes_bid == 0:
-                    yes_bid = round(1.0 - no_bid, 4)
-                prices[m["ticker"]] = {
-                    "yes_bid": yes_bid,
-                    "no_bid":  no_bid,
-                }
-        except Exception:
-            pass  # prices will be 0 if fetch fails — still show positions
+    tickers = [p["ticker"] for p in temp_positions
+               if float(p.get("position_fp") or 0) != 0]
+
+    if not tickers:
+        return enriched
+
+    # Batch fetch current market prices
+    prices = {}
+    try:
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"tickers": ",".join(tickers)},
+            timeout=15,
+        ).json()
+        for m in resp.get("markets", []):
+            yes_bid = float(m.get("yes_bid_dollars") or 0)
+            no_bid  = float(m.get("no_bid_dollars")  or 0)
+            if yes_bid > 0 and no_bid == 0:
+                no_bid = round(1.0 - yes_bid, 4)
+            elif no_bid > 0 and yes_bid == 0:
+                yes_bid = round(1.0 - no_bid, 4)
+            prices[m["ticker"]] = {"yes_bid": yes_bid, "no_bid": no_bid}
+    except Exception:
+        pass
+
+    # Fetch fills to derive accurate avg_cost per ticker
+    fills_by_ticker: dict[str, list] = {}
+    try:
+        resp = client.get("portfolio/fills", params={"limit": 200})
+        for f in resp.get("fills", []):
+            t = f.get("ticker", "")
+            if t in tickers:
+                fills_by_ticker.setdefault(t, []).append(f)
+    except Exception:
+        pass
 
     for pos in temp_positions:
-        ticker       = pos["ticker"]
-        # position_fp is a signed string: positive = long YES, negative = long NO
-        position_fp  = float(pos.get("position_fp") or 0)
-        fees_paid    = float(pos.get("fees_paid_dollars") or 0)
-        total_cost   = float(pos.get("total_traded_dollars") or 0)
+        ticker      = pos["ticker"]
+        position_fp = float(pos.get("position_fp") or 0)
+        fees_paid   = float(pos.get("fees_paid_dollars") or 0)
         last_updated = pos.get("last_updated_ts", "")
 
         if position_fp == 0:
@@ -321,9 +324,26 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
 
         side      = "yes" if position_fp > 0 else "no"
         contracts = int(abs(position_fp))
-        avg_cost  = round(total_cost / contracts, 4) if contracts else 0
 
-        # Look up price from batch result
+        # Derive avg_cost from buy fills (most accurate)
+        avg_cost = 0.0
+        price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
+        buy_fills = [f for f in fills_by_ticker.get(ticker, [])
+                     if f.get("action") == "buy" and f.get("side") == side]
+        if buy_fills:
+            total_cost     = sum(float(f.get(price_field) or 0) *
+                                 float(f.get("count_fp") or 0)
+                                 for f in buy_fills)
+            total_contracts = sum(float(f.get("count_fp") or 0) for f in buy_fills)
+            if total_contracts > 0:
+                avg_cost = round(total_cost / total_contracts, 4)
+
+        # Fallback to total_traded_dollars only if no fills available
+        if avg_cost == 0 and contracts > 0:
+            total_traded = float(pos.get("total_traded_dollars") or 0)
+            avg_cost = round(total_traded / contracts, 4)
+
+        # Current price and unrealised PnL
         if ticker in prices:
             current_price  = prices[ticker]["yes_bid"] if side == "yes" else prices[ticker]["no_bid"]
             unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
