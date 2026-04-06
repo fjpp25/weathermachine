@@ -71,13 +71,13 @@ def fetch_brackets(series: str) -> list[dict]:
 
 def fetch_nws_low(icao: str) -> tuple[float | None, float | None]:
     """
-    Fetch current observed low and forecast low from NWS.
+    Fetch current observed low and forecast overnight low from NWS.
     Returns (observed_low_f, forecast_low_f).
     """
     observed_low = None
     forecast_low = None
 
-    # Observed low — scan today's observations for minimum
+    # Observed low — minimum of today's hourly observations
     try:
         resp = requests.get(
             f"https://api.weather.gov/stations/{icao}/observations",
@@ -86,40 +86,69 @@ def fetch_nws_low(icao: str) -> tuple[float | None, float | None]:
             timeout=10,
         )
         features = resp.json().get("features", [])
-        temps = []
+        now_utc  = datetime.now(timezone.utc)
+        temps    = []
         for f in features:
-            t = f.get("properties", {}).get("temperature", {}).get("value")
-            if t is not None:
-                temps.append(t * 9/5 + 32)   # C → F
+            props = f.get("properties", {})
+            ts    = props.get("timestamp", "")
+            t     = props.get("temperature", {}).get("value")
+            if t is None:
+                continue
+            try:
+                obs_time = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                # Only include observations from today (past 24h)
+                if (now_utc - obs_time).total_seconds() < 86400:
+                    temps.append(t * 9/5 + 32)
+            except Exception:
+                temps.append(t * 9/5 + 32)
         if temps:
             observed_low = round(min(temps), 1)
     except Exception:
         pass
 
-    # Forecast low — from NWS gridpoint forecast
+    # Forecast overnight low — from NWS station forecast
+    # Use the /stations/{icao}/observations latest to get coordinates,
+    # then hit the gridpoint hourly forecast for tonight's minimum
     try:
-        # Use cached grid URL if available
-        grid_cache = Path("data/nws_grid_cache.json")
-        grid_url = None
-        if grid_cache.exists():
-            cache = json.loads(grid_cache.read_text())
-            for city_data in cache.values():
-                if city_data.get("icao") == icao:
-                    grid_url = city_data.get("forecast_url")
-                    break
+        resp = requests.get(
+            f"https://api.weather.gov/stations/{icao}/observations/latest",
+            headers={"User-Agent": "WeatherMachine/1.0"},
+            timeout=10,
+        )
+        props = resp.json().get("properties", {})
+        lat   = props.get("station", {})
 
-        if grid_url:
-            resp = requests.get(
-                grid_url,
+        # Get station metadata for grid coordinates
+        station_url = resp.json().get("properties", {}).get("station", "")
+        if station_url:
+            st_resp = requests.get(
+                station_url,
                 headers={"User-Agent": "WeatherMachine/1.0"},
                 timeout=10,
             )
-            periods = resp.json().get("properties", {}).get("periods", [])
-            # Find tonight's low period
-            for p in periods[:4]:
-                if not p.get("isDaytime", True):
-                    forecast_low = p.get("temperature")
-                    break
+            st_props  = st_resp.json().get("properties", {})
+            coords    = st_resp.json().get("geometry", {}).get("coordinates", [])
+            if coords and len(coords) >= 2:
+                lon, lat = coords[0], coords[1]
+                # Get NWS grid point
+                pt_resp = requests.get(
+                    f"https://api.weather.gov/points/{lat:.4f},{lon:.4f}",
+                    headers={"User-Agent": "WeatherMachine/1.0"},
+                    timeout=10,
+                )
+                forecast_url = pt_resp.json().get("properties", {}).get("forecast")
+                if forecast_url:
+                    fc_resp  = requests.get(
+                        forecast_url,
+                        headers={"User-Agent": "WeatherMachine/1.0"},
+                        timeout=10,
+                    )
+                    periods = fc_resp.json().get("properties", {}).get("periods", [])
+                    # Find the next overnight (isDaytime=False) period
+                    for p in periods[:6]:
+                        if not p.get("isDaytime", True):
+                            forecast_low = float(p.get("temperature", 0))
+                            break
     except Exception:
         pass
 

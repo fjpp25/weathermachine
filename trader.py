@@ -566,8 +566,8 @@ def log_trade(event: str, data: dict):
 # ---------------------------------------------------------------------------
 
 NO_STOP_LOSS_RISE   = 0.15   # exit NO if YES rises more than this above entry YES price
-                              # e.g. entered when YES=$0.20, stop fires at YES=$0.35
-                              # replaces the old absolute $0.40 threshold
+YES_EXIT_TARGET     = 0.50   # take profit if YES rises 50% from entry
+YES_STOP_LOSS       = 0.30   # stop loss if YES falls 30% from entry
 
 def check_exits(client: KalshiClient, paper: bool = False):
     """
