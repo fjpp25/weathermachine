@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QDialog, QDialogButtonBox, QCheckBox,
 )
 from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QObject
+    Qt, QThread, pyqtSignal, QTimer, QObject, QMetaObject, Q_ARG, pyqtSlot
 )
 from PyQt6.QtGui import QFont, QColor, QPalette, QIcon
 
@@ -96,11 +96,15 @@ _SERIES_TO_CITY = {
     "KXHIGHTOKC":  "Oklahoma City",
 }
 
-def _city_from_ticker(ticker: str) -> str | None:
-    """Extract city name from a Kalshi temperature ticker."""
+def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
+    """Extract city name from a Kalshi temperature ticker.
+    bare=True returns just the city name; bare=False appends (HIGH) or (LOW).
+    """
     prefix = ticker.split("-")[0]
     city = _SERIES_TO_CITY.get(prefix)
     if city:
+        if bare:
+            return city
         mtype = "HIGH" if "HIGH" in prefix else "LOW"
         return f"{city} ({mtype})"
     return None
@@ -676,10 +680,13 @@ class SchedulerWorker(QObject):
 # ---------------------------------------------------------------------------
 
 class CityCard(QFrame):
+    clicked = pyqtSignal(str)  # emits city name when clicked
+
     def __init__(self, city: str):
         super().__init__()
         self.city = city
         self.setFixedSize(200, 110)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(f"""
             QFrame {{
                 background: {BG_PANEL};
@@ -713,6 +720,10 @@ class CityCard(QFrame):
         layout.addWidget(self.lo_label)
         layout.addWidget(self.status_label)
 
+    def mousePressEvent(self, event):
+        self.clicked.emit(self.city)
+        super().mousePressEvent(event)
+
     def update_data(self, local_time: str, curr: float, obs_hi: float,
                     fcst_hi: float, active: bool,
                     obs_lo: float = None, fcst_lo: float = None):
@@ -739,12 +750,281 @@ class CityCard(QFrame):
 
 
 # ---------------------------------------------------------------------------
+# City detail dialog — shown when clicking a city card
+# ---------------------------------------------------------------------------
+
+class CityDetailDialog(QDialog):
+    def __init__(self, city: str, positions: list, client, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{city} — Detail")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(400)
+        self.setStyleSheet(f"""
+            QDialog {{ background: {BG_DARK}; color: {TEXT_PRI}; }}
+            QLabel  {{ color: {TEXT_PRI}; }}
+            QTableWidget {{
+                background: {BG_PANEL};
+                color: {TEXT_PRI};
+                gridline-color: {BORDER};
+                border: 1px solid {BORDER};
+            }}
+            QHeaderView::section {{
+                background: {BG_DARK};
+                color: {TEXT_SEC};
+                border: none;
+                padding: 4px;
+                font-size: 11px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # Title
+        title = QLabel(f"⛅  {city}")
+        title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-weight: bold;")
+        layout.addWidget(title)
+
+        # ── Open positions ────────────────────────────────────────────────
+        pos_hdr = QLabel("OPEN POSITIONS")
+        pos_hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
+        layout.addWidget(pos_hdr)
+
+        city_positions = [
+            p for p in positions
+            if _city_from_ticker(p.get("ticker", ""), bare=True) == city
+        ]
+
+        if city_positions:
+            pos_table = QTableWidget()
+            pos_table.setColumnCount(5)
+            pos_table.setHorizontalHeaderLabels(["Ticker", "Side", "Qty", "Avg Cost", "Unreal. PnL"])
+            pos_table.setRowCount(len(city_positions))
+            pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            pos_table.horizontalHeader().setStretchLastSection(True)
+            pos_table.verticalHeader().setVisible(False)
+            for col, w in enumerate([200, 55, 45, 80, 90]):
+                pos_table.setColumnWidth(col, w)
+
+            for row, pos in enumerate(city_positions):
+                ticker  = pos.get("ticker", "")
+                side    = pos.get("side", "").upper()
+                qty     = pos.get("contracts", 1)
+                cost    = pos.get("avg_cost", 0)
+                unreal  = pos.get("unrealised_pnl", 0)
+                sign    = "+" if unreal >= 0 else ""
+                bracket = ticker.split("-")[-1] if "-" in ticker else ticker
+                mtype   = "HIGH" if "HIGH" in ticker else "LOW"
+                for col, (val, color) in enumerate([
+                    (f"{mtype} {bracket}",       TEXT_PRI),
+                    (side,                        ACCENT if side == "NO" else YELLOW),
+                    (str(qty),                    TEXT_PRI),
+                    (f"${cost:.2f}",              TEXT_PRI),
+                    (f"{sign}${unreal:.2f}",      ACCENT if unreal >= 0 else RED),
+                ]):
+                    item = QTableWidgetItem(val)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setForeground(QColor(color))
+                    pos_table.setItem(row, col, item)
+
+            pos_table.setFixedHeight(min(len(city_positions) * 30 + 34, 180))
+            layout.addWidget(pos_table)
+        else:
+            no_pos = QLabel("No open positions for this city.")
+            no_pos.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
+            layout.addWidget(no_pos)
+
+        # ── Historical stats ──────────────────────────────────────────────
+        stats_hdr = QLabel("HISTORICAL PERFORMANCE")
+        stats_hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
+        layout.addWidget(stats_hdr)
+
+        self.stats_label = QLabel("Loading...")
+        self.stats_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
+        layout.addWidget(self.stats_label)
+
+        self.hist_table = QTableWidget()
+        self.hist_table.setColumnCount(5)
+        self.hist_table.setHorizontalHeaderLabels(["Date", "Bracket", "Side", "Result", "PnL"])
+        self.hist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.hist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.hist_table.horizontalHeader().setStretchLastSection(True)
+        self.hist_table.verticalHeader().setVisible(False)
+        for col, w in enumerate([100, 160, 50, 80, 80]):
+            self.hist_table.setColumnWidth(col, w)
+        layout.addWidget(self.hist_table, stretch=1)
+
+        # Close button
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(80)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {BG_PANEL};
+                color: {TEXT_SEC};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
+        """)
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        # Fetch historical stats in background if client available
+        if client:
+            self._city = city
+            self._client = client
+            threading.Thread(target=self._load_stats, daemon=True).start()
+        else:
+            self.stats_label.setText("No client connected — start trading to see stats.")
+
+    def _load_stats(self):
+        """Fetch settlements + fills for this city and compute stats."""
+        try:
+            # Fetch all settlements
+            all_settlements = []
+            cursor = None
+            for _ in range(10):
+                params = {"limit": 200, "settlement_status": "settled"}
+                if cursor:
+                    params["cursor"] = cursor
+                data  = self._client.get("portfolio/settlements", params=params)
+                batch = data.get("settlements", [])
+                all_settlements.extend(batch)
+                cursor = data.get("cursor")
+                if not cursor or len(batch) < 200:
+                    break
+
+            # Filter to this city's temperature markets
+            city_settlements = [
+                s for s in all_settlements
+                if _city_from_ticker(s.get("ticker", ""), bare=True) == self._city
+                and ("HIGH" in s.get("ticker", "") or "LOWT" in s.get("ticker", ""))
+            ]
+
+            if not city_settlements:
+                QMetaObject.invokeMethod(
+                    self, "_show_stats",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG("PyQt_PyObject", []),
+                )
+                return
+
+            # Fetch fills for these tickers
+            tickers = list({s.get("ticker") for s in city_settlements})
+            all_fills = []
+            cursor = None
+            for _ in range(10):
+                params = {"limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                data  = self._client.get("portfolio/fills", params=params)
+                batch = data.get("fills", [])
+                all_fills.extend(batch)
+                cursor = data.get("cursor")
+                if not cursor or len(batch) < 200:
+                    break
+
+            fills_by_ticker = {}
+            for f in all_fills:
+                t = f.get("ticker", "")
+                if t in tickers:
+                    fills_by_ticker.setdefault(t, []).append(f)
+
+            # Enrich settlements using same logic as PnL tab
+            enriched = []
+            for s in city_settlements:
+                ticker = s.get("ticker", "")
+                result = s.get("market_result", "").lower()
+                fee    = float(s.get("fee_cost") or 0)
+                date   = s.get("settled_time", "")[:10]
+
+                buy_fills = [f for f in fills_by_ticker.get(ticker, [])
+                             if f.get("action") == "buy"]
+                if not buy_fills:
+                    continue
+
+                sides    = [f.get("side") for f in buy_fills]
+                our_side = max(set(sides), key=sides.count)
+                our_fills = [f for f in buy_fills if f.get("side") == our_side]
+                contracts = int(sum(float(f.get("count_fp") or 0) for f in our_fills))
+                price_field = "yes_price_dollars" if our_side == "yes" else "no_price_dollars"
+                cost = round(sum(
+                    float(f.get(price_field) or 0) * float(f.get("count_fp") or 0)
+                    for f in our_fills
+                ), 4)
+
+                if contracts == 0 or cost == 0:
+                    continue
+
+                won     = (result == our_side)
+                net_pnl = round(contracts * 1.0 - cost - fee, 4) if won else round(-cost - fee, 4)
+                bracket = ticker.split("-")[-1] if "-" in ticker else ticker
+                mtype   = "HIGH" if "HIGH" in ticker else "LOW"
+
+                enriched.append({
+                    "date":    date,
+                    "bracket": f"{mtype} {bracket}",
+                    "side":    our_side.upper(),
+                    "won":     won,
+                    "net_pnl": net_pnl,
+                })
+
+            QMetaObject.invokeMethod(
+                self, "_show_stats",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG("PyQt_PyObject", enriched),
+            )
+        except Exception as e:
+            QMetaObject.invokeMethod(
+                self, "_show_stats",
+                Qt.ConnectionType.QueuedConnection,
+                Q_ARG("PyQt_PyObject", []),
+            )
+
+    @pyqtSlot(object)
+    def _show_stats(self, enriched):
+        if not enriched:
+            self.stats_label.setText("No settled trades for this city yet.")
+            return
+
+        total   = len(enriched)
+        wins    = sum(1 for e in enriched if e["won"])
+        win_pct = round(wins / total * 100)
+        net_pnl = sum(e["net_pnl"] for e in enriched)
+
+        self.stats_label.setText(
+            f"{total} settled trades  ·  {wins} wins  ·  {win_pct}% win rate  ·  Net PnL: ${net_pnl:+.2f}"
+        )
+        self.stats_label.setStyleSheet(
+            f"color: {ACCENT if net_pnl >= 0 else RED}; font-size: 12px; font-weight: bold;"
+        )
+
+        sorted_e = sorted(enriched, key=lambda x: x["date"], reverse=True)
+        self.hist_table.setRowCount(len(sorted_e))
+        for row, e in enumerate(sorted_e):
+            won = e["won"]
+            for col, (val, color) in enumerate([
+                (e["date"],              TEXT_SEC),
+                (e["bracket"],           TEXT_PRI),
+                (e["side"],              ACCENT if e["side"] == "NO" else YELLOW),
+                ("Win" if won else "Loss", ACCENT if won else RED),
+                (f"${e['net_pnl']:+.2f}", ACCENT if won else RED),
+            ]):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QColor(color))
+                self.hist_table.setItem(row, col, item)
+
+
+# ---------------------------------------------------------------------------
 # Home tab
 # ---------------------------------------------------------------------------
 
 class HomeTab(QWidget):
     log_line  = pyqtSignal(str)    # emitted on every log append → LogTab listens
-    nws_ready = pyqtSignal(object) # emitted when NWS snapshot completes
 
     def __init__(self):
         super().__init__()
@@ -829,6 +1109,7 @@ class HomeTab(QWidget):
         cities = list(CITY_TIMEZONES.keys())
         for i, city in enumerate(cities):
             card = CityCard(city)
+            card.clicked.connect(self._on_city_card_clicked)
             self.city_cards[city] = card
             city_grid.addWidget(card, i // 4, i % 4)
 
@@ -878,7 +1159,6 @@ class HomeTab(QWidget):
         self._refresh_cities()
 
         # NWS data fetch — every 5 minutes, fetch immediately on startup
-        self.nws_ready.connect(self._on_nws_ready)
         self._nws_timer = QTimer()
         self._nws_timer.timeout.connect(self._refresh_nws_data)
         self._nws_timer.start(300_000)
@@ -897,6 +1177,12 @@ class HomeTab(QWidget):
         line.setFrameShape(QFrame.Shape.HLine)
         line.setStyleSheet(f"color: {BORDER};")
         return line
+
+    def _on_city_card_clicked(self, city: str):
+        """Open city detail dialog when a card is clicked."""
+        positions = getattr(self, '_last_positions', [])
+        dlg = CityDetailDialog(city, positions, self._client, parent=self)
+        dlg.exec()
 
     def toggle_scheduler(self):
         if self._running:
@@ -942,7 +1228,6 @@ class HomeTab(QWidget):
         self._client  = None   # will be set once worker connects
         self.status_label.setText("Starting...")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
-        self.append_log("Scheduler started.")
 
         self._thread = QThread()
         self._worker = SchedulerWorker(paper=False)
@@ -1014,6 +1299,7 @@ class HomeTab(QWidget):
             m, s = divmod(remaining, 60)
             self.countdown_label.setText(f"next poll in {m:02d}:{s:02d}")
 
+    @pyqtSlot(str)
     def append_log(self, text: str):
         self.log_line.emit(text)
 
@@ -1046,6 +1332,7 @@ class HomeTab(QWidget):
 
     def _update_positions_table(self, positions: list):
         """Update the positions table from a list of enriched position dicts."""
+        self._last_positions = positions  # cache for city detail dialog
         # Sort oldest first (chronological order)
         sorted_positions = sorted(
             positions,
@@ -1115,17 +1402,44 @@ class HomeTab(QWidget):
 
     def _refresh_nws_data(self):
         """Fetch NWS temperatures in background — called every 5 minutes."""
+        import threading
+
         def fetch():
             try:
                 import nws_feed
-                return nws_feed.snapshot()
-            except Exception:
-                return {}
+                results = nws_feed.snapshot()
+                # Post back to main thread safely
+                QMetaObject.invokeMethod(
+                    self, "_on_nws_ready",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG("PyQt_PyObject", results),
+                )
+            except Exception as e:
+                QMetaObject.invokeMethod(
+                    self, "append_log",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, f"NWS fetch error: {e}"),
+                )
 
-        run_in_background(fetch, self.nws_ready.emit)
+        threading.Thread(target=fetch, daemon=True).start()
 
+    @pyqtSlot(object)
     def _on_nws_ready(self, results):
         """Called on main thread when NWS snapshot completes."""
+        if "_error" in results:
+            self.log_line.emit(f"NWS fetch error: {results['_error']}")
+            return
+
+        # Log a sample to confirm data is arriving
+        sample = next(iter(results.values()), {})
+        self.log_line.emit(
+            f"NWS data received — "
+            f"obs_hi={sample.get('observed_high_f')} "
+            f"obs_lo={sample.get('observed_low_f')} "
+            f"fcst_hi={sample.get('forecast_high_f')} "
+            f"fcst_lo={sample.get('forecast_low_f')}"
+        )
+
         for city, tz in CITY_TIMEZONES.items():
             card = self.city_cards.get(city)
             if not card:
@@ -1135,18 +1449,19 @@ class HomeTab(QWidget):
             data    = results.get(city, {})
             obs_hi  = data.get("observed_high_f")
             fcst_hi = data.get("forecast_high_f")
+            obs_lo  = data.get("observed_low_f")
             fcst_lo = data.get("forecast_low_f")
             # Cache on card so clock ticks preserve the values
             card._obs_hi  = obs_hi
             card._fcst_hi = fcst_hi
-            card._obs_lo  = None
+            card._obs_lo  = obs_lo
             card._fcst_lo = fcst_lo
             card.update_data(
                 local_time = now.strftime("%H:%M %Z"),
                 curr       = None,
                 obs_hi     = obs_hi,
                 fcst_hi    = fcst_hi,
-                obs_lo     = None,
+                obs_lo     = obs_lo,
                 fcst_lo    = fcst_lo,
                 active     = active,
             )

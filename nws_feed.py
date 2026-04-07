@@ -224,6 +224,62 @@ def fetch_observed_high(icao: str, tz_name: str, lst_offset: int) -> float | Non
     return max(temps_today) if temps_today else None
 
 
+def fetch_observed_low(icao: str, tz_name: str, lst_offset: int) -> float | None:
+    """
+    Fetch last 48 hours of observations and extract today's low so far.
+    Same LST boundary logic as fetch_observed_high.
+    """
+    data = get(f"{API_BASE}/stations/{icao}/observations?limit=48")
+    features = data.get("features", [])
+
+    lst_tz    = timezone(timedelta(hours=lst_offset))
+    today_lst = datetime.now(lst_tz).date()
+
+    temps_today = []
+    for feature in features:
+        props  = feature.get("properties", {})
+        ts     = props.get("timestamp")
+        temp_c = props.get("temperature", {}).get("value")
+
+        if ts is None or temp_c is None:
+            continue
+
+        obs_time_lst = datetime.fromisoformat(ts).astimezone(lst_tz)
+        if obs_time_lst.date() == today_lst:
+            temps_today.append(c_to_f(temp_c))
+
+    return min(temps_today) if temps_today else None
+
+
+def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
+    """
+    Fetch observations once and return (observed_high, observed_low) for today.
+    More efficient than calling fetch_observed_high and fetch_observed_low separately.
+    """
+    data = get(f"{API_BASE}/stations/{icao}/observations?limit=48")
+    features = data.get("features", [])
+
+    lst_tz    = timezone(timedelta(hours=lst_offset))
+    today_lst = datetime.now(lst_tz).date()
+
+    temps_today = []
+    for feature in features:
+        props  = feature.get("properties", {})
+        ts     = props.get("timestamp")
+        temp_c = props.get("temperature", {}).get("value")
+
+        if ts is None or temp_c is None:
+            continue
+
+        obs_time_lst = datetime.fromisoformat(ts).astimezone(lst_tz)
+        if obs_time_lst.date() == today_lst:
+            temps_today.append(c_to_f(temp_c))
+
+    if temps_today:
+        return max(temps_today), min(temps_today)
+    return None, None
+
+
 def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
     """
     Fetch the NWS daily forecast and extract today's high and low.
@@ -286,10 +342,12 @@ def snapshot(city_filter: str = None) -> dict:
             obs = fetch_current_observation(meta["icao"])
             result.update(obs)
 
-            # Today's observed high so far (uses LST, not wall clock)
-            result["observed_high_f"] = fetch_observed_high(
+            # Today's observed high and low so far (single API call, LST boundary)
+            obs_hi, obs_lo = fetch_observed_high_low(
                 meta["icao"], meta["tz"], meta["lst_offset"]
             )
+            result["observed_high_f"] = obs_hi
+            result["observed_low_f"]  = obs_lo
 
             # Forecast high/low
             forecast_url = get_forecast_url(city, meta, grid_cache)
