@@ -32,8 +32,8 @@ import decision_engine
 # Config
 # ---------------------------------------------------------------------------
 
-ACTIVITY_START_HOUR = 9    # local city time — start polling
-ACTIVITY_END_HOUR   = 17   # local city time — stop polling
+ACTIVITY_START_HOUR = 0    # local city time — poll from midnight
+ACTIVITY_END_HOUR   = 23   # local city time — poll all day
 
 CITY_TIMEZONES = {
     "New York":      "America/New_York",
@@ -44,6 +44,10 @@ CITY_TIMEZONES = {
     "San Francisco": "America/Los_Angeles",
     "Denver":        "America/Denver",
     "Philadelphia":  "America/New_York",
+    "Atlanta":       "America/New_York",
+    "Houston":       "America/Chicago",
+    "Phoenix":       "America/Phoenix",
+    "Las Vegas":     "America/Los_Angeles",
 }
 
 
@@ -103,20 +107,21 @@ def dynamic_interval(city_filter: str = None) -> int:
     Returns poll interval in seconds based on the most active city phase.
     Takes the minimum (most frequent) interval across all active cities.
 
-    11am-1pm local is the peak window — NWS model runs land around this
-    time and the market reprices fastest, so we poll most aggressively.
+    Overnight (midnight-9am): 10 min — bracket elimination from obs temps
+    9am-11am:  5 min  — approaching peak, forecasts updating
+    11am-1pm:  3 min  — peak — NWS model runs, market reprices fastest
+    1pm-3pm:   5 min  — post-peak, convergence settling
+    3pm-11pm: 10 min  — exit monitoring, slow convergence
     """
     cities       = _filter_cities(city_filter)
-    min_interval = 15 * 60   # default: 15 min
+    min_interval = 10 * 60   # default: 10 min
 
     for tz in cities.values():
         h = local_hour(tz)
         if 11 <= h < 13:
             min_interval = min(min_interval, 3 * 60)    # peak — 3 min
-        elif h == 10 or h == 13:
-            min_interval = min(min_interval, 5 * 60)    # opening/closing — 5 min
-        elif 14 <= h < ACTIVITY_END_HOUR:
-            min_interval = min(min_interval, 10 * 60)   # exits only — 10 min
+        elif h in (9, 10, 13, 14):
+            min_interval = min(min_interval, 5 * 60)    # shoulder — 5 min
 
     return min_interval
 

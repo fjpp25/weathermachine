@@ -60,6 +60,10 @@ CITY_TIMEZONES = {
     "San Francisco": "America/Los_Angeles",
     "Denver":        "America/Denver",
     "Philadelphia":  "America/New_York",
+    "Atlanta":       "America/New_York",
+    "Houston":       "America/Chicago",
+    "Phoenix":       "America/Phoenix",
+    "Las Vegas":     "America/Los_Angeles",
 }
 
 # Reverse map: series prefix → city name (for ticker → city display)
@@ -799,7 +803,7 @@ class CityDetailDialog(QDialog):
         if city_positions:
             pos_table = QTableWidget()
             pos_table.setColumnCount(5)
-            pos_table.setHorizontalHeaderLabels(["Ticker", "Side", "Qty", "Avg Cost", "Unreal. PnL"])
+            pos_table.setHorizontalHeaderLabels(["Market", "Side", "Qty", "Avg Cost", "Unreal. PnL"])
             pos_table.setRowCount(len(city_positions))
             pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -1389,7 +1393,7 @@ class HomeTab(QWidget):
             card = self.city_cards[city]
             now  = datetime.now(ZoneInfo(tz))
             h    = now.hour
-            active = 9 <= h < 17
+            active = True  # 24/7 window
             card.update_data(
                 local_time = now.strftime("%H:%M %Z"),
                 curr       = None,
@@ -1445,7 +1449,7 @@ class HomeTab(QWidget):
             if not card:
                 continue
             now    = datetime.now(ZoneInfo(tz))
-            active = 9 <= now.hour < 17
+            active = True  # 24/7 window
             data    = results.get(city, {})
             obs_hi  = data.get("observed_high_f")
             fcst_hi = data.get("forecast_high_f")
@@ -1929,15 +1933,15 @@ class PnLTab(QWidget):
                 self.daily_table.setItem(ri, ci, item)
 
         # ── All settlements table ─────────────────────────────────────
-        s_hdrs = ["Date", "Ticker", "Side", "Qty", "Result", "Fee", "Net PnL"]
+        s_hdrs = ["Date", "Market", "Side", "Qty", "Result", "Fee", "Net PnL"]
         self.settlements_table.setColumnCount(len(s_hdrs))
         self.settlements_table.setHorizontalHeaderLabels(s_hdrs)
         self.settlements_table.setRowCount(len(enriched))
         sh = self.settlements_table.horizontalHeader()
         sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         sh.setStretchLastSection(True)
-        # Date, Ticker, Side, Qty, Result, Fee, Net PnL
-        for col, width in enumerate([180, 280, 60, 50, 90, 120, 160]):
+        # Date, Market, Side, Qty, Result, Fee, Net PnL
+        for col, width in enumerate([180, 220, 60, 50, 90, 120, 160]):
             self.settlements_table.setColumnWidth(col, width)
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
@@ -1952,7 +1956,8 @@ class PnLTab(QWidget):
                 result_str = "LOST ✗"
                 result_color = RED
 
-            vals = [e["date"], e["ticker"], e["side"], str(e["contracts"]),
+            market = _city_from_ticker(e["ticker"]) or e["ticker"]
+            vals = [e["date"], market, e["side"], str(e["contracts"]),
                     result_str, f"${e['fee']:.2f}", f"${e['net_pnl']:+.2f}"]
             for ci, val in enumerate(vals):
                 item = QTableWidgetItem(val)
@@ -2036,13 +2041,13 @@ class SessionTab(QWidget):
         self.table = QTableWidget()
         self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(
-            ["Time", "Ticker", "Side", "Qty", "Entry", "Score", "Status"]
+            ["Time", "Market", "Side", "Qty", "Entry", "Score", "Status"]
         )
         th = self.table.horizontalHeader()
         th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         th.setStretchLastSection(True)
-        # Time, Ticker, Side, Qty, Entry, Score, Status
-        for col, width in enumerate([90, 270, 60, 50, 70, 65, 90]):
+        # Time, Market, Side, Qty, Entry, Score, Status
+        for col, width in enumerate([90, 200, 60, 50, 70, 65, 90]):
             self.table.setColumnWidth(col, width)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2106,8 +2111,8 @@ class SessionTab(QWidget):
                 status_color = TEXT_SEC
 
             vals = [
-                (e.get("entered_at", "—"),   TEXT_SEC),
-                (e.get("ticker", ""),         TEXT_PRI),
+                (e.get("entered_at", "—"),                          TEXT_SEC),
+                (_city_from_ticker(e.get("ticker","")) or e.get("ticker",""), TEXT_PRI),
                 (side,                        ACCENT if side == "NO" else YELLOW),
                 (str(e.get("contracts", 1)), TEXT_PRI),
                 (f"${avg_cost:.2f}",          TEXT_PRI),

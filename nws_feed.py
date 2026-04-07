@@ -97,7 +97,35 @@ CITIES = {
         "lat":         39.8721,
         "lon":         -75.2411,
         "tz":          "America/New_York",
-        "lst_offset":  -5,   # UTC-5 always (EST)
+        "lst_offset":  -5,
+    },
+    "Atlanta": {
+        "icao":        "KATL",
+        "lat":         33.6407,
+        "lon":         -84.4277,
+        "tz":          "America/New_York",
+        "lst_offset":  -5,
+    },
+    "Houston": {
+        "icao":        "KHOU",
+        "lat":         29.6454,
+        "lon":         -95.2789,
+        "tz":          "America/Chicago",
+        "lst_offset":  -6,
+    },
+    "Phoenix": {
+        "icao":        "KPHX",
+        "lat":         33.4343,
+        "lon":         -112.0078,
+        "tz":          "America/Phoenix",
+        "lst_offset":  -7,   # UTC-7 always (MST, no DST)
+    },
+    "Las Vegas": {
+        "icao":        "KLAS",
+        "lat":         36.0800,
+        "lon":         -115.1522,
+        "tz":          "America/Los_Angeles",
+        "lst_offset":  -8,
     },
 }
 

@@ -50,8 +50,8 @@ import kalshi_scanner
 # ---------------------------------------------------------------------------
 
 # Gate thresholds
-TRADE_WINDOW_START  = 9        # local hour (inclusive) — widened for testing
-TRADE_WINDOW_END    = 23       # local hour (exclusive) — widened for testing
+TRADE_WINDOW_START  = 0        # local hour — trade 24/7
+TRADE_WINDOW_END    = 24       # local hour — trade 24/7
 MAX_SPREAD          = 0.05     # max acceptable bid-ask spread ($)
                                # relaxed from 0.03 — was blocking too many valid signals
 MIN_DEPTH           = 500      # min contracts on the side we're buying
@@ -479,6 +479,38 @@ def run(city_filter: str = None, paper: bool = False) -> list[dict]:
         nws_data  = nws_results.get(city, {})
         scan_data = kalshi_results.get(city, {})
         eval_result = evaluate_city(city, nws_data, scan_data, profiles)
+        evaluations.append(eval_result)
+
+    return evaluations
+
+
+def run_lowt_observe(city_filter: str = None) -> list[dict]:
+    """
+    Scan LOWT markets and evaluate signals — but mark all as observe-only.
+    No orders will ever be placed from these evaluations.
+    Used for paper monitoring of low temperature markets.
+    """
+    profiles = load_profiles()
+
+    nws_results    = nws_feed.snapshot(city_filter)
+    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="low")
+
+    evaluations = []
+    for city, nws_data in nws_results.items():
+        scan_data = kalshi_results.get(city, {})
+        if not scan_data or scan_data.get("error"):
+            continue
+
+        eval_result = evaluate_city(city, nws_data, scan_data, profiles)
+
+        # Force all signals to observe-only — no trades will be placed
+        for signal in eval_result.get("signals", []):
+            if signal.get("trade_type"):
+                signal["observe_only"] = True
+                signal["skip_reason"]  = "LOWT observe-only mode"
+                signal["trade_type"]   = None
+
+        eval_result["market_type"] = "lowt"
         evaluations.append(eval_result)
 
     return evaluations

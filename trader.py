@@ -524,7 +524,7 @@ NO_STOP_LOSS_RISE   = 0.15   # exit NO if YES rises more than this above entry Y
 YES_EXIT_TARGET     = 0.50   # take profit if YES rises 50% from entry
 YES_STOP_LOSS       = 0.30   # stop loss if YES falls 30% from entry
 
-def check_exits(client: KalshiClient, paper: bool = False):
+def check_exits(client: KalshiClient, paper: bool = False) -> dict:
     """
     Check all open positions and trigger exits where appropriate.
     Sources positions directly from Kalshi — not from local positions.json.
@@ -536,17 +536,21 @@ def check_exits(client: KalshiClient, paper: bool = False):
     YES trades:
       - Take profit when price rises YES_EXIT_TARGET% from entry
       - Stop loss when price falls YES_STOP_LOSS% from entry
+
+    Returns dict of {ticker: reason} for each position that was exited.
+    Reasons: "Stopped Out", "Take Profit"
     """
+    exited = {}   # {ticker: reason}
     # Get live positions from Kalshi — this catches ALL open positions
     # regardless of whether they were recorded in positions.json
     try:
         live_positions = sync_from_kalshi(client)
     except Exception as e:
         print(f"  Could not fetch live positions for exit check: {e}")
-        return
+        return exited
 
     if not live_positions:
-        return
+        return exited
 
     # Prices already fetched by sync_from_kalshi — use current_price directly
     # But we need yes_bid specifically for NO stop-loss check, so batch fetch
@@ -572,7 +576,7 @@ def check_exits(client: KalshiClient, paper: bool = False):
             }
     except Exception as e:
         print(f"  Batch price fetch failed: {e} — skipping exit check")
-        return
+        return exited
 
     for pos in live_positions:
         ticker    = pos["ticker"]
@@ -637,16 +641,22 @@ def check_exits(client: KalshiClient, paper: bool = False):
                         contracts     = contracts,
                         paper         = False,
                     )
+                    label = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
+                    exited[ticker] = label
                     print(f"  Exit order placed: {ticker} {exit_side.upper()} "
                           f"@ ${exit_price:.2f}  reason={exit_reason}")
                 except Exception as e:
                     print(f"  Exit order failed for {ticker}: {e}")
                     continue
             else:
+                label = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
+                exited[ticker] = label
                 print(f"    [PAPER] Would exit {ticker} {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
 
         time.sleep(0.1)
+
+    return exited
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +667,27 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     """Run decision engine, then execute any actionable signals."""
     evaluations = decision_engine.run(city_filter=city_filter, paper=False)
     decision_engine.display(evaluations)
+
+    # LOWT observe-only scan — evaluate signals but never place orders
+    try:
+        lowt_evals = decision_engine.run_lowt_observe(city_filter=city_filter)
+        if lowt_evals:
+            print("\n  ── LOWT Markets (observe only) ──────────────────────────")
+            for ev in lowt_evals:
+                city    = ev["city"]
+                signals = [s for s in ev.get("signals", [])
+                           if s.get("observe_only")]
+                if signals:
+                    for s in signals:
+                        print(f"  [OBS] {city} {s['ticker'][-12:]}  "
+                              f"score={s.get('score',0)}/3  "
+                              f"[{', '.join(s.get('score_detail', []))}]")
+            print()
+    except Exception as e:
+        print(f"  LOWT observe error: {e}")
+
+    # Combine evaluations (LOWT ones have no trade_type so won't be executed)
+    evaluations = evaluations + (lowt_evals or [])
 
     balance    = get_balance(client)
     deployable = round(balance * 0.70, 2)

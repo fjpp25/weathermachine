@@ -38,14 +38,18 @@ except ImportError:
 # Each series has one market per day (today's event)
 # ---------------------------------------------------------------------------
 CITY_SERIES = {
-    "New York":      {"high": "KXHIGHNY",   "low": "KXLOWTNYC"},
-    "Chicago":       {"high": "KXHIGHCHI",  "low": "KXLOWTCHI"},
-    "Miami":         {"high": "KXHIGHMIA",  "low": "KXLOWTMIA"},
-    "Austin":        {"high": "KXHIGHAUS",  "low": "KXLOWTAUS"},
-    "Los Angeles":   {"high": "KXHIGHLAX",  "low": "KXLOWTLAX"},
-    "San Francisco": {"high": "KXHIGHTSFO", "low": None},          # no low market for SF
-    "Denver":        {"high": "KXHIGHDEN",  "low": "KXLOWTDEN"},
-    "Philadelphia":  {"high": "KXHIGHPHIL", "low": "KXLOWTPHIL"},
+    "New York":      {"high": "KXHIGHNY",    "low": "KXLOWTNYC"},
+    "Chicago":       {"high": "KXHIGHCHI",   "low": "KXLOWTCHI"},
+    "Miami":         {"high": "KXHIGHMIA",   "low": "KXLOWTMIA"},
+    "Austin":        {"high": "KXHIGHAUS",   "low": "KXLOWTAUS"},
+    "Los Angeles":   {"high": "KXHIGHLAX",   "low": "KXLOWTLAX"},
+    "San Francisco": {"high": "KXHIGHTSFO",  "low": None},
+    "Denver":        {"high": "KXHIGHDEN",   "low": "KXLOWTDEN"},
+    "Philadelphia":  {"high": "KXHIGHPHIL",  "low": "KXLOWTPHIL"},
+    "Atlanta":       {"high": "KXHIGHTATL",  "low": None},
+    "Houston":       {"high": "KXHIGHTHOU",  "low": None},
+    "Phoenix":       {"high": "KXHIGHTPHX",  "low": None},
+    "Las Vegas":     {"high": "KXHIGHTLV",   "low": None},
 }
 
 API_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
@@ -239,6 +243,7 @@ def scan_city(city: str, market_type: str = "high") -> dict:
             bracket = {
                 "ticker":       ticker,
                 "title":        title,
+                "status":       market.get("status", "active"),
                 "floor":        market.get("floor_strike"),
                 "cap":          market.get("cap_strike"),
                 "volume":       safe_decimal(market.get("volume_fp")),
