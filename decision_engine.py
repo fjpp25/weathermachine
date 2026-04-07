@@ -83,6 +83,11 @@ MOMENTUM_LOOKBACK        = 3   # look at last N candles for direction
 # NWS forecast warm bias correction (from research: forecasts run ~1°F warm)
 FORECAST_BIAS_CORRECTION = -1.0   # subtract this from NWS forecast high
 
+# Forecast well-clear threshold for NO trade scoring
+# Bracket must be this far from the corrected forecast to score the forecast point
+# (higher bar than BOUNDARY_BUFFER gate — gate=3°F, score=6°F)
+FORECAST_WELL_CLEAR = 6.0
+
 # ---------------------------------------------------------------------------
 # Load cached city profiles
 # ---------------------------------------------------------------------------
@@ -262,42 +267,65 @@ def evaluate_bracket(
             return signal
 
     # --- Signal scoring ---
+    # YES trades: scored on forecast match, observed floor, momentum up
+    # NO trades:  scored on observed elimination, forecast well-clear, momentum flat/down
     score = 0
     details = []
 
-    # +1 forecast signal (YES trades only — forecast points here)
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+
     if is_forecast_bracket:
+        # ── YES trade scoring ─────────────────────────────────────────────
+
+        # +1 forecast match (forecast points to this bracket)
         score += 1
         details.append("forecast_match")
 
-    # +1 observed high signal
-    if observed_high is not None:
-        floor = bracket.get("floor")
-        cap   = bracket.get("cap")
+        # +1 observed floor cleared (temperature already in bracket range)
+        if observed_high is not None and floor is not None and observed_high >= floor:
+            score += 1
+            details.append("obs_floor_cleared")
 
-        if is_forecast_bracket:
-            # YES trade: observed high already above bracket floor = bullish
-            if floor is not None and observed_high >= floor:
-                score += 1
-                details.append("obs_floor_cleared")
-        else:
-            # NO trade: observed high already above bracket cap = bracket is eliminated
-            # (temperature has passed the cap, so YES is impossible)
+        # +1 momentum up (YES price trending upward = market agrees)
+        candles  = bracket.get("candles", [])
+        if score_momentum(candles):
+            score += 1
+            details.append("momentum_up")
+
+    else:
+        # ── NO trade scoring ──────────────────────────────────────────────
+
+        # +1 observed signal: temperature already eliminates this bracket,
+        #    or still well below the bracket floor
+        if observed_high is not None:
             if cap is not None and observed_high >= cap:
+                # Definitive: temperature has passed bracket ceiling
                 score += 1
                 details.append("obs_eliminates_bracket")
-            # NO trade: observed high still well below bracket floor = bracket unlikely
-            # (temperature hasn't reached the floor with little time remaining)
             elif floor is not None and observed_high < floor - BOUNDARY_BUFFER:
+                # Likely: temperature still well below bracket floor
                 score += 1
                 details.append("obs_below_floor")
 
-    # +1 momentum signal
-    candles  = bracket.get("candles", [])
-    momentum = score_momentum(candles)
-    if momentum:
-        score += 1
-        details.append("momentum_up")
+        # +1 forecast well-clear: corrected forecast is >FORECAST_WELL_CLEAR°F
+        #    from the nearest bracket edge (stronger than the gate threshold)
+        corrected = forecast_high + FORECAST_BIAS_CORRECTION
+        distances = []
+        if floor is not None:
+            distances.append(abs(corrected - floor))
+        if cap is not None:
+            distances.append(abs(corrected - cap))
+        if distances and min(distances) >= FORECAST_WELL_CLEAR:
+            score += 1
+            details.append("forecast_well_clear")
+
+        # +1 momentum flat or down: YES price not rising = market not pricing
+        #    this bracket in (good for NO holders)
+        candles  = bracket.get("candles", [])
+        if not score_momentum(candles):   # momentum_up returned 0
+            score += 1
+            details.append("momentum_flat_or_down")
 
     signal["score"]        = score
     signal["score_detail"] = details

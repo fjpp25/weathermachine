@@ -33,7 +33,7 @@ import decision_engine
 # ---------------------------------------------------------------------------
 
 ACTIVITY_START_HOUR = 9    # local city time — start polling
-ACTIVITY_END_HOUR   = 15   # local city time — stop polling
+ACTIVITY_END_HOUR   = 17   # local city time — stop polling
 
 CITY_TIMEZONES = {
     "New York":      "America/New_York",

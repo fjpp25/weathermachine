@@ -344,12 +344,22 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             avg_cost = round(total_traded / contracts, 4)
 
         # Current price and unrealised PnL
-        if ticker in prices:
+        # For active markets: use live bid price
+        # For closed/pending-settlement markets: derive from market_exposure_dollars
+        live = False
+        if ticker in prices and (prices[ticker]["yes_bid"] > 0 or prices[ticker]["no_bid"] > 0):
             current_price  = prices[ticker]["yes_bid"] if side == "yes" else prices[ticker]["no_bid"]
             unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
+            live = True
         else:
-            current_price  = 0
-            unrealised_pnl = 0
+            # Market closed — use Kalshi's mark-to-market exposure value
+            market_exposure = float(pos.get("market_exposure_dollars") or 0)
+            if market_exposure > 0 and contracts > 0:
+                current_price  = round(market_exposure / contracts, 4)
+                unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
+            else:
+                current_price  = 0
+                unrealised_pnl = 0
 
         enriched.append({
             "ticker":         ticker,
@@ -360,6 +370,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             "unrealised_pnl": unrealised_pnl,
             "fees_paid":      fees_paid,
             "last_updated":   last_updated[:16].replace("T", " ") if last_updated else "",
+            "live":           live,
         })
 
     return enriched
@@ -682,7 +693,8 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             print(f"\n  Executing: {city} {ticker}")
             print(f"    {side.upper()} {contracts}x @ ${price:.2f}  "
-                  f"target=${signal['exit_target']:.2f}  score={signal['score']}/3")
+                  f"target=${signal['exit_target']:.2f}  score={signal['score']}/3"
+                  f"  [{', '.join(signal.get('score_detail', []))}]")
 
             try:
                 place_order(
@@ -700,6 +712,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 print(f"  Order failed for {ticker}: {e}")
 
     print(f"\n  {executed} order(s) placed.")
+    return evaluations
 
 
 # ---------------------------------------------------------------------------

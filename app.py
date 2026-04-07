@@ -62,9 +62,48 @@ CITY_TIMEZONES = {
     "Philadelphia":  "America/New_York",
 }
 
-# ---------------------------------------------------------------------------
-# Color palette — dark financial terminal aesthetic
-# ---------------------------------------------------------------------------
+# Reverse map: series prefix → city name (for ticker → city display)
+_SERIES_TO_CITY = {
+    "KXHIGHNY":   "New York",
+    "KXLOWTNYC":  "New York",
+    "KXHIGHCHI":  "Chicago",
+    "KXLOWTCHI":  "Chicago",
+    "KXHIGHMIA":  "Miami",
+    "KXLOWTMIA":  "Miami",
+    "KXHIGHAUS":  "Austin",
+    "KXLOWTAUS":  "Austin",
+    "KXHIGHLAX":  "Los Angeles",
+    "KXLOWTLAX":  "Los Angeles",
+    "KXHIGHTSFO": "San Francisco",
+    "KXHIGHSFO":  "San Francisco",
+    "KXLOWTSFO":  "San Francisco",
+    "KXHIGHDEN":  "Denver",
+    "KXLOWTDEN":  "Denver",
+    "KXHIGHPHIL": "Philadelphia",
+    "KXLOWTPHIL": "Philadelphia",
+    # Additional cities
+    "KXHIGHTATL":  "Atlanta",
+    "KXHIGHTBOS":  "Boston",
+    "KXHIGHTDC":   "Washington DC",
+    "KXHIGHTPHX":  "Phoenix",
+    "KXHIGHTLV":   "Las Vegas",
+    "KXHIGHTDAL":  "Dallas",
+    "KXHIGHTMIN":  "Minneapolis",
+    "KXHIGHTSATX": "San Antonio",
+    "KXHIGHTHOU":  "Houston",
+    "KXHIGHTSEA":  "Seattle",
+    "KXHIGHTNOLA": "New Orleans",
+    "KXHIGHTOKC":  "Oklahoma City",
+}
+
+def _city_from_ticker(ticker: str) -> str | None:
+    """Extract city name from a Kalshi temperature ticker."""
+    prefix = ticker.split("-")[0]
+    city = _SERIES_TO_CITY.get(prefix)
+    if city:
+        mtype = "HIGH" if "HIGH" in prefix else "LOW"
+        return f"{city} ({mtype})"
+    return None
 BG_DARK     = "#0d0f14"
 BG_PANEL    = "#141720"
 BG_ROW_ALT = "#181c24"
@@ -437,11 +476,15 @@ class BackgroundWorker(QObject):
             self.errored.emit(f"{e}\n{traceback.format_exc()}")
 
 
+# Module-level set to keep thread references alive until they finish
+_active_threads: set = set()
+
+
 def run_in_background(fn, on_done, on_error=None, *args, **kwargs):
     """
     Helper: run fn(*args, **kwargs) in a QThread,
     call on_done(result) on success, on_error(msg) on failure.
-    Returns the thread so the caller can keep a reference.
+    Thread is kept alive in _active_threads until it finishes.
     """
     worker = BackgroundWorker(fn, *args, **kwargs)
     thread = QThread()
@@ -451,8 +494,13 @@ def run_in_background(fn, on_done, on_error=None, *args, **kwargs):
     worker.finished.connect(lambda _: thread.quit())
     worker.errored.connect(on_error or (lambda e: None))
     worker.errored.connect(lambda _: thread.quit())
+
+    # Keep reference alive until thread finishes, then clean up
+    _active_threads.add(thread)
+    thread.finished.connect(lambda: _active_threads.discard(thread))
+
     thread.start()
-    return thread, worker   # caller must hold reference to prevent GC
+    return thread, worker
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +519,7 @@ class SchedulerWorker(QObject):
     balance_updated   = pyqtSignal(float, float)
     client_ready      = pyqtSignal(object)
     session_entry     = pyqtSignal(dict)   # emitted each time an order is placed
-    session_exit      = pyqtSignal(str)    # emitted with ticker when position closes
+    session_exit      = pyqtSignal(str, str) # ticker, reason ("Stopped Out" | "Settled")
     stopped           = pyqtSignal()
 
     def __init__(self, paper: bool = False):
@@ -556,18 +604,14 @@ class SchedulerWorker(QObject):
                         p["ticker"] for p in trader.sync_from_kalshi(client)
                         if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
                     }
-                    # Capture scores from decision engine before pipeline runs
-                    try:
-                        evals = decision_engine.run()
-                        for ev in evals:
-                            for sig in ev.get("signals", []):
-                                t = sig.get("ticker")
-                                s = sig.get("score")
-                                if t and s is not None:
-                                    self._last_scores[t] = s
-                    except Exception:
-                        pass
-                    trader.run_pipeline(client=client, paper=self.paper)
+                    evaluations = trader.run_pipeline(client=client, paper=self.paper)
+                    # Build score lookup from this run's evaluations
+                    for ev in (evaluations or []):
+                        for sig in ev.get("signals", []):
+                            t = sig.get("ticker")
+                            s = sig.get("score")
+                            if t and s is not None:
+                                self._last_scores[t] = s
                     positions_after = [
                         p for p in trader.sync_from_kalshi(client)
                         if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
@@ -596,14 +640,15 @@ class SchedulerWorker(QObject):
                     }
                     if live_pos:
                         self.log_line.emit(f"Checking exits ({len(live_pos)} open)...")
-                        trader.check_exits(client, paper=self.paper)
-                        # Detect closed positions
+                        exited = trader.check_exits(client, paper=self.paper)
+                        # Detect closed positions and emit with reason
                         climate_after = {
                             p["ticker"] for p in trader.sync_from_kalshi(client)
                             if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
                         }
                         for closed_ticker in climate_before - climate_after:
-                            self.session_exit.emit(closed_ticker)
+                            reason = exited.get(closed_ticker, "Settled")
+                            self.session_exit.emit(closed_ticker, reason)
                     self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"Exit check error: {e}")
@@ -634,7 +679,7 @@ class CityCard(QFrame):
     def __init__(self, city: str):
         super().__init__()
         self.city = city
-        self.setFixedSize(180, 90)
+        self.setFixedSize(200, 110)
         self.setStyleSheet(f"""
             QFrame {{
                 background: {BG_PANEL};
@@ -645,34 +690,45 @@ class CityCard(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setSpacing(3)
 
         self.name_label = QLabel(city)
-        self.name_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;")
+        self.name_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px; letter-spacing: 1px;")
 
         self.time_label = QLabel("--:-- --")
-        self.time_label.setStyleSheet(f"color: {TEXT_PRI}; font-size: 13px; font-weight: bold;")
+        self.time_label.setStyleSheet(f"color: {TEXT_PRI}; font-size: 14px; font-weight: bold;")
 
-        self.temp_label = QLabel("curr: --°  hi: --°")
-        self.temp_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+        self.hi_label = QLabel("hi: --°  fcst: --°")
+        self.hi_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
+
+        self.lo_label = QLabel("lo: --°  fcst: --°")
+        self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
 
         self.status_label = QLabel("waiting")
-        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px;")
+        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
 
         layout.addWidget(self.name_label)
         layout.addWidget(self.time_label)
-        layout.addWidget(self.temp_label)
+        layout.addWidget(self.hi_label)
+        layout.addWidget(self.lo_label)
         layout.addWidget(self.status_label)
 
     def update_data(self, local_time: str, curr: float, obs_hi: float,
-                    fcst_hi: float, active: bool):
+                    fcst_hi: float, active: bool,
+                    obs_lo: float = None, fcst_lo: float = None):
         self.time_label.setText(local_time)
-        self.temp_label.setText(
-            f"curr: {curr:.0f}°  hi: {obs_hi:.0f}°  fcst: {fcst_hi:.0f}°"
-        )
+
+        hi_str   = f"{obs_hi:.0f}°"  if obs_hi  else "--°"
+        lo_str   = f"{obs_lo:.0f}°"  if obs_lo  else "--°"
+        fhi_str  = f"{fcst_hi:.0f}°" if fcst_hi else "--°"
+        flo_str  = f"{fcst_lo:.0f}°" if fcst_lo else "--°"
+
+        self.hi_label.setText(f"hi: {hi_str}  fcst: {fhi_str}")
+        self.lo_label.setText(f"lo: {lo_str}  fcst: {flo_str}")
+
         color = ACCENT if active else TEXT_SEC
         self.status_label.setText("active" if active else "outside window")
-        self.status_label.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
         self.setStyleSheet(f"""
             QFrame {{
                 background: {BG_PANEL};
@@ -687,6 +743,9 @@ class CityCard(QFrame):
 # ---------------------------------------------------------------------------
 
 class HomeTab(QWidget):
+    log_line  = pyqtSignal(str)    # emitted on every log append → LogTab listens
+    nws_ready = pyqtSignal(object) # emitted when NWS snapshot completes
+
     def __init__(self):
         super().__init__()
         self._worker  = None
@@ -701,24 +760,6 @@ class HomeTab(QWidget):
 
         # ── Top bar: controls + balance ──────────────────────────────────
         top_bar = QHBoxLayout()
-
-        self.start_btn = QPushButton("▶  Start Trading")
-        self.start_btn.setFixedHeight(44)
-        self.start_btn.setFixedWidth(180)
-        self.start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {ACCENT};
-                color: {BG_DARK};
-                border: none;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-                letter-spacing: 1px;
-            }}
-            QPushButton:hover {{ background: {ACCENT_DIM}; }}
-            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_SEC}; }}
-        """)
-        self.start_btn.clicked.connect(self.toggle_scheduler)
 
         self.mode_label = QLabel("LIVE" if os.environ.get("KALSHI_DEMO", "true") == "false" else "DEMO")
         live = os.environ.get("KALSHI_DEMO", "true") == "false"
@@ -737,7 +778,7 @@ class HomeTab(QWidget):
         self.countdown_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
 
         self.sync_btn = QPushButton("⟳  Sync")
-        self.sync_btn.setFixedHeight(44)
+        self.sync_btn.setFixedHeight(36)
         self.sync_btn.setFixedWidth(100)
         self.sync_btn.setStyleSheet(f"""
             QPushButton {{
@@ -751,8 +792,6 @@ class HomeTab(QWidget):
         """)
         self.sync_btn.clicked.connect(self.sync_positions_from_kalshi)
 
-        top_bar.addWidget(self.start_btn)
-        top_bar.addSpacing(8)
         top_bar.addWidget(self.sync_btn)
         top_bar.addSpacing(12)
         top_bar.addWidget(self.mode_label)
@@ -793,9 +832,6 @@ class HomeTab(QWidget):
             self.city_cards[city] = card
             city_grid.addWidget(card, i // 4, i % 4)
 
-        # ── Splitter: positions table + log ──────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
         # Positions table
         pos_frame = QFrame()
         pos_layout = QVBoxLayout(pos_frame)
@@ -807,15 +843,15 @@ class HomeTab(QWidget):
         pos_layout.addWidget(pos_hdr)
 
         self.pos_table = QTableWidget()
-        self.pos_table.setColumnCount(7)
+        self.pos_table.setColumnCount(8)
         self.pos_table.setHorizontalHeaderLabels(
-            ["Ticker", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened"]
+            ["Market", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened", "Status"]
         )
         hdr = self.pos_table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hdr.setStretchLastSection(True)
-        # Default column widths: Ticker, Side, Qty, Avg Cost, Current, Unreal PnL, Opened
-        for col, width in enumerate([260, 60, 50, 90, 90, 100, 120]):
+        # Ticker, Side, Qty, Avg Cost, Current, Unreal PnL, Opened, Status
+        for col, width in enumerate([260, 60, 50, 90, 90, 160, 180, 90]):
             self.pos_table.setColumnWidth(col, width)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -826,25 +862,6 @@ class HomeTab(QWidget):
         )
         pos_layout.addWidget(self.pos_table)
 
-        # Log panel
-        log_frame = QFrame()
-        log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(0, 0, 0, 0)
-        log_layout.setSpacing(6)
-
-        log_hdr = QLabel("ACTIVITY LOG")
-        log_hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
-        log_layout.addWidget(log_hdr)
-
-        self.log_box = QTextEdit()
-        self.log_box.setReadOnly(True)
-        self.log_box.setMinimumHeight(120)
-        log_layout.addWidget(self.log_box)
-
-        splitter.addWidget(pos_frame)
-        splitter.addWidget(log_frame)
-        splitter.setSizes([300, 180])
-
         # ── Assemble ─────────────────────────────────────────────────────
         main_layout.addLayout(top_bar)
         main_layout.addLayout(bal_bar)
@@ -852,13 +869,20 @@ class HomeTab(QWidget):
         main_layout.addWidget(city_label)
         main_layout.addLayout(city_grid)
         main_layout.addWidget(self._hline())
-        main_layout.addWidget(splitter, stretch=1)
+        main_layout.addWidget(pos_frame, stretch=1)
 
         # Timers
         self._city_timer = QTimer()
         self._city_timer.timeout.connect(self._refresh_cities)
         self._city_timer.start(30_000)
         self._refresh_cities()
+
+        # NWS data fetch — every 5 minutes, fetch immediately on startup
+        self.nws_ready.connect(self._on_nws_ready)
+        self._nws_timer = QTimer()
+        self._nws_timer.timeout.connect(self._refresh_nws_data)
+        self._nws_timer.start(300_000)
+        QTimer.singleShot(500, self._refresh_nws_data)  # slight delay so UI renders first
 
         self._countdown_timer = QTimer()
         self._countdown_timer.timeout.connect(self._tick_countdown)
@@ -916,18 +940,6 @@ class HomeTab(QWidget):
     def _start_scheduler(self):
         self._running = True
         self._client  = None   # will be set once worker connects
-        self.start_btn.setText("■  Stop Trading")
-        self.start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {RED};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background: #cc3d55; }}
-        """)
         self.status_label.setText("Starting...")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
         self.append_log("Scheduler started.")
@@ -954,8 +966,6 @@ class HomeTab(QWidget):
     def _stop_scheduler(self):
         if self._worker:
             self._worker.stop()
-        self.start_btn.setEnabled(False)
-        self.start_btn.setText("■  Stopping...")
         self.status_label.setText("Stopping — finishing current operation...")
         self.status_label.setStyleSheet(f"color: {YELLOW}; font-size: 12px;")
         self.append_log("Stop requested — will finish current operation then exit.")
@@ -964,23 +974,13 @@ class HomeTab(QWidget):
         self._running = False
         self._thread.quit()
         self._thread.wait()
-        self.start_btn.setEnabled(True)
-        self.start_btn.setText("▶  Start Trading")
-        self.start_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {ACCENT};
-                color: {BG_DARK};
-                border: none;
-                border-radius: 6px;
-                font-size: 13px;
-                font-weight: bold;
-            }}
-            QPushButton:hover {{ background: {ACCENT_DIM}; }}
-        """)
         self.status_label.setText("Idle")
         self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
         self._next_poll_ts = None
         self.append_log("Scheduler stopped.")
+        # Notify registered stop callbacks (e.g. global header button)
+        for cb in getattr(self, '_stop_trading_callbacks', []):
+            cb()
 
     def _on_client_ready(self, client):
         self._client = client
@@ -1015,9 +1015,7 @@ class HomeTab(QWidget):
             self.countdown_label.setText(f"next poll in {m:02d}:{s:02d}")
 
     def append_log(self, text: str):
-        self.log_box.append(text)
-        sb = self.log_box.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        self.log_line.emit(text)
 
     def sync_positions_from_kalshi(self):
         """Fetch live positions directly from Kalshi and update the table."""
@@ -1048,10 +1046,15 @@ class HomeTab(QWidget):
 
     def _update_positions_table(self, positions: list):
         """Update the positions table from a list of enriched position dicts."""
-        self.pos_table.setRowCount(len(positions))
+        # Sort oldest first (chronological order)
+        sorted_positions = sorted(
+            positions,
+            key=lambda p: p.get("last_updated", ""),
+        )
+        self.pos_table.setRowCount(len(sorted_positions))
         total_unrealised = 0.0
 
-        for row, pos in enumerate(positions):
+        for row, pos in enumerate(sorted_positions):
             ticker    = pos.get("ticker", "")
             side      = pos.get("side", "").upper()
             qty       = pos.get("contracts", 1)
@@ -1059,19 +1062,26 @@ class HomeTab(QWidget):
             current   = pos.get("current_price", 0)
             unreal    = pos.get("unrealised_pnl", 0)
             updated   = pos.get("last_updated", "")
+            is_live   = pos.get("live", True)
             total_unrealised += unreal
 
-            pnl_color = ACCENT if unreal >= 0 else RED
-            sign      = "+" if unreal >= 0 else ""
+            # Derive city name from ticker prefix
+            city_display = _city_from_ticker(ticker) or ticker
+
+            pnl_color    = ACCENT if unreal >= 0 else RED
+            sign         = "+" if unreal >= 0 else ""
+            status_str   = "Live" if is_live else "Settling"
+            status_color = ACCENT if is_live else YELLOW
 
             items = [
-                (ticker, TEXT_PRI),
-                (side, ACCENT if side == "NO" else YELLOW),
-                (str(qty), TEXT_PRI),
-                (f"${avg_cost:.2f}", TEXT_PRI),
-                (f"${current:.2f}", TEXT_PRI),
+                (city_display,          TEXT_PRI),
+                (side,                  ACCENT if side == "NO" else YELLOW),
+                (str(qty),              TEXT_PRI),
+                (f"${avg_cost:.2f}",    TEXT_PRI),
+                (f"${current:.2f}",     TEXT_PRI),
                 (f"{sign}${unreal:.2f}", pnl_color),
-                (updated, TEXT_SEC),
+                (updated,               TEXT_SEC),
+                (status_str,            status_color),
             ]
 
             for col, (val, color) in enumerate(items):
@@ -1087,16 +1097,57 @@ class HomeTab(QWidget):
         self.pnl_label.setStyleSheet(f"color: {color}; font-size: 14px;")
 
     def _refresh_cities(self):
+        """Update city card times only — called every 30s."""
         for city, tz in CITY_TIMEZONES.items():
             card = self.city_cards[city]
             now  = datetime.now(ZoneInfo(tz))
             h    = now.hour
-            active = 9 <= h < 15
+            active = 9 <= h < 17
             card.update_data(
                 local_time = now.strftime("%H:%M %Z"),
-                curr       = 0,
-                obs_hi     = 0,
-                fcst_hi    = 0,
+                curr       = None,
+                obs_hi     = getattr(card, '_obs_hi', None),
+                fcst_hi    = getattr(card, '_fcst_hi', None),
+                obs_lo     = getattr(card, '_obs_lo', None),
+                fcst_lo    = getattr(card, '_fcst_lo', None),
+                active     = active,
+            )
+
+    def _refresh_nws_data(self):
+        """Fetch NWS temperatures in background — called every 5 minutes."""
+        def fetch():
+            try:
+                import nws_feed
+                return nws_feed.snapshot()
+            except Exception:
+                return {}
+
+        run_in_background(fetch, self.nws_ready.emit)
+
+    def _on_nws_ready(self, results):
+        """Called on main thread when NWS snapshot completes."""
+        for city, tz in CITY_TIMEZONES.items():
+            card = self.city_cards.get(city)
+            if not card:
+                continue
+            now    = datetime.now(ZoneInfo(tz))
+            active = 9 <= now.hour < 17
+            data    = results.get(city, {})
+            obs_hi  = data.get("observed_high_f")
+            fcst_hi = data.get("forecast_high_f")
+            fcst_lo = data.get("forecast_low_f")
+            # Cache on card so clock ticks preserve the values
+            card._obs_hi  = obs_hi
+            card._fcst_hi = fcst_hi
+            card._obs_lo  = None
+            card._fcst_lo = fcst_lo
+            card.update_data(
+                local_time = now.strftime("%H:%M %Z"),
+                curr       = None,
+                obs_hi     = obs_hi,
+                fcst_hi    = fcst_hi,
+                obs_lo     = None,
+                fcst_lo    = fcst_lo,
                 active     = active,
             )
 
@@ -1546,7 +1597,7 @@ class PnLTab(QWidget):
         dh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         dh.setStretchLastSection(True)
         # Date, Trades, Wins, Losses, Win%, Fees, Net PnL, Cum PnL
-        for col, width in enumerate([100, 70, 65, 70, 70, 70, 90, 90]):
+        for col, width in enumerate([180, 70, 65, 70, 70, 120, 160, 160]):
             self.daily_table.setColumnWidth(col, width)
 
         for ri, row in enumerate(day_rows):
@@ -1571,7 +1622,7 @@ class PnLTab(QWidget):
         sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         sh.setStretchLastSection(True)
         # Date, Ticker, Side, Qty, Result, Fee, Net PnL
-        for col, width in enumerate([100, 280, 60, 50, 90, 60, 90]):
+        for col, width in enumerate([180, 280, 60, 50, 90, 120, 160]):
             self.settlements_table.setColumnWidth(col, width)
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
@@ -1725,12 +1776,19 @@ class SessionTab(QWidget):
         )
 
         for row, e in enumerate(entries):
-            status     = e.get("status", "Open")
-            side       = e.get("side", "").upper()
-            score      = e.get("score", "?")
-            avg_cost   = e.get("avg_cost", 0)
+            status   = e.get("status", "Open")
+            side     = e.get("side", "").upper()
+            score    = e.get("score", "?")
+            avg_cost = e.get("avg_cost", 0)
 
-            status_color = ACCENT if status == "Open" else RED
+            if status == "Open":
+                status_color = ACCENT
+            elif status == "Stopped Out":
+                status_color = RED
+            elif status == "Take Profit":
+                status_color = ACCENT
+            else:  # Settled
+                status_color = TEXT_SEC
 
             vals = [
                 (e.get("entered_at", "—"),   TEXT_SEC),
@@ -1747,6 +1805,57 @@ class SessionTab(QWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setForeground(QColor(color))
                 self.table.setItem(row, col, item)
+
+
+# ---------------------------------------------------------------------------
+# Log tab
+# ---------------------------------------------------------------------------
+
+class LogTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(8)
+
+        hdr = QLabel("ACTIVITY LOG")
+        hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
+        layout.addWidget(hdr)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet(f"""
+            QTextEdit {{
+                background: {BG_DARK};
+                color: {TEXT_PRI};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                font-family: monospace;
+                font-size: 12px;
+            }}
+        """)
+        layout.addWidget(self.log_box, stretch=1)
+
+        clear_btn = QPushButton("Clear Log")
+        clear_btn.setFixedWidth(100)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {BG_PANEL};
+                color: {TEXT_SEC};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 4px 8px;
+                font-size: 11px;
+            }}
+            QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
+        """)
+        clear_btn.clicked.connect(self.log_box.clear)
+        layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def append(self, text: str):
+        self.log_box.append(text)
+        sb = self.log_box.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
 
 # ---------------------------------------------------------------------------
@@ -1786,10 +1895,36 @@ class MainWindow(QMainWindow):
         """)
         subtitle = QLabel("Kalshi Temperature Markets")
         subtitle.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;")
+
+        # Global start/stop button
+        self.global_start_btn = QPushButton("▶  Start Trading")
+        self.global_start_btn.setFixedHeight(34)
+        self.global_start_btn.setFixedWidth(150)
+        self.global_start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT};
+                color: {BG_DARK};
+                border: none;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {ACCENT_DIM}; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_SEC}; }}
+        """)
+        self.global_start_btn.clicked.connect(self._global_toggle)
+
+        self.global_status_label = QLabel("Idle")
+        self.global_status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+
         header_layout.addWidget(logo)
         header_layout.addSpacing(12)
         header_layout.addWidget(subtitle)
         header_layout.addStretch()
+        header_layout.addWidget(self.global_status_label)
+        header_layout.addSpacing(12)
+        header_layout.addWidget(self.global_start_btn)
+        header_layout.addSpacing(8)
         main_layout.addWidget(header)
 
         # Tabs
@@ -1797,6 +1932,10 @@ class MainWindow(QMainWindow):
         self.home_tab    = HomeTab()
         self.session_tab = SessionTab()
         self.pnl_tab     = PnLTab()
+        self.log_tab     = LogTab()
+
+        # Wire home tab log signal → log tab
+        self.home_tab.log_line.connect(self.log_tab.append)
 
         settings_btn = QPushButton("⚙  Settings")
         settings_btn.setStyleSheet(f"""
@@ -1815,15 +1954,61 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.home_tab,    "  Home  ")
         tabs.addTab(self.session_tab, "  Session  ")
         tabs.addTab(self.pnl_tab,     "  Performance  ")
+        tabs.addTab(self.log_tab,     "  Log  ")
         tabs.currentChanged.connect(self._on_tab_changed)
         main_layout.addWidget(tabs)
 
         # Client ready → pass to PnL tab
         self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
         # Wire session tab when scheduler starts
-        self.home_tab._start_trading_callbacks = [self._wire_session_signals]
+        self.home_tab._start_trading_callbacks = [
+            self._wire_session_signals,
+            self._sync_global_btn_running,
+        ]
+        # Sync global button when home tab stops
+        self.home_tab._stop_trading_callbacks = [self._sync_global_btn_stopped]
 
         self.setCentralWidget(central)
+
+    def _global_toggle(self):
+        """Delegate start/stop to the home tab's toggle_scheduler method."""
+        self.home_tab.toggle_scheduler()
+
+    def _sync_global_btn_running(self):
+        """Update global button to reflect running state."""
+        self.global_start_btn.setText("■  Stop Trading")
+        self.global_start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {RED};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: #cc2222; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_SEC}; }}
+        """)
+        self.global_status_label.setText("Trading active")
+        self.global_status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+
+    def _sync_global_btn_stopped(self):
+        """Update global button to reflect stopped state."""
+        self.global_start_btn.setText("▶  Start Trading")
+        self.global_start_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT};
+                color: {BG_DARK};
+                border: none;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {ACCENT_DIM}; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_SEC}; }}
+        """)
+        self.global_status_label.setText("Idle")
+        self.global_status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
 
     def _wire_session_signals(self):
         """Connect session signals and clear the session tab."""
@@ -1832,7 +2017,7 @@ class MainWindow(QMainWindow):
         if worker:
             worker.session_entry.connect(self.session_tab.add_entry)
             worker.session_exit.connect(
-                lambda ticker: self.session_tab.update_status(ticker, "Stopped Out")
+                lambda ticker, reason: self.session_tab.update_status(ticker, reason)
             )
 
     def _open_settings(self):
