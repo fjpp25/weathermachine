@@ -22,7 +22,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from cities import TRADING_CITIES as _CITY_REGISTRY, SERIES_TO_CITY as _SERIES_TO_CITY
+from cities import TRADING_CITIES as _CITY_REGISTRY, SERIES_TO_CITY as _SERIES_TO_CITY, CITIES_WEST_TO_EAST as _CITIES_ORDERED, CITIES as _ALL_CITIES
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -1131,12 +1131,11 @@ class HomeTab(QWidget):
         city_grid = QGridLayout()
         city_grid.setSpacing(10)
         self.city_cards = {}
-        cities = list(CITY_TIMEZONES.keys())
-        for i, city in enumerate(cities):
+        for i, city in enumerate(_CITIES_ORDERED):
             card = CityCard(city)
             card.clicked.connect(self._on_city_card_clicked)
             self.city_cards[city] = card
-            city_grid.addWidget(card, i // 4, i % 4)
+            city_grid.addWidget(card, i % 4, i // 4)
 
         # Positions table
         pos_frame = QFrame()
@@ -1421,9 +1420,12 @@ class HomeTab(QWidget):
 
     def _refresh_cities(self):
         """Update city card times only — called every 30s."""
-        for city, tz in CITY_TIMEZONES.items():
-            card = self.city_cards[city]
-            now  = datetime.now(ZoneInfo(tz))
+        for city in _CITIES_ORDERED:
+            card = self.city_cards.get(city)
+            if not card:
+                continue
+            tz = _ALL_CITIES[city]["tz"]
+            now = datetime.now(ZoneInfo(tz))
             h    = now.hour
             active = True  # 24/7 window
             card.update_data(
@@ -1477,11 +1479,12 @@ class HomeTab(QWidget):
             f"fcst_lo={sample.get('forecast_low_f')}"
         )
 
-        for city, tz in CITY_TIMEZONES.items():
+        for city in _CITIES_ORDERED:
             card = self.city_cards.get(city)
             if not card:
                 continue
-            now    = datetime.now(ZoneInfo(tz))
+            tz = _ALL_CITIES[city]["tz"]
+            now = datetime.now(ZoneInfo(tz))
             active = True  # 24/7 window
             data    = results.get(city, {})
             obs_hi  = data.get("observed_high_f")
