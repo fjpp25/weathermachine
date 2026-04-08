@@ -63,13 +63,21 @@ BOUNDARY_BUFFER     = 3.0      # °F — forecast must be this far inside bracke
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
-                               # must stay comfortably below NO_STOP_LOSS_RISE threshold
-                               # prevents entering positions already near stop-loss boundary
-NO_MAX_ENTRY_PRICE  = 0.87     # never pay more than this for a NO contract
-                               # tightened from 0.90 — positions above this are
-                               # often fee-neutral or worse after settlement
+NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
+                               # data: below 0.75 market is pricing in real uncertainty
+NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract
+                               # data: 0.75-0.92 gives 86.5% WR across 37 trades
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
-                               # prevents carpet-bombing every bracket in a market
+NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for HIGH markets
+                               # spring/summer: temps trending up → asymmetric risk upward
+                               # data: 29% WR, -$6.52 across 7 trades
+MAX_CONTRACTS       = 2        # hard cap on contracts per position
+                               # data: 3-contract losses average -$1.74 each, far worse than 1-2
+
+# Cities paused from trading pending further analysis
+# LAX: 50% WR, -$1.79 across 8 trades — coastal marine layer makes forecasts unreliable
+# PHIL: 0% WR, -$2.15 across 2 trades — small sample but concerning
+PAUSED_CITIES = {"Los Angeles", "Philadelphia"}
 
 # Exit targets
 YES_EXIT_TARGET     = 0.25     # take profit when YES price rises 25%
@@ -221,6 +229,12 @@ def evaluate_bracket(
         signal["skip_reason"] = f"Market not active (status={bracket.get('status')})"
         return signal
 
+    # --- Gate 0b: Ban NO trades on above-threshold (T) brackets for HIGH markets ---
+    if (not is_forecast_bracket and NO_BAN_ABOVE_BRACKETS
+            and bracket.get("cap") is None and bracket.get("floor") is not None):
+        signal["skip_reason"] = "NO on above-threshold bracket banned (spring upward bias)"
+        return signal
+
     # --- Gate 1: Timing ---
     if not (TRADE_WINDOW_START <= city_local_hour < TRADE_WINDOW_END):
         signal["skip_reason"] = f"Outside trading window (local hour={city_local_hour})"
@@ -344,18 +358,23 @@ def evaluate_bracket(
     elif (
         not is_forecast_bracket
         and no_ask is not None
-        and no_ask <= NO_MAX_ENTRY_PRICE
+        and NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE
         and yes_ask is not None
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
     ):
         # NO trade: bracket is far enough from forecast (enforced by boundary buffer above)
-        # and entry price is within acceptable range
-        # Exit: hold to resolution at $1.00, no take-profit needed
-        signal["trade_type"]    = "NO"
-        signal["entry_price"]   = no_ask
-        signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
-        signal["stop_loss"]     = None
+        # entry price within the profitable band ($0.85–$0.90 from backtested data)
+        # Below $0.75: market is pricing in real uncertainty — require score 3/3
+        if no_ask < 0.75 and signal.get("score", 0) < 3:
+            signal["trade_type"]  = None
+            signal["skip_reason"] = f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 (got {signal.get('score',0)}/3)"
+        else:
+            signal["trade_type"]    = "NO"
+            signal["entry_price"]   = no_ask
+            signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
+            signal["stop_loss"]     = None
+            signal["max_contracts"] = MAX_CONTRACTS
 
     return signal
 
@@ -390,6 +409,10 @@ def evaluate_city(
     }
 
     # Sanity checks
+    if city in PAUSED_CITIES:
+        result["error"] = f"City paused (insufficient edge — see PAUSED_CITIES)"
+        return result
+
     if nws_data.get("error"):
         result["error"] = f"NWS error: {nws_data['error']}"
         return result

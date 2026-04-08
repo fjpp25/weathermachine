@@ -52,17 +52,21 @@ DATA_DIR    = Path("data")
 CONFIG_FILE = DATA_DIR / "config.json"
 
 CITY_TIMEZONES = {
+    # Eastern (UTC-5)
     "New York":      "America/New_York",
-    "Chicago":       "America/Chicago",
+    "Philadelphia":  "America/New_York",
     "Miami":         "America/New_York",
+    "Atlanta":       "America/New_York",
+    # Central (UTC-6)
+    "Chicago":       "America/Chicago",
+    "Houston":       "America/Chicago",
     "Austin":        "America/Chicago",
+    # Mountain (UTC-7)
+    "Denver":        "America/Denver",
+    "Phoenix":       "America/Phoenix",
+    # Pacific (UTC-8)
     "Los Angeles":   "America/Los_Angeles",
     "San Francisco": "America/Los_Angeles",
-    "Denver":        "America/Denver",
-    "Philadelphia":  "America/New_York",
-    "Atlanta":       "America/New_York",
-    "Houston":       "America/Chicago",
-    "Phoenix":       "America/Phoenix",
     "Las Vegas":     "America/Los_Angeles",
 }
 
@@ -1075,11 +1079,12 @@ class HomeTab(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._worker  = None
-        self._thread  = None
-        self._running = False
-        self._client  = None
+        self._worker       = None
+        self._thread       = None
+        self._running      = False
+        self._client       = None
         self._next_poll_ts = None
+        self._last_balance = 0.0
 
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
@@ -1136,12 +1141,17 @@ class HomeTab(QWidget):
         self.deployable_label = QLabel("Deployable  —")
         self.deployable_label.setStyleSheet(f"color: {ACCENT}; font-size: 14px;")
 
-        self.pnl_label = QLabel("Session PnL  —")
+        self.portfolio_label = QLabel("Portfolio  —")
+        self.portfolio_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 14px;")
+
+        self.pnl_label = QLabel("Unrealised  —")
         self.pnl_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 14px;")
 
         bal_bar.addWidget(self.balance_label)
         bal_bar.addSpacing(32)
         bal_bar.addWidget(self.deployable_label)
+        bal_bar.addSpacing(32)
+        bal_bar.addWidget(self.portfolio_label)
         bal_bar.addSpacing(32)
         bal_bar.addWidget(self.pnl_label)
         bal_bar.addStretch()
@@ -1332,6 +1342,7 @@ class HomeTab(QWidget):
         self.sync_positions_from_kalshi()
 
     def _on_balance_updated(self, bal: float, dep: float):
+        self._last_balance = bal
         self.balance_label.setText(f"Balance  ${bal:.2f}")
         self.deployable_label.setText(f"Deployable  ${dep:.2f}")
 
@@ -1424,11 +1435,21 @@ class HomeTab(QWidget):
                 item.setForeground(QColor(color))
                 self.pos_table.setItem(row, col, item)
 
-        # Update session PnL from unrealised
+        # Update unrealised PnL and portfolio value
+        total_current = sum(
+            pos.get("current_price", 0) * pos.get("contracts", 1)
+            for pos in sorted_positions
+        )
         sign  = "+" if total_unrealised >= 0 else ""
         color = ACCENT if total_unrealised >= 0 else RED
         self.pnl_label.setText(f"Unrealised  {sign}${total_unrealised:.2f}")
         self.pnl_label.setStyleSheet(f"color: {color}; font-size: 14px;")
+
+        # Portfolio = cash balance + current market value of open positions
+        bal = getattr(self, '_last_balance', 0.0)
+        portfolio = bal + total_current
+        self.portfolio_label.setText(f"Portfolio  ${portfolio:.2f}")
+        self.portfolio_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 14px;")
 
     def _refresh_cities(self):
         """Update city card times only — called every 30s."""
