@@ -22,7 +22,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from cities import TRADING_CITIES as _CITY_REGISTRY, SERIES_TO_CITY as _SERIES_TO_CITY_MAP
+from cities import TRADING_CITIES as _CITY_REGISTRY, SERIES_TO_CITY as _SERIES_TO_CITY
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,

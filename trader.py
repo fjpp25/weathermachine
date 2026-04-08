@@ -35,7 +35,10 @@ import argparse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+# Timestamps in positions table are shown in this timezone
+DISPLAY_TZ = ZoneInfo("Europe/Lisbon")
 
 try:
     import requests
@@ -64,7 +67,7 @@ MAX_CONTRACTS_PER_ORDER = 10
 BASE_CONTRACTS = 1
 
 # Score-based position sizing multiplier
-# Kept flat at 1x for now — with a small account, size consistency matters more than scaling
+# Kept flat at 1x — with a small account, size consistency matters more than scaling
 SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
 
 # Exit monitor poll interval (seconds)
@@ -81,12 +84,7 @@ class KalshiClient:
     Handles all auth header generation transparently.
     """
 
-    def __init__(
-        self,
-        key_id:      str,
-        key_file:    str,
-        demo:        bool = True,
-    ):
+    def __init__(self, key_id: str, key_file: str, demo: bool = True):
         self.key_id   = key_id
         self.base_url = DEMO_BASE_URL if demo else PROD_BASE_URL
         self.demo     = demo
@@ -125,19 +123,19 @@ class KalshiClient:
         }
 
     def _api_path(self, endpoint: str) -> str:
-        """Return just the path portion for signing."""
         return f"/trade-api/v2/{endpoint.lstrip('/')}"
 
-    def _request_with_backoff(self, method: str, url: str,
-                              headers: dict, timeout: int,
-                              params: dict = None, json: dict = None) -> requests.Response:
+    def _request_with_backoff(
+        self, method: str, url: str, headers: dict, timeout: int,
+        params: dict = None, json: dict = None,
+    ) -> requests.Response:
         """
         Execute an HTTP request with exponential backoff retry.
         Retries on: connection errors, timeouts, 429 rate-limit, 5xx server errors.
-        Does NOT retry on 4xx client errors (bad request, auth failure etc).
+        Does NOT retry on 4xx client errors.
         """
         MAX_RETRIES = 4
-        BASE_DELAY  = 2   # seconds
+        BASE_DELAY  = 2
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -148,7 +146,6 @@ class KalshiClient:
                     json=json,
                     timeout=timeout,
                 )
-                # Retry on rate-limit or server error
                 if resp.status_code == 429 or resp.status_code >= 500:
                     if attempt < MAX_RETRIES - 1:
                         delay = BASE_DELAY * (2 ** attempt)
@@ -249,15 +246,83 @@ def make_client(skip_confirmation: bool = False) -> KalshiClient:
 def get_balance(client: KalshiClient) -> float:
     """Returns account balance in dollars."""
     data    = client.get("portfolio/balance")
-    # balance is returned in cents
     balance = data.get("balance", 0)
-    return balance / 100
+    return balance / 100   # Kalshi returns cents
 
 
 def get_positions(client: KalshiClient) -> list[dict]:
     """Returns all open market positions from Kalshi."""
     data = client.get("portfolio/positions", params={"count_filter": "position"})
     return data.get("market_positions", [])
+
+
+def _parse_kalshi_ts(raw) -> str:
+    """
+    Parse a Kalshi timestamp into a local display string (DISPLAY_TZ).
+
+    Kalshi returns timestamps in multiple formats depending on the endpoint:
+      - ISO 8601 string: "2026-04-08T13:30:00Z" or "2026-04-08T13:30:00.000000+00:00"
+      - Unix seconds:    1744112400
+      - Unix milliseconds: 1744112400000
+    """
+    if not raw:
+        return ""
+    try:
+        s  = str(raw).strip()
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        pass
+    try:
+        ms = int(raw)
+        if ms > 1_000_000_000_000:   # milliseconds
+            ms = ms / 1000
+        dt = datetime.fromtimestamp(ms, tz=timezone.utc)
+        return dt.astimezone(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M")
+    except (ValueError, TypeError, OSError):
+        pass
+    return str(raw)[:16].replace("T", " ")   # last resort
+
+
+def _market_price(ticker: str) -> dict:
+    """
+    Fetch a single market's price data from the individual Kalshi endpoint.
+    The individual endpoint always returns result and last_price, unlike the
+    batch endpoint which strips them for finalized markets.
+    """
+    zero = {"yes_bid": 0.0, "no_bid": 0.0, "status": "unknown", "result": ""}
+    try:
+        resp   = requests.get(
+            f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
+            timeout=10,
+        ).json()
+        m      = resp.get("market", {})
+        result = (m.get("result") or "").lower()
+        status = m.get("status", "")
+
+        if result == "yes":
+            return {"yes_bid": 0.99, "no_bid": 0.01, "status": status, "result": result}
+        if result == "no":
+            return {"yes_bid": 0.01, "no_bid": 0.99, "status": status, "result": result}
+
+        yes_bid = float(m.get("yes_bid_dollars") or 0)
+        no_bid  = float(m.get("no_bid_dollars")  or 0)
+
+        if yes_bid == 0 and no_bid == 0:
+            lp_cents = float(m.get("last_price") or 0)
+            if 1 <= lp_cents <= 99:
+                yes_bid = round(lp_cents / 100, 4)
+                no_bid  = round(1.0 - yes_bid, 4)
+
+        if yes_bid > 0 and no_bid == 0:
+            no_bid = round(1.0 - yes_bid, 4)
+        elif no_bid > 0 and yes_bid == 0:
+            yes_bid = round(1.0 - no_bid, 4)
+
+        return {"yes_bid": yes_bid, "no_bid": no_bid, "status": status, "result": result}
+    except Exception as e:
+        print(f"  [sync] Individual market fetch failed for {ticker}: {e}")
+        return zero
 
 
 def sync_from_kalshi(client: KalshiClient) -> list[dict]:
@@ -267,7 +332,6 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     """
     raw_positions = get_positions(client)
 
-    # Filter to temperature markets only
     temp_positions = [
         p for p in raw_positions
         if p.get("ticker", "").startswith("KX")
@@ -283,7 +347,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     if not tickers:
         return enriched
 
-    # Batch fetch current market prices
+    # ── Batch fetch current market prices ────────────────────────────────────
     prices = {}
     try:
         resp = requests.get(
@@ -292,17 +356,42 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             timeout=15,
         ).json()
         for m in resp.get("markets", []):
+            result  = (m.get("result") or "").lower()
+            status  = m.get("status", "active")
             yes_bid = float(m.get("yes_bid_dollars") or 0)
             no_bid  = float(m.get("no_bid_dollars")  or 0)
-            if yes_bid > 0 and no_bid == 0:
-                no_bid = round(1.0 - yes_bid, 4)
-            elif no_bid > 0 and yes_bid == 0:
-                yes_bid = round(1.0 - no_bid, 4)
-            prices[m["ticker"]] = {"yes_bid": yes_bid, "no_bid": no_bid}
-    except Exception:
-        pass
 
-    # Fetch fills to derive accurate avg_cost per ticker
+            if result == "yes":
+                yes_bid, no_bid = 0.99, 0.01
+            elif result == "no":
+                yes_bid, no_bid = 0.01, 0.99
+            else:
+                lp_cents = float(m.get("last_price") or 0)
+                if 1 <= lp_cents <= 99 and yes_bid == 0 and no_bid == 0:
+                    yes_bid = round(lp_cents / 100, 4)
+                    no_bid  = round(1.0 - yes_bid, 4)
+                elif yes_bid > 0 and no_bid == 0:
+                    no_bid = round(1.0 - yes_bid, 4)
+                elif no_bid > 0 and yes_bid == 0:
+                    yes_bid = round(1.0 - no_bid, 4)
+
+            prices[m["ticker"]] = {
+                "yes_bid": yes_bid, "no_bid": no_bid,
+                "status":  status,  "result": result,
+            }
+    except Exception as e:
+        print(f"  [sync] Batch price fetch failed: {e}")
+
+    # ── Individual fallback for tickers with no price data ───────────────────
+    # The batch endpoint strips result/last_price from finalized markets.
+    # The individual endpoint always returns the full object.
+    for ticker in tickers:
+        p = prices.get(ticker, {})
+        if not p or (p["yes_bid"] == 0 and p["no_bid"] == 0):
+            prices[ticker] = _market_price(ticker)
+            time.sleep(0.1)   # only fires for closed positions — gentle on the API
+
+    # ── Fetch fills for avg_cost and opened-at timestamp ─────────────────────
     fills_by_ticker: dict[str, list] = {}
     try:
         resp = client.get("portfolio/fills", params={"limit": 200})
@@ -310,14 +399,14 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             t = f.get("ticker", "")
             if t in tickers:
                 fills_by_ticker.setdefault(t, []).append(f)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [sync] Fills fetch failed: {e} — avg_cost will use total_traded fallback")
 
+    # ── Enrich each position ──────────────────────────────────────────────────
     for pos in temp_positions:
         ticker      = pos["ticker"]
         position_fp = float(pos.get("position_fp") or 0)
         fees_paid   = float(pos.get("fees_paid_dollars") or 0)
-        last_updated = pos.get("last_updated_ts", "")
 
         if position_fp == 0:
             continue
@@ -325,41 +414,53 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
         side      = "yes" if position_fp > 0 else "no"
         contracts = int(abs(position_fp))
 
-        # Derive avg_cost from buy fills (most accurate)
-        avg_cost = 0.0
-        price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
-        buy_fills = [f for f in fills_by_ticker.get(ticker, [])
-                     if f.get("action") == "buy" and f.get("side") == side]
+        # Opened-at timestamp: use earliest buy fill's created_time.
+        # last_updated_ts reflects when Kalshi last touched the record,
+        # not when the order was placed — so fills are more accurate.
+        buy_fills = [
+            f for f in fills_by_ticker.get(ticker, [])
+            if f.get("action") == "buy" and f.get("side") == side
+        ]
         if buy_fills:
-            total_cost     = sum(float(f.get(price_field) or 0) *
-                                 float(f.get("count_fp") or 0)
-                                 for f in buy_fills)
+            earliest  = min(buy_fills, key=lambda f: f.get("created_time", ""))
+            opened_at = _parse_kalshi_ts(earliest.get("created_time", ""))
+        else:
+            opened_at = _parse_kalshi_ts(pos.get("last_updated_ts", ""))
+
+        # avg_cost from fills.
+        # Kalshi fills return yes_price_dollars for ALL trades including NO buys.
+        # For NO trades: no_price = 1.0 - yes_price_dollars.
+        avg_cost = 0.0
+        if buy_fills:
+            if side == "yes":
+                total_cost = sum(
+                    float(f.get("yes_price_dollars") or 0) *
+                    float(f.get("count_fp") or 0) for f in buy_fills
+                )
+            else:
+                total_cost = sum(
+                    (1.0 - float(f.get("yes_price_dollars") or 0)) *
+                    float(f.get("count_fp") or 0) for f in buy_fills
+                )
             total_contracts = sum(float(f.get("count_fp") or 0) for f in buy_fills)
             if total_contracts > 0:
                 avg_cost = round(total_cost / total_contracts, 4)
 
-        # Fallback to total_traded_dollars only if no fills available
         if avg_cost == 0 and contracts > 0:
             total_traded = float(pos.get("total_traded_dollars") or 0)
             avg_cost = round(total_traded / contracts, 4)
 
         # Current price and unrealised PnL
-        # For active markets: use live bid price
-        # For closed/pending-settlement markets: derive from market_exposure_dollars
+        p    = prices.get(ticker, {})
         live = False
-        if ticker in prices and (prices[ticker]["yes_bid"] > 0 or prices[ticker]["no_bid"] > 0):
-            current_price  = prices[ticker]["yes_bid"] if side == "yes" else prices[ticker]["no_bid"]
+        if p.get("yes_bid", 0) > 0 or p.get("no_bid", 0) > 0:
+            current_price  = p["yes_bid"] if side == "yes" else p["no_bid"]
             unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
-            live = True
+            live           = p.get("status", "") in ("active", "initialized")
         else:
-            # Market closed — use Kalshi's mark-to-market exposure value
-            market_exposure = float(pos.get("market_exposure_dollars") or 0)
-            if market_exposure > 0 and contracts > 0:
-                current_price  = round(market_exposure / contracts, 4)
-                unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
-            else:
-                current_price  = 0
-                unrealised_pnl = 0
+            # No price data — PnL unknown until Kalshi posts result
+            current_price  = avg_cost
+            unrealised_pnl = 0.0
 
         enriched.append({
             "ticker":         ticker,
@@ -369,7 +470,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             "current_price":  current_price,
             "unrealised_pnl": unrealised_pnl,
             "fees_paid":      fees_paid,
-            "last_updated":   last_updated[:16].replace("T", " ") if last_updated else "",
+            "last_updated":   opened_at,
             "live":           live,
         })
 
@@ -381,12 +482,12 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def place_order(
-    client:     KalshiClient,
-    ticker:     str,
-    side:       str,        # "yes" or "no"
-    price_dollars: float,   # e.g. 0.35
-    contracts:  int,
-    paper:      bool = False,
+    client:        KalshiClient,
+    ticker:        str,
+    side:          str,    # "yes" or "no"
+    price_dollars: float,  # e.g. 0.35
+    contracts:     int,
+    paper:         bool = False,
 ) -> dict:
     """
     Place a limit order on Kalshi.
@@ -394,7 +495,6 @@ def place_order(
     side:  "yes" to buy YES contracts, "no" to buy NO contracts
     price: limit price in dollars ($0.01–$0.99)
     """
-    # Kalshi uses integer cent prices
     price_cents = int(round(price_dollars * 100))
 
     order = {
@@ -434,17 +534,16 @@ def test_order(client: KalshiClient):
     """
     print("\n  Finding an open climate market...")
 
-    # Find any open temperature market to use as the test vehicle
     data = requests.get(
         "https://api.elections.kalshi.com/trade-api/v2/markets",
         params={"series_ticker": "KXHIGHNY", "status": "open"},
         timeout=10,
     ).json()
-
     markets = data.get("markets", [])
+
     if not markets:
         print("  No open KXHIGHNY markets found — trying KXHIGHMIA...")
-        data = requests.get(
+        data    = requests.get(
             "https://api.elections.kalshi.com/trade-api/v2/markets",
             params={"series_ticker": "KXHIGHMIA", "status": "open"},
             timeout=10,
@@ -455,11 +554,9 @@ def test_order(client: KalshiClient):
         print("  Could not find any open market to test against.")
         return
 
-    # Pick a middle bracket (not the <1% ones at the extremes)
     ticker = markets[len(markets) // 2]["ticker"]
     print(f"  Test market: {ticker}")
 
-    # Step 1: Place a $0.01 YES limit order (will never fill)
     print("\n  Step 1 — placing YES limit order @ $0.01 (1 contract)...")
     order_body = {
         "ticker":          ticker,
@@ -467,7 +564,7 @@ def test_order(client: KalshiClient):
         "side":            "yes",
         "type":            "limit",
         "count":           1,
-        "yes_price":       1,    # 1 cent — will never fill
+        "yes_price":       1,
         "client_order_id": f"kw-test-{uuid.uuid4().hex[:8]}",
     }
 
@@ -495,7 +592,6 @@ def test_order(client: KalshiClient):
         print(f"  Order placement FAILED: {e}")
         return
 
-    # Step 2: Immediately cancel it
     print(f"\n  Step 2 — cancelling order {order_id}...")
     try:
         cancel_result = client.delete(f"portfolio/orders/{order_id}")
@@ -520,9 +616,10 @@ def contracts_for_signal(signal: dict) -> int:
 # Exit monitor
 # ---------------------------------------------------------------------------
 
-NO_STOP_LOSS_RISE   = 0.15   # exit NO if YES rises more than this above entry YES price
-YES_EXIT_TARGET     = 0.50   # take profit if YES rises 50% from entry
-YES_STOP_LOSS       = 0.30   # stop loss if YES falls 30% from entry
+NO_STOP_LOSS_RISE = 0.15   # exit NO if YES rises more than this above entry YES price
+YES_EXIT_TARGET   = 0.50   # take profit if YES rises 50% from entry
+YES_STOP_LOSS     = 0.30   # stop loss if YES falls 30% from entry
+
 
 def check_exits(client: KalshiClient, paper: bool = False) -> dict:
     """
@@ -531,18 +628,16 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
 
     NO trades:
       - Stop loss if YES price has risen NO_STOP_LOSS_RISE above entry YES price
-        Entry YES price = 1.0 - avg_cost (derived from Kalshi position data)
+        Entry YES price = 1.0 - avg_cost
 
     YES trades:
       - Take profit when price rises YES_EXIT_TARGET% from entry
       - Stop loss when price falls YES_STOP_LOSS% from entry
 
     Returns dict of {ticker: reason} for each position that was exited.
-    Reasons: "Stopped Out", "Take Profit"
     """
-    exited = {}   # {ticker: reason}
-    # Get live positions from Kalshi — this catches ALL open positions
-    # regardless of whether they were recorded in positions.json
+    exited = {}
+
     try:
         live_positions = sync_from_kalshi(client)
     except Exception as e:
@@ -552,10 +647,8 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
     if not live_positions:
         return exited
 
-    # Prices already fetched by sync_from_kalshi — use current_price directly
-    # But we need yes_bid specifically for NO stop-loss check, so batch fetch
-    tickers   = [p["ticker"] for p in live_positions]
-    prices    = {}
+    tickers = [p["ticker"] for p in live_positions]
+    prices  = {}
     try:
         resp = requests.get(
             "https://api.elections.kalshi.com/trade-api/v2/markets",
@@ -580,19 +673,18 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
 
     for pos in live_positions:
         ticker    = pos["ticker"]
-        side      = pos["side"]           # "yes" or "no"
-        avg_cost  = pos["avg_cost"]       # what we paid per contract
+        side      = pos["side"]
+        avg_cost  = pos["avg_cost"]
         contracts = pos["contracts"]
 
         if ticker not in prices:
             continue
 
-        market   = prices[ticker]
-        status   = market["status"]
+        market    = prices[ticker]
+        status    = market["status"]
         yes_price = market["yes_bid"]
         no_price  = market["no_bid"]
 
-        # Skip markets that are no longer active
         if status not in ("active", "initialized"):
             continue
 
@@ -600,7 +692,6 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
         exit_price  = None
 
         if side == "no":
-            # Entry YES price = 1.0 - what we paid for NO
             entry_yes_price = round(1.0 - avg_cost, 2)
             stop_threshold  = round(entry_yes_price + NO_STOP_LOSS_RISE, 2)
 
@@ -614,24 +705,22 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
                 print(f"    Avg cost=${avg_cost:.2f} → Exit=${exit_price:.2f} "
                       f"PnL=${round((exit_price - avg_cost) * contracts, 2):+.2f}")
 
-        else:  # YES trade
+        else:
             take_profit = round(avg_cost * (1 + YES_EXIT_TARGET), 2)
             stop_loss   = round(avg_cost * (1 - YES_STOP_LOSS),   2)
 
             if yes_price >= take_profit:
                 exit_reason = "take_profit"
                 exit_price  = yes_price
-                print(f"  TAKE PROFIT: {ticker} YES "
-                      f"${avg_cost:.2f} → ${yes_price:.2f}")
+                print(f"  TAKE PROFIT: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
             elif yes_price <= stop_loss:
                 exit_reason = "stop_loss"
                 exit_price  = yes_price
-                print(f"  STOP LOSS: {ticker} YES "
-                      f"${avg_cost:.2f} → ${yes_price:.2f}")
+                print(f"  STOP LOSS: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
 
         if exit_reason:
+            exit_side = "yes" if side == "no" else "no"
             if not paper:
-                exit_side = "yes" if side == "no" else "no"
                 try:
                     place_order(
                         client        = client,
@@ -641,7 +730,7 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
                         contracts     = contracts,
                         paper         = False,
                     )
-                    label = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
+                    label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
                     exited[ticker] = label
                     print(f"  Exit order placed: {ticker} {exit_side.upper()} "
                           f"@ ${exit_price:.2f}  reason={exit_reason}")
@@ -649,7 +738,7 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
                     print(f"  Exit order failed for {ticker}: {e}")
                     continue
             else:
-                label = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
+                label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
                 exited[ticker] = label
                 print(f"    [PAPER] Would exit {ticker} {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
@@ -668,32 +757,29 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
     evaluations = decision_engine.run(city_filter=city_filter, paper=False)
     decision_engine.display(evaluations)
 
-    # LOWT observe-only scan — evaluate signals but never place orders
+    # LOWT observe-only scan — signals logged but never executed
     try:
         lowt_evals = decision_engine.run_lowt_observe(city_filter=city_filter)
         if lowt_evals:
             print("\n  ── LOWT Markets (observe only) ──────────────────────────")
             for ev in lowt_evals:
                 city    = ev["city"]
-                signals = [s for s in ev.get("signals", [])
-                           if s.get("observe_only")]
+                signals = [s for s in ev.get("signals", []) if s.get("observe_only")]
                 if signals:
                     for s in signals:
                         print(f"  [OBS] {city} {s['ticker'][-12:]}  "
-                              f"score={s.get('score',0)}/3  "
+                              f"score={s.get('score', 0)}/3  "
                               f"[{', '.join(s.get('score_detail', []))}]")
             print()
     except Exception as e:
         print(f"  LOWT observe error: {e}")
 
-    # Combine evaluations (LOWT ones have no trade_type so won't be executed)
     evaluations = evaluations + (lowt_evals or [])
 
     balance    = get_balance(client)
     deployable = round(balance * 0.70, 2)
     print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
 
-    # Open tickers sourced directly from Kalshi — no local file
     try:
         live_positions = sync_from_kalshi(client)
         open_tickers   = {p["ticker"] for p in live_positions}
@@ -702,6 +788,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
     executed = 0
     deployed = 0.0
+
     for ev in evaluations:
         city    = ev["city"]
         signals = [s for s in ev.get("signals", []) if s.get("trade_type")]
@@ -743,7 +830,6 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 print(f"  Order failed for {ticker}: {e}")
 
     print(f"\n  {executed} order(s) placed.")
-    return evaluations
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +839,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kalshi weather trader")
     parser.add_argument("--balance",    action="store_true", help="Show account balance")
+    parser.add_argument("--positions",  action="store_true", help="Show open positions")
     parser.add_argument("--monitor",    action="store_true", help="Start exit monitor loop")
     parser.add_argument("--run",        action="store_true", help="Run full pipeline (signals + execute)")
     parser.add_argument("--test-order", action="store_true", help="Place + immediately cancel a $0.01 test order")
@@ -767,12 +854,27 @@ if __name__ == "__main__":
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-    if args.balance or args.run or args.monitor or args.test_order:
+    if args.balance or args.positions or args.run or args.monitor or args.test_order:
         client = make_client()
 
         if args.balance:
             bal = get_balance(client)
             print(f"\n  Account balance: ${bal:.2f}")
+
+        if args.positions:
+            positions = sync_from_kalshi(client)
+            if not positions:
+                print("\n  No open positions.")
+            else:
+                print(f"\n  {'Ticker':<28} {'Side':>5} {'Qty':>4} "
+                      f"{'AvgCost':>8} {'Current':>8} {'UnrealPnL':>10}")
+                print(f"  {'-'*70}")
+                for p in positions:
+                    sign = "+" if p["unrealised_pnl"] >= 0 else ""
+                    print(f"  {p['ticker']:<28} {p['side'].upper():>5} "
+                          f"{p['contracts']:>4} ${p['avg_cost']:.2f}   "
+                          f"${p['current_price']:.2f}   "
+                          f"{sign}${p['unrealised_pnl']:.2f}")
 
         if args.test_order:
             test_order(client)
