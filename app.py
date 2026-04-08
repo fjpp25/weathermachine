@@ -22,6 +22,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from cities import TRADING_CITIES as _CITY_REGISTRY, SERIES_TO_CITY as _SERIES_TO_CITY_MAP
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget,
@@ -70,39 +71,6 @@ CITY_TIMEZONES = {
     "Las Vegas":     "America/Los_Angeles",
 }
 
-# Reverse map: series prefix → city name (for ticker → city display)
-_SERIES_TO_CITY = {
-    "KXHIGHNY":   "New York",
-    "KXLOWTNYC":  "New York",
-    "KXHIGHCHI":  "Chicago",
-    "KXLOWTCHI":  "Chicago",
-    "KXHIGHMIA":  "Miami",
-    "KXLOWTMIA":  "Miami",
-    "KXHIGHAUS":  "Austin",
-    "KXLOWTAUS":  "Austin",
-    "KXHIGHLAX":  "Los Angeles",
-    "KXLOWTLAX":  "Los Angeles",
-    "KXHIGHTSFO": "San Francisco",
-    "KXHIGHSFO":  "San Francisco",
-    "KXLOWTSFO":  "San Francisco",
-    "KXHIGHDEN":  "Denver",
-    "KXLOWTDEN":  "Denver",
-    "KXHIGHPHIL": "Philadelphia",
-    "KXLOWTPHIL": "Philadelphia",
-    # Additional cities
-    "KXHIGHTATL":  "Atlanta",
-    "KXHIGHTBOS":  "Boston",
-    "KXHIGHTDC":   "Washington DC",
-    "KXHIGHTPHX":  "Phoenix",
-    "KXHIGHTLV":   "Las Vegas",
-    "KXHIGHTDAL":  "Dallas",
-    "KXHIGHTMIN":  "Minneapolis",
-    "KXHIGHTSATX": "San Antonio",
-    "KXHIGHTHOU":  "Houston",
-    "KXHIGHTSEA":  "Seattle",
-    "KXHIGHTNOLA": "New Orleans",
-    "KXHIGHTOKC":  "Oklahoma City",
-}
 
 def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
     """

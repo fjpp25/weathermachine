@@ -5,11 +5,11 @@ Runs the full trading pipeline on a polling loop with a dynamic interval
 that tightens around the peak trading window.
 
 Interval schedule (per city local time):
-  Before 10am  → 15 min  (just waiting)
-  10am–11am    →  5 min  (window just opened)
-  11am–1pm     →  3 min  (peak — forecasts updating, most movement)
-  1pm–2pm      →  5 min  (approaching cutoff)
-  After 2pm    → 10 min  (exit monitoring only)
+  Overnight (midnight–9am)  → 10 min  (bracket elimination from obs temps)
+  9am–11am                  →  5 min  (approaching peak, forecasts updating)
+  11am–1pm                  →  3 min  (peak — NWS model runs, market reprices fastest)
+  1pm–3pm                   →  5 min  (post-peak, convergence settling)
+  3pm–midnight               → 10 min  (exit monitoring, slow convergence)
 
 Usage:
   python scheduler.py                   # live, dynamic interval
@@ -19,6 +19,7 @@ Usage:
 """
 
 import os
+import json
 import time
 import argparse
 from datetime import datetime, timezone, timedelta
@@ -27,6 +28,7 @@ from pathlib import Path
 
 import trader
 import decision_engine
+from cities import TRADING_CITIES as _CITY_REGISTRY
 
 # ---------------------------------------------------------------------------
 # Config
@@ -35,31 +37,17 @@ import decision_engine
 ACTIVITY_START_HOUR = 0    # local city time — poll from midnight
 ACTIVITY_END_HOUR   = 23   # local city time — poll all day
 
-CITY_TIMEZONES = {
-    "New York":      "America/New_York",
-    "Chicago":       "America/Chicago",
-    "Miami":         "America/New_York",
-    "Austin":        "America/Chicago",
-    "Los Angeles":   "America/Los_Angeles",
-    "San Francisco": "America/Los_Angeles",
-    "Denver":        "America/Denver",
-    "Philadelphia":  "America/New_York",
-    "Atlanta":       "America/New_York",
-    "Houston":       "America/Chicago",
-    "Phoenix":       "America/Phoenix",
-    "Las Vegas":     "America/Los_Angeles",
-}
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _filter_cities(city_filter: str = None) -> dict:
+def _filter_cities(city_filter: str = None) -> dict[str, str]:
+    """Return {city: tz_name} for active trading cities, optionally filtered."""
+    cities = {name: meta["tz"] for name, meta in _CITY_REGISTRY.items()}
     if city_filter:
-        return {k: v for k, v in CITY_TIMEZONES.items()
-                if k.lower() == city_filter.lower()}
-    return CITY_TIMEZONES
+        return {k: v for k, v in cities.items() if k.lower() == city_filter.lower()}
+    return cities
 
 
 def local_hour(tz_name: str) -> int:
@@ -71,11 +59,11 @@ def dynamic_interval(city_filter: str = None) -> int:
     Returns poll interval in seconds based on the most active city phase.
     Takes the minimum (most frequent) interval across all active cities.
 
-    Overnight (midnight-9am): 10 min — bracket elimination from obs temps
-    9am-11am:  5 min  — approaching peak, forecasts updating
-    11am-1pm:  3 min  — peak — NWS model runs, market reprices fastest
-    1pm-3pm:   5 min  — post-peak, convergence settling
-    3pm-11pm: 10 min  — exit monitoring, slow convergence
+    Overnight (midnight–9am): 10 min — bracket elimination from obs temps
+    9am–11am:  5 min  — approaching peak, forecasts updating
+    11am–1pm:  3 min  — peak — NWS model runs, market reprices fastest
+    1pm–3pm:   5 min  — post-peak, convergence settling
+    3pm–11pm: 10 min  — exit monitoring, slow convergence
     """
     cities       = _filter_cities(city_filter)
     min_interval = 10 * 60   # default: 10 min
@@ -110,7 +98,6 @@ def run_scheduler(
     config_file = Path("data/config.json")
     if config_file.exists():
         try:
-            import json
             config = json.loads(config_file.read_text())
             if config.get("key_id"):
                 os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
@@ -146,7 +133,6 @@ def run_scheduler(
     while True:
         now_str = fmt_now()
 
-        # ── Determine interval for this cycle ────────────────────────────
         interval_secs = (
             interval_override * 60
             if interval_override
@@ -168,7 +154,7 @@ def run_scheduler(
         except Exception as e:
             print(f"  Pipeline error: {e}")
 
-        # ── Check exits — count from Kalshi, not local file ───────────────
+        # ── Check exits ───────────────────────────────────────────────────
         try:
             live_positions = trader.sync_from_kalshi(client)
             if live_positions:
@@ -206,15 +192,11 @@ if __name__ == "__main__":
     parser.add_argument("--city",     type=str, default=None,
                         help="Filter to one city (e.g. 'Miami')")
     parser.add_argument("--interval", type=int, default=None, metavar="MINUTES",
-                        help="Override poll interval in minutes (default: dynamic)")
+                        help="Override dynamic interval (minutes)")
     args = parser.parse_args()
 
-    try:
-        run_scheduler(
-            paper             = args.paper,
-            city_filter       = args.city,
-            interval_override = args.interval,
-        )
-    except KeyboardInterrupt:
-        print(f"\n\n  Interrupted. Final position summary:")
-        trader.display_positions()
+    run_scheduler(
+        paper             = args.paper,
+        city_filter       = args.city,
+        interval_override = args.interval,
+    )
