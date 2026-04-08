@@ -100,7 +100,43 @@ _SERIES_TO_CITY = {
     "KXHIGHTOKC":  "Oklahoma City",
 }
 
+def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
+    """
+    Convert raw bracket code to a readable label.
+    B50.5 → '50–52°'  (between, next bracket inferred from Kalshi 2° spacing)
+    T55   → '>55°'    (above threshold for HIGH)
+    T31   → '<31°'    (below threshold for LOWT)
+    """
+    if not bracket:
+        return bracket
+    try:
+        if bracket.startswith("B"):
+            floor = float(bracket[1:])
+            cap   = round(floor + 2, 1)
+            return f"{floor:.0f}–{cap:.0f}°"
+        elif bracket.startswith("T"):
+            val = float(bracket[1:])
+            if market_type == "LOW":
+                return f"<{val:.0f}°"
+            else:
+                return f">{val:.0f}°"
+    except ValueError:
+        pass
+    return bracket
+
+
 def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
+    """Extract city name from a Kalshi temperature ticker.
+    bare=True returns just the city name; bare=False appends (HIGH) or (LOW).
+    """
+    prefix = ticker.split("-")[0]
+    city = _SERIES_TO_CITY.get(prefix)
+    if city:
+        if bare:
+            return city
+        mtype = "HIGH" if "HIGH" in prefix else "LOW"
+        return f"{city} ({mtype})"
+    return None
     """Extract city name from a Kalshi temperature ticker.
     bare=True returns just the city name; bare=False appends (HIGH) or (LOW).
     """
@@ -556,34 +592,17 @@ class SchedulerWorker(QObject):
             self.client_ready.emit(client)
             self.log_line.emit("  Scheduler started.")
 
-            ACTIVITY_START = 9
-            ACTIVITY_END   = 15
-
             def local_hour(tz):
                 return datetime.now(ZoneInfo(tz)).hour
 
-            def any_active():
-                return any(
-                    ACTIVITY_START <= local_hour(tz) < ACTIVITY_END
-                    for tz in CITY_TIMEZONES.values()
-                )
-
-            def all_done():
-                return all(
-                    local_hour(tz) >= ACTIVITY_END
-                    for tz in CITY_TIMEZONES.values()
-                )
-
             def dynamic_interval():
-                min_secs = 15 * 60
+                min_secs = 10 * 60  # default 10 min overnight
                 for tz in CITY_TIMEZONES.values():
                     h = local_hour(tz)
                     if 11 <= h < 13:
                         min_secs = min(min_secs, 3 * 60)
-                    elif h in (10, 13):
+                    elif h in (9, 10, 13, 14):
                         min_secs = min(min_secs, 5 * 60)
-                    elif 14 <= h < ACTIVITY_END:
-                        min_secs = min(min_secs, 10 * 60)
                 return min_secs
 
             self._last_scores = {}   # ticker → score, updated each poll
@@ -591,13 +610,6 @@ class SchedulerWorker(QObject):
             poll_count = 0
 
             while self.is_running():
-                if not any_active():
-                    if all_done():
-                        self.log_line.emit("All cities past activity window. Done for today.")
-                        break
-                    self.log_line.emit("No city active yet — waiting...")
-                    self.sleep_interruptible(60)
-                    continue
 
                 interval_secs = dynamic_interval()
                 poll_count += 1
@@ -715,7 +727,7 @@ class CityCard(QFrame):
         self.lo_label = QLabel("lo: --°  fcst: --°")
         self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
 
-        self.status_label = QLabel("waiting")
+        self.status_label = QLabel("—")
         self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
 
         layout.addWidget(self.name_label)
@@ -730,24 +742,54 @@ class CityCard(QFrame):
 
     def update_data(self, local_time: str, curr: float, obs_hi: float,
                     fcst_hi: float, active: bool,
-                    obs_lo: float = None, fcst_lo: float = None):
+                    obs_lo: float = None, fcst_lo: float = None,
+                    local_hour: int = None):
         self.time_label.setText(local_time)
 
-        hi_str   = f"{obs_hi:.0f}°"  if obs_hi  else "--°"
-        lo_str   = f"{obs_lo:.0f}°"  if obs_lo  else "--°"
-        fhi_str  = f"{fcst_hi:.0f}°" if fcst_hi else "--°"
-        flo_str  = f"{fcst_lo:.0f}°" if fcst_lo else "--°"
+        hi_str  = f"{obs_hi:.0f}°"  if obs_hi  else "--°"
+        lo_str  = f"{obs_lo:.0f}°"  if obs_lo  else "--°"
+        fhi_str = f"{fcst_hi:.0f}°" if fcst_hi else "--°"
+        flo_str = f"{fcst_lo:.0f}°" if fcst_lo else "--°"
 
         self.hi_label.setText(f"hi: {hi_str}  fcst: {fhi_str}")
         self.lo_label.setText(f"lo: {lo_str}  fcst: {flo_str}")
 
-        color = ACCENT if active else TEXT_SEC
-        self.status_label.setText("active" if active else "outside window")
-        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+        # Determine HIGH and LOWT activity windows from observer data:
+        # HIGH: 9am–3pm local (temperature rising toward peak)
+        # LOWT: midnight–8am local (overnight low being recorded)
+        if local_hour is not None:
+            high_active = 9 <= local_hour < 15
+            lowt_active = local_hour < 8 or local_hour >= 22
+
+            parts  = []
+            colors = []
+            if high_active:
+                parts.append("HIGH ▲")
+                colors.append(ACCENT)
+            if lowt_active:
+                parts.append("LOWT ▼")
+                colors.append("#5599ff")   # blue tint for low temp
+
+            if parts:
+                status_str = "  ".join(parts)
+                # Use the more prominent color
+                status_color = ACCENT if high_active else "#5599ff"
+            else:
+                status_str   = "between windows"
+                status_color = TEXT_SEC
+
+            self.status_label.setText(status_str)
+            self.status_label.setStyleSheet(f"color: {status_color}; font-size: 11px;")
+            border_color = ACCENT_DIM if (high_active or lowt_active) else BORDER
+        else:
+            self.status_label.setText("—")
+            self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+            border_color = BORDER
+
         self.setStyleSheet(f"""
             QFrame {{
                 background: {BG_PANEL};
-                border: 1px solid {"" + ACCENT_DIM if active else BORDER};
+                border: 1px solid {border_color};
                 border-radius: 6px;
             }}
         """)
@@ -821,8 +863,9 @@ class CityDetailDialog(QDialog):
                 sign    = "+" if unreal >= 0 else ""
                 bracket = ticker.split("-")[-1] if "-" in ticker else ticker
                 mtype   = "HIGH" if "HIGH" in ticker else "LOW"
+                label   = f"{mtype} {_fmt_bracket(bracket, mtype)}"
                 for col, (val, color) in enumerate([
-                    (f"{mtype} {bracket}",       TEXT_PRI),
+                    (label,                       TEXT_PRI),
                     (side,                        ACCENT if side == "NO" else YELLOW),
                     (str(qty),                    TEXT_PRI),
                     (f"${cost:.2f}",              TEXT_PRI),
@@ -970,7 +1013,7 @@ class CityDetailDialog(QDialog):
 
                 enriched.append({
                     "date":    date,
-                    "bracket": f"{mtype} {bracket}",
+                    "bracket": f"{mtype} {_fmt_bracket(bracket, mtype)}",
                     "side":    our_side.upper(),
                     "won":     won,
                     "net_pnl": net_pnl,
@@ -1395,13 +1438,14 @@ class HomeTab(QWidget):
             h    = now.hour
             active = True  # 24/7 window
             card.update_data(
-                local_time = now.strftime("%H:%M %Z"),
-                curr       = None,
-                obs_hi     = getattr(card, '_obs_hi', None),
-                fcst_hi    = getattr(card, '_fcst_hi', None),
-                obs_lo     = getattr(card, '_obs_lo', None),
-                fcst_lo    = getattr(card, '_fcst_lo', None),
-                active     = active,
+                local_time  = now.strftime("%H:%M %Z"),
+                curr        = None,
+                obs_hi      = getattr(card, '_obs_hi', None),
+                fcst_hi     = getattr(card, '_fcst_hi', None),
+                obs_lo      = getattr(card, '_obs_lo', None),
+                fcst_lo     = getattr(card, '_fcst_lo', None),
+                active      = True,
+                local_hour  = h,
             )
 
     def _refresh_nws_data(self):
@@ -1461,13 +1505,14 @@ class HomeTab(QWidget):
             card._obs_lo  = obs_lo
             card._fcst_lo = fcst_lo
             card.update_data(
-                local_time = now.strftime("%H:%M %Z"),
-                curr       = None,
-                obs_hi     = obs_hi,
-                fcst_hi    = fcst_hi,
-                obs_lo     = obs_lo,
-                fcst_lo    = fcst_lo,
-                active     = active,
+                local_time  = now.strftime("%H:%M %Z"),
+                curr        = None,
+                obs_hi      = obs_hi,
+                fcst_hi     = fcst_hi,
+                obs_lo      = obs_lo,
+                fcst_lo     = fcst_lo,
+                active      = True,
+                local_hour  = now.hour,
             )
 
 
@@ -2413,5 +2458,5 @@ if __name__ == "__main__":
     apply_config(config)
 
     window = MainWindow(config)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())

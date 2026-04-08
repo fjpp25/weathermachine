@@ -66,42 +66,6 @@ def local_hour(tz_name: str) -> int:
     return datetime.now(ZoneInfo(tz_name)).hour
 
 
-def any_city_active(city_filter: str = None) -> bool:
-    cities = _filter_cities(city_filter)
-    return any(
-        ACTIVITY_START_HOUR <= local_hour(tz) < ACTIVITY_END_HOUR
-        for tz in cities.values()
-    )
-
-
-def all_cities_done(city_filter: str = None) -> bool:
-    cities = _filter_cities(city_filter)
-    return all(local_hour(tz) >= ACTIVITY_END_HOUR for tz in cities.values())
-
-
-def next_active_city_time(city_filter: str = None) -> str:
-    cities        = _filter_cities(city_filter)
-    earliest_utc  = None
-    earliest_city = None
-
-    for city, tz in cities.items():
-        now_local = datetime.now(ZoneInfo(tz))
-        if now_local.hour < ACTIVITY_START_HOUR:
-            opens_local = now_local.replace(
-                hour=ACTIVITY_START_HOUR, minute=0, second=0, microsecond=0
-            )
-            opens_utc = opens_local.astimezone(timezone.utc)
-            if earliest_utc is None or opens_utc < earliest_utc:
-                earliest_utc  = opens_utc
-                earliest_city = city
-
-    if earliest_utc:
-        wait_mins = int((earliest_utc - datetime.now(timezone.utc)).total_seconds() / 60)
-        return f"{earliest_city} opens in ~{wait_mins} min ({earliest_utc.strftime('%H:%M UTC')})"
-
-    return "all windows closed for today"
-
-
 def dynamic_interval(city_filter: str = None) -> int:
     """
     Returns poll interval in seconds based on the most active city phase.
@@ -181,17 +145,6 @@ def run_scheduler(
 
     while True:
         now_str = fmt_now()
-
-        # ── Wait if no city is active yet ────────────────────────────────
-        if not any_city_active(city_filter):
-            if all_cities_done(city_filter):
-                print(f"[{now_str}] All cities past activity window. Done for today.")
-                break
-            else:
-                next_str = next_active_city_time(city_filter)
-                print(f"[{now_str}] No city active yet — {next_str}")
-                time.sleep(15 * 60)
-                continue
 
         # ── Determine interval for this cycle ────────────────────────────
         interval_secs = (

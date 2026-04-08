@@ -301,8 +301,11 @@ def scan_all(city_filter: str = None, market_type: str = "high") -> dict:
 
     results = {}
     for city in cities:
-        print(f"  Scanning {city} ({market_type})...", end=" ", flush=True)
         result = scan_city(city, market_type)
+        if result.get("error") == "No series ticker configured":
+            results[city] = result
+            continue
+        print(f"  Scanning {city} ({market_type})...", end=" ", flush=True)
         if result.get("error"):
             print(f"ERROR: {result['error']}")
         else:

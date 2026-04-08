@@ -404,7 +404,7 @@ def evaluate_city(
     brackets        = scan_data.get("brackets", [])
 
     if forecast_high is None:
-        result["error"] = "No forecast high available"
+        result["error"] = "No forecast high — NWS grid not cached yet (will retry next poll)"
         return result
 
     # Find forecast bracket
@@ -498,6 +498,7 @@ def run_lowt_observe(city_filter: str = None) -> list[dict]:
     evaluations = []
     for city, nws_data in nws_results.items():
         scan_data = kalshi_results.get(city, {})
+        # Skip cities with no LOWT series configured
         if not scan_data or scan_data.get("error"):
             continue
 
@@ -546,8 +547,8 @@ def display(evaluations: list[dict]):
 
         if not active_signals:
             # Show why things were skipped — useful for tuning
-            skip_reasons = set(s.get("skip_reason", "no trade type") for s in skipped)
-            print(f"  No signals — {'; '.join(r for r in skip_reasons if r)}")
+            skip_reasons = set(s.get("skip_reason") or "no trade type" for s in skipped)
+            print(f"  No signals — {'; '.join(skip_reasons)}")
             continue
 
         any_signal = True
