@@ -52,6 +52,7 @@ except ImportError:
     )
 
 import decision_engine
+from entry_snapshots import log_entry as _log_entry_snapshot
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -284,6 +285,37 @@ def _parse_kalshi_ts(raw) -> str:
     return str(raw)[:16].replace("T", " ")   # last resort
 
 
+def _normalise_prices(m: dict) -> dict:
+    """
+    Extract and normalise yes/no bid prices from a Kalshi market dict.
+    Handles settled markets, last_price fallback, and one-sided books.
+    Shared by _market_price() and the batch fetch in sync_from_kalshi().
+    """
+    result  = (m.get("result") or "").lower()
+    status  = m.get("status", "active")
+
+    if result == "yes":
+        return {"yes_bid": 0.99, "no_bid": 0.01, "status": status, "result": result}
+    if result == "no":
+        return {"yes_bid": 0.01, "no_bid": 0.99, "status": status, "result": result}
+
+    yes_bid = float(m.get("yes_bid_dollars") or 0)
+    no_bid  = float(m.get("no_bid_dollars")  or 0)
+
+    if yes_bid == 0 and no_bid == 0:
+        lp_cents = float(m.get("last_price") or 0)
+        if 1 <= lp_cents <= 99:
+            yes_bid = round(lp_cents / 100, 4)
+            no_bid  = round(1.0 - yes_bid, 4)
+
+    if yes_bid > 0 and no_bid == 0:
+        no_bid = round(1.0 - yes_bid, 4)
+    elif no_bid > 0 and yes_bid == 0:
+        yes_bid = round(1.0 - no_bid, 4)
+
+    return {"yes_bid": yes_bid, "no_bid": no_bid, "status": status, "result": result}
+
+
 def _market_price(ticker: str) -> dict:
     """
     Fetch a single market's price data from the individual Kalshi endpoint.
@@ -292,34 +324,11 @@ def _market_price(ticker: str) -> dict:
     """
     zero = {"yes_bid": 0.0, "no_bid": 0.0, "status": "unknown", "result": ""}
     try:
-        resp   = requests.get(
+        resp = requests.get(
             f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}",
             timeout=10,
         ).json()
-        m      = resp.get("market", {})
-        result = (m.get("result") or "").lower()
-        status = m.get("status", "")
-
-        if result == "yes":
-            return {"yes_bid": 0.99, "no_bid": 0.01, "status": status, "result": result}
-        if result == "no":
-            return {"yes_bid": 0.01, "no_bid": 0.99, "status": status, "result": result}
-
-        yes_bid = float(m.get("yes_bid_dollars") or 0)
-        no_bid  = float(m.get("no_bid_dollars")  or 0)
-
-        if yes_bid == 0 and no_bid == 0:
-            lp_cents = float(m.get("last_price") or 0)
-            if 1 <= lp_cents <= 99:
-                yes_bid = round(lp_cents / 100, 4)
-                no_bid  = round(1.0 - yes_bid, 4)
-
-        if yes_bid > 0 and no_bid == 0:
-            no_bid = round(1.0 - yes_bid, 4)
-        elif no_bid > 0 and yes_bid == 0:
-            yes_bid = round(1.0 - no_bid, 4)
-
-        return {"yes_bid": yes_bid, "no_bid": no_bid, "status": status, "result": result}
+        return _normalise_prices(resp.get("market", {}))
     except Exception as e:
         print(f"  [sync] Individual market fetch failed for {ticker}: {e}")
         return zero
@@ -335,6 +344,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
     temp_positions = [
         p for p in raw_positions
         if p.get("ticker", "").startswith("KX")
+        and ("HIGH" in p.get("ticker", "") or "LOWT" in p.get("ticker", ""))
     ]
 
     enriched = []
@@ -356,29 +366,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             timeout=15,
         ).json()
         for m in resp.get("markets", []):
-            result  = (m.get("result") or "").lower()
-            status  = m.get("status", "active")
-            yes_bid = float(m.get("yes_bid_dollars") or 0)
-            no_bid  = float(m.get("no_bid_dollars")  or 0)
-
-            if result == "yes":
-                yes_bid, no_bid = 0.99, 0.01
-            elif result == "no":
-                yes_bid, no_bid = 0.01, 0.99
-            else:
-                lp_cents = float(m.get("last_price") or 0)
-                if 1 <= lp_cents <= 99 and yes_bid == 0 and no_bid == 0:
-                    yes_bid = round(lp_cents / 100, 4)
-                    no_bid  = round(1.0 - yes_bid, 4)
-                elif yes_bid > 0 and no_bid == 0:
-                    no_bid = round(1.0 - yes_bid, 4)
-                elif no_bid > 0 and yes_bid == 0:
-                    yes_bid = round(1.0 - no_bid, 4)
-
-            prices[m["ticker"]] = {
-                "yes_bid": yes_bid, "no_bid": no_bid,
-                "status":  status,  "result": result,
-            }
+            prices[m["ticker"]] = _normalise_prices(m)
     except Exception as e:
         print(f"  [sync] Batch price fetch failed: {e}")
 
@@ -488,27 +476,30 @@ def place_order(
     price_dollars: float,  # e.g. 0.35
     contracts:     int,
     paper:         bool = False,
+    action:        str  = "buy",   # "buy" to open, "sell" to close
 ) -> dict:
     """
     Place a limit order on Kalshi.
 
-    side:  "yes" to buy YES contracts, "no" to buy NO contracts
-    price: limit price in dollars ($0.01–$0.99)
+    side:   "yes" or "no" -- which contracts to act on
+    action: "buy"  to open a new position
+            "sell" to close an existing position (exit trades must use this)
+    price:  limit price in dollars ($0.01-$0.99)
     """
     price_cents = int(round(price_dollars * 100))
 
     order = {
         "ticker":          ticker,
-        "action":          "buy",
+        "action":          action,
         "side":            side,
         "type":            "limit",
         "count":           contracts,
         "yes_price":       price_cents if side == "yes" else (100 - price_cents),
-        "client_order_id": f"kw-{uuid.uuid4().hex[:12]}",
+        "client_order_id": f"kw-exit-{uuid.uuid4().hex[:8]}" if action == "sell" else f"kw-{uuid.uuid4().hex[:12]}",
     }
 
     if paper:
-        print(f"    [PAPER] Would place: {side.upper()} {contracts}x {ticker} @ ${price_dollars:.2f}")
+        print(f"    [PAPER] Would {action.upper()}: {side.upper()} {contracts}x {ticker} @ ${price_dollars:.2f}")
         return {"paper": True, "order": order}
 
     try:
@@ -616,33 +607,39 @@ def contracts_for_signal(signal: dict) -> int:
 # Exit monitor
 # ---------------------------------------------------------------------------
 
-NO_STOP_LOSS_RISE = 0.15   # exit NO if YES rises more than this above entry YES price
+NO_STOP_LOSS_DROP = 0.50   # exit NO if NO price falls more than 50% from entry (e.g. $0.04 → $0.02)
 YES_EXIT_TARGET   = 0.50   # take profit if YES rises 50% from entry
 YES_STOP_LOSS     = 0.30   # stop loss if YES falls 30% from entry
 
 
-def check_exits(client: KalshiClient, paper: bool = False) -> dict:
+def check_exits(
+    client:         KalshiClient,
+    paper:          bool  = False,
+    live_positions: list  = None,   # pass pre-fetched positions to skip redundant sync
+) -> dict:
     """
     Check all open positions and trigger exits where appropriate.
     Sources positions directly from Kalshi — not from local positions.json.
 
     NO trades:
-      - Stop loss if YES price has risen NO_STOP_LOSS_RISE above entry YES price
-        Entry YES price = 1.0 - avg_cost
+      - Stop loss if NO price falls NO_STOP_LOSS_DROP% below entry (e.g. $0.04 → $0.02)
+      - Take profit if NO price rises YES_EXIT_TARGET% above entry
 
     YES trades:
       - Take profit when price rises YES_EXIT_TARGET% from entry
       - Stop loss when price falls YES_STOP_LOSS% from entry
 
+    Pass live_positions if already fetched this poll to avoid a redundant sync call.
     Returns dict of {ticker: reason} for each position that was exited.
     """
     exited = {}
 
-    try:
-        live_positions = sync_from_kalshi(client)
-    except Exception as e:
-        print(f"  Could not fetch live positions for exit check: {e}")
-        return exited
+    if live_positions is None:
+        try:
+            live_positions = sync_from_kalshi(client)
+        except Exception as e:
+            print(f"  Could not fetch live positions for exit check: {e}")
+            return exited
 
     if not live_positions:
         return exited
@@ -673,6 +670,12 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
 
     for pos in live_positions:
         ticker    = pos["ticker"]
+
+        # Safety guard — only manage temperature market positions
+        if "HIGH" not in ticker and "LOWT" not in ticker:
+            print(f"  Skipping {ticker} — not a temperature market (exit monitor ignores it)")
+            continue
+
         side      = pos["side"]
         avg_cost  = pos["avg_cost"]
         contracts = pos["contracts"]
@@ -692,18 +695,22 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
         exit_price  = None
 
         if side == "no":
-            entry_yes_price = round(1.0 - avg_cost, 2)
-            stop_threshold  = round(entry_yes_price + NO_STOP_LOSS_RISE, 2)
+            stop_threshold  = round(avg_cost * (1 - NO_STOP_LOSS_DROP), 2)
+            take_profit     = round(avg_cost * (1 + YES_EXIT_TARGET),    2)
 
-            if yes_price >= stop_threshold:
+            if no_price <= stop_threshold:
                 exit_reason = "no_stop_loss"
                 exit_price  = no_price
                 print(f"  NO STOP LOSS: {ticker} "
-                      f"YES rose to ${yes_price:.2f} "
-                      f"(entry YES=${entry_yes_price:.2f} + {NO_STOP_LOSS_RISE:.2f} "
+                      f"NO fell to ${no_price:.2f} "
+                      f"(entry=${avg_cost:.2f} × {1 - NO_STOP_LOSS_DROP:.2f} "
                       f"= threshold ${stop_threshold:.2f})")
                 print(f"    Avg cost=${avg_cost:.2f} → Exit=${exit_price:.2f} "
                       f"PnL=${round((exit_price - avg_cost) * contracts, 2):+.2f}")
+            elif no_price >= take_profit:
+                exit_reason = "take_profit"
+                exit_price  = no_price
+                print(f"  NO TAKE PROFIT: {ticker} NO ${avg_cost:.2f} → ${no_price:.2f}")
 
         else:
             take_profit = round(avg_cost * (1 + YES_EXIT_TARGET), 2)
@@ -719,20 +726,20 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
                 print(f"  STOP LOSS: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
 
         if exit_reason:
-            exit_side = "yes" if side == "no" else "no"
             if not paper:
                 try:
                     place_order(
                         client        = client,
                         ticker        = ticker,
-                        side          = exit_side,
+                        side          = side,    # sell what we hold
+                        action        = "sell",  # close the position
                         price_dollars = exit_price,
                         contracts     = contracts,
                         paper         = False,
                     )
                     label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
                     exited[ticker] = label
-                    print(f"  Exit order placed: {ticker} {exit_side.upper()} "
+                    print(f"  Exit order placed: {ticker} SELL {side.upper()} "
                           f"@ ${exit_price:.2f}  reason={exit_reason}")
                 except Exception as e:
                     print(f"  Exit order failed for {ticker}: {e}")
@@ -740,7 +747,7 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
             else:
                 label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
                 exited[ticker] = label
-                print(f"    [PAPER] Would exit {ticker} {side.upper()} "
+                print(f"    [PAPER] Would exit {ticker} SELL {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
 
         time.sleep(0.1)
@@ -752,9 +759,37 @@ def check_exits(client: KalshiClient, paper: bool = False) -> dict:
 # Full pipeline: signals → execute
 # ---------------------------------------------------------------------------
 
+def _ticker_date(ticker: str):
+    """
+    Extract the settlement date from a Kalshi temperature ticker.
+    Format: KXHIGHNY-26APR09-B70  ->  date(2026, 4, 9)
+    Returns None if the date segment cannot be parsed.
+    """
+    try:
+        parts = ticker.split("-")
+        if len(parts) < 2:
+            return None
+        raw = parts[1]          # e.g. "26APR09"
+        return datetime.strptime(raw, "%y%b%d").date()
+    except (ValueError, IndexError):
+        return None
+
+
+def _city_local_date(city: str):
+    """
+    Return today's date in the city's local timezone.
+    Falls back to UTC date if the city or timezone is not found.
+    """
+    from cities import CITIES as _CITIES
+    tz_name = _CITIES.get(city, {}).get("tz")
+    if tz_name:
+        return datetime.now(ZoneInfo(tz_name)).date()
+    return datetime.now(timezone.utc).date()
+
+
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
     """Run decision engine, then execute any actionable signals."""
-    evaluations = decision_engine.run(city_filter=city_filter, paper=False)
+    evaluations = decision_engine.run(city_filter=city_filter)
     decision_engine.display(evaluations)
 
     # LOWT observe-only scan — signals logged but never executed
@@ -782,9 +817,10 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
     try:
         live_positions = sync_from_kalshi(client)
-        open_tickers   = {p["ticker"] for p in live_positions}
+        # Track contracts held per ticker so we can top up below MAX_CONTRACTS
+        open_contracts = {p["ticker"]: p["contracts"] for p in live_positions}
     except Exception:
-        open_tickers = set()
+        open_contracts = {}
 
     executed = 0
     deployed = 0.0
@@ -799,8 +835,24 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             price     = signal["entry_price"]
             ticker    = signal["ticker"]
 
-            if ticker in open_tickers:
-                print(f"  Skipping {ticker} — already holding this position")
+            held      = open_contracts.get(ticker, 0)
+            max_contr = getattr(decision_engine, 'MAX_CONTRACTS', 2)
+            headroom  = max_contr - held
+            if headroom <= 0:
+                print(f"  Skipping {ticker} — already at max contracts ({held}/{max_contr})")
+                continue
+            contracts = min(contracts, headroom)
+
+            # Only trade today's markets — compare against city local date, not UTC
+            # (e.g. at 11pm Mountain time it's already tomorrow UTC but still today locally)
+            ticker_dt  = _ticker_date(ticker)
+            today_local = _city_local_date(city)
+            if ticker_dt is None:
+                print(f"  Skipping {ticker} — could not parse date from ticker")
+                continue
+            if ticker_dt != today_local:
+                print(f"  Skipping {ticker} — market date {ticker_dt} is not today "
+                      f"(local: {today_local}, city: {city})")
                 continue
 
             cost = price * contracts
@@ -823,13 +875,28 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     contracts     = contracts,
                     paper         = paper,
                 )
-                open_tickers.add(ticker)
+                open_contracts[ticker] = open_contracts.get(ticker, 0) + contracts
                 deployed += cost
                 executed += 1
+
+                # Log entry snapshot to entry_snapshots.csv
+                try:
+                    _log_entry_snapshot(
+                        city      = city,
+                        signal    = signal,
+                        ev        = ev,
+                        brackets  = [],   # brackets removed — was duplicate scanner call
+                        contracts = contracts,
+                        paper     = paper,
+                    )
+                except Exception as snap_err:
+                    print(f"  [snapshot] log error (non-fatal): {snap_err}")
+
             except Exception as e:
                 print(f"  Order failed for {ticker}: {e}")
 
     print(f"\n  {executed} order(s) placed.")
+    return evaluations
 
 
 # ---------------------------------------------------------------------------

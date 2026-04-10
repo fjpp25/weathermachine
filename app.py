@@ -52,26 +52,6 @@ import trader as _trader_preload
 DATA_DIR    = Path("data")
 CONFIG_FILE = DATA_DIR / "config.json"
 
-CITY_TIMEZONES = {
-    # Eastern (UTC-5)
-    "New York":      "America/New_York",
-    "Philadelphia":  "America/New_York",
-    "Miami":         "America/New_York",
-    "Atlanta":       "America/New_York",
-    # Central (UTC-6)
-    "Chicago":       "America/Chicago",
-    "Houston":       "America/Chicago",
-    "Austin":        "America/Chicago",
-    # Mountain (UTC-7)
-    "Denver":        "America/Denver",
-    "Phoenix":       "America/Phoenix",
-    # Pacific (UTC-8)
-    "Los Angeles":   "America/Los_Angeles",
-    "San Francisco": "America/Los_Angeles",
-    "Las Vegas":     "America/Los_Angeles",
-}
-
-
 def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
     """
     Convert raw bracket code to a readable label.
@@ -109,17 +89,8 @@ def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
         mtype = "HIGH" if "HIGH" in prefix else "LOW"
         return f"{city} ({mtype})"
     return None
-    """Extract city name from a Kalshi temperature ticker.
-    bare=True returns just the city name; bare=False appends (HIGH) or (LOW).
-    """
-    prefix = ticker.split("-")[0]
-    city = _SERIES_TO_CITY.get(prefix)
-    if city:
-        if bare:
-            return city
-        mtype = "HIGH" if "HIGH" in prefix else "LOW"
-        return f"{city} ({mtype})"
-    return None
+
+
 BG_DARK     = "#0d0f14"
 BG_PANEL    = "#141720"
 BG_ROW_ALT = "#181c24"
@@ -564,20 +535,19 @@ class SchedulerWorker(QObject):
             self.client_ready.emit(client)
             self.log_line.emit("  Scheduler started.")
 
-            def local_hour(tz):
-                return datetime.now(ZoneInfo(tz)).hour
-
             def dynamic_interval():
+                # Mirrors scheduler.py logic — uses _ALL_CITIES from cities.py
                 min_secs = 10 * 60  # default 10 min overnight
-                for tz in CITY_TIMEZONES.values():
-                    h = local_hour(tz)
+                for meta in _ALL_CITIES.values():
+                    tz = meta.get("tz")
+                    if not tz:
+                        continue
+                    h = datetime.now(ZoneInfo(tz)).hour
                     if 11 <= h < 13:
                         min_secs = min(min_secs, 3 * 60)
                     elif h in (9, 10, 13, 14):
                         min_secs = min(min_secs, 5 * 60)
                 return min_secs
-
-            self._last_scores = {}   # ticker → score, updated each poll
 
             poll_count = 0
 
@@ -590,32 +560,29 @@ class SchedulerWorker(QObject):
                 now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
                 self.log_line.emit(f"\n[{now_str}] Poll #{poll_count}  ({interval_secs//60} min interval)")
 
-                # Run pipeline — track new entries for Session Activity tab
+                # ── Single sync fetch shared across pipeline + exit check ──────
                 try:
-                    tickers_before = {
-                        p["ticker"] for p in trader.sync_from_kalshi(client)
-                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
-                    }
+                    live_pos = trader.sync_from_kalshi(client)
+                except Exception as e:
+                    self.log_line.emit(f"Sync error: {e}")
+                    live_pos = []
+
+                tickers_before = {
+                    p["ticker"] for p in live_pos
+                    if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
+                }
+
+                # Run pipeline
+                try:
                     evaluations = trader.run_pipeline(client=client, paper=self.paper)
-                    # Build score lookup from this run's evaluations
+                    # Reset scores each poll so stale entries never mask missing scores
+                    self._last_scores = {}
                     for ev in (evaluations or []):
                         for sig in ev.get("signals", []):
                             t = sig.get("ticker")
                             s = sig.get("score")
                             if t and s is not None:
                                 self._last_scores[t] = s
-                    positions_after = [
-                        p for p in trader.sync_from_kalshi(client)
-                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
-                    ]
-                    for pos in positions_after:
-                        if pos["ticker"] not in tickers_before:
-                            score = self._last_scores.get(pos["ticker"], "?")
-                            self.session_entry.emit({
-                                **pos,
-                                "entered_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
-                                "score": score,
-                            })
                     self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"Pipeline error: {e}")
@@ -623,24 +590,37 @@ class SchedulerWorker(QObject):
                 if not self.is_running():
                     break
 
-                # Check exits — use live Kalshi positions, not local file
+                # Check exits — pass pre-fetched positions to avoid redundant sync
                 try:
-                    live_pos = trader.sync_from_kalshi(client)
-                    climate_before = {
-                        p["ticker"] for p in live_pos
-                        if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
-                    }
                     if live_pos:
                         self.log_line.emit(f"Checking exits ({len(live_pos)} open)...")
-                        exited = trader.check_exits(client, paper=self.paper)
-                        # Detect closed positions and emit with reason
-                        climate_after = {
-                            p["ticker"] for p in trader.sync_from_kalshi(client)
+                    exited = trader.check_exits(
+                        client         = client,
+                        paper          = self.paper,
+                        live_positions = live_pos,
+                    )
+                    # Detect newly entered positions (post-pipeline) and emit for session tab
+                    try:
+                        live_pos_after = trader.sync_from_kalshi(client)
+                        tickers_after  = {
+                            p["ticker"] for p in live_pos_after
                             if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
                         }
-                        for closed_ticker in climate_before - climate_after:
+                        for pos in live_pos_after:
+                            t = pos["ticker"]
+                            if t not in tickers_before and ("HIGH" in t or "LOWT" in t):
+                                score = self._last_scores.get(t, "?")
+                                self.session_entry.emit({
+                                    **pos,
+                                    "entered_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+                                    "score": score,
+                                })
+                        # Detect closed positions
+                        for closed_ticker in tickers_before - tickers_after:
                             reason = exited.get(closed_ticker, "Settled")
                             self.session_exit.emit(closed_ticker, reason)
+                    except Exception as e:
+                        self.log_line.emit(f"Post-pipeline sync error: {e}")
                     self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"Exit check error: {e}")
@@ -673,7 +653,7 @@ class CityCard(QFrame):
     def __init__(self, city: str):
         super().__init__()
         self.city = city
-        self.setFixedSize(200, 110)
+        self.setFixedSize(200, 82)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(f"""
             QFrame {{
@@ -684,20 +664,20 @@ class CityCard(QFrame):
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(3)
+        layout.setContentsMargins(10, 5, 10, 5)
+        layout.setSpacing(1)
 
         self.name_label = QLabel(city)
-        self.name_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px; letter-spacing: 1px;")
+        self.name_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;")
 
         self.time_label = QLabel("--:-- --")
-        self.time_label.setStyleSheet(f"color: {TEXT_PRI}; font-size: 14px; font-weight: bold;")
+        self.time_label.setStyleSheet(f"color: {TEXT_PRI}; font-size: 12px; font-weight: bold;")
 
         self.hi_label = QLabel("hi: --°  fcst: --°")
-        self.hi_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
+        self.hi_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
 
         self.lo_label = QLabel("lo: --°  fcst: --°")
-        self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
+        self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
 
         self.status_label = QLabel("—")
         self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
@@ -969,9 +949,10 @@ class CityDetailDialog(QDialog):
                 our_side = max(set(sides), key=sides.count)
                 our_fills = [f for f in buy_fills if f.get("side") == our_side]
                 contracts = int(sum(float(f.get("count_fp") or 0) for f in our_fills))
-                price_field = "yes_price_dollars" if our_side == "yes" else "no_price_dollars"
                 cost = round(sum(
-                    float(f.get(price_field) or 0) * float(f.get("count_fp") or 0)
+                    (float(f.get("yes_price_dollars") or 0) if our_side == "yes"
+                     else (1.0 - float(f.get("yes_price_dollars") or 0)))
+                    * float(f.get("count_fp") or 0)
                     for f in our_fills
                 ), 4)
 
@@ -1575,13 +1556,18 @@ class PnLTab(QWidget):
             stats_row.addWidget(frame)
         layout.addLayout(stats_row)
 
-        # ── Equity curve ──────────────────────────────────────────────────
-        curve_label = QLabel("EQUITY CURVE  —  Cumulative Net PnL  (temperature markets only)")
-        curve_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
-        layout.addWidget(curve_label)
+        # ── Charts row — equity curve + win rate ──────────────────────────
+        charts_row = QHBoxLayout()
+        charts_row.setSpacing(12)
 
         if HAS_PYQTGRAPH:
             pg.setConfigOptions(antialias=True, background=BG_PANEL, foreground=TEXT_SEC)
+
+            # Left: equity curve
+            pnl_col = QVBoxLayout()
+            pnl_col.setSpacing(4)
+            curve_label = QLabel("EQUITY CURVE  —  Cumulative Net PnL")
+            curve_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 20px; letter-spacing: 2px;")
             self.chart = pg.PlotWidget()
             self.chart.setMinimumHeight(150)
             self.chart.setMaximumHeight(200)
@@ -1591,12 +1577,36 @@ class PnLTab(QWidget):
             self.chart.setLabel("left", "Net PnL ($)")
             self.chart.getPlotItem().hideAxis("top")
             self.chart.getPlotItem().hideAxis("right")
-            layout.addWidget(self.chart)
+            pnl_col.addWidget(curve_label)
+            pnl_col.addWidget(self.chart)
+
+            # Right: rolling win rate
+            wr_col = QVBoxLayout()
+            wr_col.setSpacing(4)
+            wr_label = QLabel("WIN RATE  —  Rolling 7-day %")
+            wr_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 20px; letter-spacing: 2px;")
+            self.wr_chart = pg.PlotWidget()
+            self.wr_chart.setMinimumHeight(150)
+            self.wr_chart.setMaximumHeight(200)
+            self.wr_chart.showGrid(x=False, y=True, alpha=0.15)
+            self.wr_chart.getAxis("left").setTextPen(TEXT_SEC)
+            self.wr_chart.getAxis("bottom").setTextPen(TEXT_SEC)
+            self.wr_chart.setLabel("left", "Win %")
+            self.wr_chart.getPlotItem().hideAxis("top")
+            self.wr_chart.getPlotItem().hideAxis("right")
+            self.wr_chart.setYRange(0, 100)
+            wr_col.addWidget(wr_label)
+            wr_col.addWidget(self.wr_chart)
+
+            charts_row.addLayout(pnl_col)
+            charts_row.addLayout(wr_col)
         else:
-            no_chart = QLabel("Install pyqtgraph for equity curve:  pip install pyqtgraph")
+            no_chart = QLabel("Install pyqtgraph for charts:  pip install pyqtgraph")
             no_chart.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
             no_chart.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(no_chart)
+            charts_row.addWidget(no_chart)
+
+        layout.addLayout(charts_row)
 
         # ── Settlements table ─────────────────────────────────────────────
         inner_tabs = QTabWidget()
@@ -1712,18 +1722,30 @@ class PnLTab(QWidget):
 
                 our_buys = [f for f in buy_fills if f.get("side") == our_side]
 
-                # Exit fills use the OPPOSITE side (closing NO = sell YES)
-                exit_side        = "yes" if our_side == "no" else "no"
-                our_early_sells  = [f for f in early_sells
-                                    if f.get("side") == exit_side]
+                # Exit fills: action=sell on the SAME side as our position.
+                # Both programmatic exits (place_order action=sell) and manual
+                # Kalshi UI exits record side=our_side with action=sell.
+                our_early_sells = [f for f in early_sells
+                                   if f.get("side") == our_side]
+
+                # Fallback: if no same-side sells found, try opposite side
+                # (handles legacy fills from before the exit bug was fixed)
+                if not our_early_sells:
+                    legacy_side     = "yes" if our_side == "no" else "no"
+                    our_early_sells = [f for f in early_sells
+                                       if f.get("side") == legacy_side]
 
                 if not our_early_sells:
                     continue
 
-                buy_price_field  = ("yes_price_dollars" if our_side == "yes"
-                                    else "no_price_dollars")
-                sell_price_field = ("yes_price_dollars" if exit_side == "yes"
-                                    else "no_price_dollars")
+                # Kalshi fills only carry yes_price_dollars regardless of side.
+                # For NO positions: actual price = 1.0 - yes_price_dollars.
+                # Both buy and sell fills are interpreted from our_side's perspective —
+                # closing a NO position records exit_side="yes" but the economic value
+                # to the NO holder is still 1.0 - yes_price_dollars.
+                def _fill_price(f):
+                    yp = float(f.get("yes_price_dollars") or 0)
+                    return yp if our_side == "yes" else (1.0 - yp)
 
                 buy_contracts  = sum(float(f.get("count_fp") or 0) for f in our_buys)
                 sell_contracts = sum(float(f.get("count_fp") or 0)
@@ -1733,12 +1755,12 @@ class PnLTab(QWidget):
                     continue
 
                 avg_buy_price  = sum(
-                    float(f.get(buy_price_field) or 0) * float(f.get("count_fp") or 0)
+                    _fill_price(f) * float(f.get("count_fp") or 0)
                     for f in our_buys
                 ) / buy_contracts
 
                 avg_sell_price = sum(
-                    float(f.get(sell_price_field) or 0) * float(f.get("count_fp") or 0)
+                    _fill_price(f) * float(f.get("count_fp") or 0)
                     for f in our_early_sells
                 ) / max(sell_contracts, 1)
 
@@ -1805,7 +1827,6 @@ class PnLTab(QWidget):
             ticker   = s.get("ticker", "")
             result   = s.get("market_result", "").lower()
             fee      = float(s.get("fee_cost") or 0)
-            revenue  = float(s.get("revenue") or 0) / 100   # cents → dollars
             settled  = s.get("settled_time", "")[:10]
 
             # Determine our side and cost purely from fills
@@ -1825,9 +1846,10 @@ class PnLTab(QWidget):
             our_fills = [f for f in buy_fills if f.get("side") == our_side]
             contracts = int(sum(float(f.get("count_fp") or 0) for f in our_fills))
 
-            price_field = "yes_price_dollars" if our_side == "yes" else "no_price_dollars"
             cost = round(sum(
-                float(f.get(price_field) or 0) * float(f.get("count_fp") or 0)
+                (float(f.get("yes_price_dollars") or 0) if our_side == "yes"
+                 else (1.0 - float(f.get("yes_price_dollars") or 0)))
+                * float(f.get("count_fp") or 0)
                 for f in our_fills
             ), 4)
 
@@ -1924,6 +1946,43 @@ class PnLTab(QWidget):
             )
             self.chart.addItem(fill)
 
+            # ── Rolling 7-day win rate chart ──────────────────────────
+            if hasattr(self, 'wr_chart'):
+                from collections import deque
+                self.wr_chart.clear()
+                window = deque()
+                wr_x, wr_y = [], []
+                for i, day in enumerate(sorted_days):
+                    window.append(by_day[day])
+                    # Keep only last 7 days in the window
+                    if len(window) > 7:
+                        window.popleft()
+                    day_trades = [t for batch in window for t in batch]
+                    if day_trades:
+                        day_wins = sum(1 for t in day_trades if t["won"])
+                        wr_x.append(i)
+                        wr_y.append(round(day_wins / len(day_trades) * 100, 1))
+
+                if wr_x:
+                    wr_pen = pg.mkPen(color=YELLOW, width=2)
+                    self.wr_chart.plot(wr_x, wr_y, pen=wr_pen)
+                    # 70% reference line
+                    ref_pen = pg.mkPen(color=ACCENT_DIM, width=1, style=Qt.PenStyle.DashLine)
+                    self.wr_chart.addItem(pg.InfiniteLine(
+                        pos=70, angle=0, pen=ref_pen, label="70%",
+                        labelOpts={"color": ACCENT_DIM, "position": 0.95},
+                    ))
+                    # Fill under the line
+                    wr_fill_color = QColor(YELLOW)
+                    wr_fill_color.setAlpha(20)
+                    wr_fill = pg.FillBetweenItem(
+                        self.wr_chart.plot(wr_x, [0] * len(wr_x), pen=pg.mkPen(None)),
+                        self.wr_chart.plot(wr_x, wr_y, pen=wr_pen),
+                        brush=wr_fill_color,
+                    )
+                    self.wr_chart.addItem(wr_fill)
+                    self.wr_chart.setYRange(0, 100)
+
         # ── By-day table ─────────────────────────────────────────────
         day_rows = []
         cum = 0.0
@@ -1932,40 +1991,47 @@ class PnLTab(QWidget):
             day_wins  = [t for t in trades if t["won"]]
             day_pnl   = round(sum(t["net_pnl"] for t in trades), 2)
             day_fees  = round(sum(t["fee"] for t in trades), 2)
+            day_settled_losses = sum(1 for t in trades
+                                     if not t["won"] and t.get("result") != "EARLY EXIT")
+            day_stopped        = sum(1 for t in trades
+                                     if t.get("result") == "EARLY EXIT")
             cum      += day_pnl
             day_rows.append({
-                "date":    day,
-                "trades":  len(trades),
-                "wins":    len(day_wins),
-                "losses":  len(trades) - len(day_wins),
-                "win%":    f"{round(len(day_wins)/len(trades)*100,1)}%",
-                "fees":    f"${day_fees:.2f}",
-                "net_pnl": day_pnl,
-                "cum_pnl": round(cum, 2),
+                "date":            day,
+                "trades":          len(trades),
+                "wins":            len(day_wins),
+                "losses":          day_settled_losses,
+                "stopped":         day_stopped,
+                "win%":            f"{round(len(day_wins)/len(trades)*100,1)}%",
+                "fees":            f"${day_fees:.2f}",
+                "net_pnl":         day_pnl,
+                "cum_pnl":         round(cum, 2),
             })
         day_rows.reverse()   # newest first for display
 
-        hdrs = ["Date", "Trades", "Wins", "Losses", "Win%", "Fees", "Net PnL", "Cum PnL"]
+        hdrs = ["Date", "Trades", "Wins", "Losses", "Stopped", "Win%", "Fees", "Net PnL", "Cum PnL"]
         self.daily_table.setColumnCount(len(hdrs))
         self.daily_table.setHorizontalHeaderLabels(hdrs)
         self.daily_table.setRowCount(len(day_rows))
         dh = self.daily_table.horizontalHeader()
         dh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         dh.setStretchLastSection(True)
-        # Date, Trades, Wins, Losses, Win%, Fees, Net PnL, Cum PnL
-        for col, width in enumerate([180, 70, 65, 70, 70, 120, 160, 160]):
+        # Date, Trades, Wins, Losses, Stopped, Win%, Fees, Net PnL, Cum PnL
+        for col, width in enumerate([180, 70, 65, 70, 75, 70, 120, 160, 160]):
             self.daily_table.setColumnWidth(col, width)
 
         for ri, row in enumerate(day_rows):
             vals = [row["date"], str(row["trades"]), str(row["wins"]),
-                    str(row["losses"]), row["win%"], row["fees"],
+                    str(row["losses"]), str(row["stopped"]), row["win%"], row["fees"],
                     f"${row['net_pnl']:+.2f}", f"${row['cum_pnl']:+.2f}"]
             for ci, val in enumerate(vals):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if ci == 6:
-                    item.setForeground(QColor(ACCENT if row["net_pnl"] >= 0 else RED))
+                if ci == 4:   # Stopped — highlight in yellow if non-zero
+                    item.setForeground(QColor(YELLOW if row["stopped"] > 0 else TEXT_SEC))
                 if ci == 7:
+                    item.setForeground(QColor(ACCENT if row["net_pnl"] >= 0 else RED))
+                if ci == 8:
                     item.setForeground(QColor(ACCENT if row["cum_pnl"] >= 0 else RED))
                 self.daily_table.setItem(ri, ci, item)
 

@@ -154,14 +154,14 @@ def run_scheduler(
         except Exception as e:
             print(f"  Pipeline error: {e}")
 
-        # ── Check exits ───────────────────────────────────────────────────
+        # ── Check exits — reuse positions already fetched by run_pipeline ──
         try:
             live_positions = trader.sync_from_kalshi(client)
-            if live_positions:
-                print(f"\n  Checking exits ({len(live_positions)} open positions)...")
-                trader.check_exits(client, paper=paper)
+            exited = trader.check_exits(client, paper=paper, live_positions=live_positions)
+            if exited:
+                print(f"\n  Exited {len(exited)} position(s): {list(exited.values())}")
             else:
-                print(f"  No open positions to monitor.")
+                print(f"  No exits triggered.")
         except Exception as e:
             print(f"  Exit check error: {e}")
 

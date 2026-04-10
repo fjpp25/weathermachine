@@ -97,8 +97,9 @@ FORECAST_BIAS_CORRECTION = -1.0   # subtract this from NWS forecast high
 
 # Forecast well-clear threshold for NO trade scoring
 # Bracket must be this far from the corrected forecast to score the forecast point
-# (higher bar than BOUNDARY_BUFFER gate — gate=3°F, score=6°F)
-FORECAST_WELL_CLEAR = 6.0
+# (higher bar than BOUNDARY_BUFFER gate — gate=3°F, score=4°F)
+# Data: fcst_gap >= 4° covers 30% of early obs at avg NO $0.944 vs 9.4% at 6°
+FORECAST_WELL_CLEAR = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -139,18 +140,23 @@ PAUSED_CITIES: set[str] = _build_paused_cities()
 def _trade_start_for(city: str, market_type: str = "high") -> int:
     """
     Return the earliest local hour for entering trades in this city.
-
-    Looks up trade_start_high or trade_start_lowt from cities.py.
     Falls back to TRADE_WINDOW_START (global default) if not set.
-
-    The per-city values are calibrated from entry_window_analysis.py and
-    reflect when the NWS morning forecast has stabilised enough for NO
-    entries to be reliable.
     """
     meta = _CITY_REGISTRY.get(city, {})
     key  = "trade_start_high" if market_type == "high" else "trade_start_lowt"
     val  = meta.get(key)
     return val if val is not None else TRADE_WINDOW_START
+
+
+def _trade_end_for(city: str, market_type: str = "high") -> int:
+    """
+    Return the latest local hour for entering trades in this city.
+    Falls back to TRADE_WINDOW_END (global default = 24, disabled) if not set.
+    """
+    meta = _CITY_REGISTRY.get(city, {})
+    key  = "trade_end_high" if market_type == "high" else "trade_end_lowt"
+    val  = meta.get(key)
+    return val if val is not None else TRADE_WINDOW_END
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +260,7 @@ def evaluate_bracket(
     city_local_hour:     int,
     is_forecast_bracket: bool,
     trade_start_hour:    int = 0,    # per-city entry window start (from cities.py)
+    trade_end_hour:      int = 24,   # per-city entry window end (from cities.py)
 ) -> dict | None:
     """
     Run all gates and scoring for a single bracket.
@@ -291,19 +298,27 @@ def evaluate_bracket(
         return signal
 
     # --- Gate 1: Timing — per-city entry window ---
-    # trade_start_hour comes from cities.py (calibrated from observations).
-    # TRADE_WINDOW_END is the global close — currently 24 (disabled).
-    if not (trade_start_hour <= city_local_hour < TRADE_WINDOW_END):
+    # trade_start_hour and trade_end_hour from cities.py.
+    if city_local_hour < trade_start_hour:
         signal["skip_reason"] = (
-            f"Before entry window (local hour={city_local_hour}, "
-            f"window opens at {trade_start_hour:02d}:00)"
+            f"Before entry window (local={city_local_hour:02d}:00, "
+            f"opens {trade_start_hour:02d}:00)"
+        )
+        return signal
+    if city_local_hour >= trade_end_hour:
+        signal["skip_reason"] = (
+            f"After entry window (local={city_local_hour:02d}:00, "
+            f"closed {trade_end_hour:02d}:00)"
         )
         return signal
 
     # --- Gate 2: Liquidity ---
     spread = bracket.get("ob_spread")
-    if spread is None or spread > MAX_SPREAD:
-        signal["skip_reason"] = f"Spread too wide or missing ({spread})"
+    if spread is None:
+        signal["skip_reason"] = "Spread missing (no resting orders on one or both sides)"
+        return signal
+    if spread > MAX_SPREAD:
+        signal["skip_reason"] = f"Spread too wide ({spread:.2f} > {MAX_SPREAD})"
         return signal
 
     no_depth  = bracket.get("ob_no_depth") or 0
@@ -466,8 +481,9 @@ def evaluate_city(
         result["error"] = "No forecast high — NWS grid not cached yet (will retry next poll)"
         return result
 
-    # Look up per-city entry window start from cities.py
+    # Look up per-city entry window from cities.py
     trade_start = _trade_start_for(city, market_type)
+    trade_end   = _trade_end_for(city, market_type)
 
     forecast_bracket = get_forecast_bracket(forecast_high, brackets)
 
@@ -483,6 +499,7 @@ def evaluate_city(
             city_local_hour     = city_local_hour,
             is_forecast_bracket = is_forecast,
             trade_start_hour    = trade_start,
+            trade_end_hour      = trade_end,
         )
         if signal:
             result["signals"].append(signal)
@@ -521,7 +538,7 @@ def evaluate_city(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(city_filter: str = None, paper: bool = False) -> list[dict]:
+def run(city_filter: str = None) -> list[dict]:
     profiles = load_profiles()
 
     print("Fetching NWS live data...")
@@ -593,11 +610,13 @@ def display(evaluations: list[dict]):
 
         snap = ev["nws_snapshot"]
         trade_start = _trade_start_for(city)
+        trade_end   = _trade_end_for(city)
+        window_str  = f"{trade_start:02d}:00–{trade_end:02d}:00" if trade_end < 24 else f"{trade_start:02d}:00+"
         print(f"\n{city}  |  local: {snap.get('local_time','?')}  "
               f"curr: {fmt(snap.get('current_temp_f'))}°  "
               f"obs_hi: {fmt(snap.get('observed_high_f'))}°  "
               f"fcst_hi: {fmt(snap.get('forecast_high_f'))}°  "
-              f"window: {trade_start:02d}:00+")
+              f"window: {window_str}")
 
         active_signals = [s for s in ev["signals"] if s.get("trade_type")]
         skipped        = [s for s in ev["signals"] if not s.get("trade_type")]
