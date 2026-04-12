@@ -802,7 +802,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 signals = [s for s in ev.get("signals", []) if s.get("observe_only")]
                 if signals:
                     for s in signals:
-                        print(f"  [OBS] {city} {s['ticker'][-12:]}  "
+                        print(f"  [OBS] {city} {s['ticker'].split('-',1)[1]}  "
                               f"score={s.get('score', 0)}/3  "
                               f"[{', '.join(s.get('score_detail', []))}]")
             print()

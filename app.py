@@ -1489,6 +1489,112 @@ class HomeTab(QWidget):
             )
 
 
+
+# ---------------------------------------------------------------------------
+# Day detail dialog — shown when clicking a row in the By Day table
+# ---------------------------------------------------------------------------
+
+class DayDetailDialog(QDialog):
+    """Shows all trades for a given day when a By Day row is clicked."""
+
+    def __init__(self, date: str, trades: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Trades  —  {date}")
+        self.setMinimumWidth(680)
+        self.setMinimumHeight(360)
+        self.setStyleSheet(f"""
+            QDialog   {{ background: {BG_DARK}; color: {TEXT_PRI}; }}
+            QLabel    {{ color: {TEXT_PRI}; }}
+            QTableWidget {{
+                background: {BG_PANEL}; color: {TEXT_PRI};
+                gridline-color: {BORDER}; border: 1px solid {BORDER};
+            }}
+            QHeaderView::section {{
+                background: {BG_DARK}; color: {TEXT_SEC};
+                border: none; padding: 6px; font-size: 11px;
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # ── Header ───────────────────────────────────────────────────────
+        wins    = sum(1 for t in trades if t["won"])
+        losses  = sum(1 for t in trades if not t["won"] and t.get("result") != "EARLY EXIT")
+        stopped = sum(1 for t in trades if t.get("result") == "EARLY EXIT")
+        net_pnl = sum(t["net_pnl"] for t in trades)
+        sign    = "+" if net_pnl >= 0 else ""
+        color   = ACCENT if net_pnl >= 0 else RED
+
+        summary = QLabel(
+            f"{len(trades)} trades  ·  {wins}W  {losses}L  {stopped} stopped  "
+            f"·  Net PnL: {sign}${net_pnl:.2f}"
+        )
+        summary.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: bold;")
+        layout.addWidget(summary)
+
+        # ── Trades table ─────────────────────────────────────────────────
+        table = QTableWidget()
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["Market", "Side", "Qty", "Result", "Fee", "Net PnL"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet(
+            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
+        )
+        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setVisible(False)
+        for col, w in enumerate([220, 60, 45, 90, 90, 120]):
+            table.setColumnWidth(col, w)
+
+        table.setRowCount(len(trades))
+        for ri, e in enumerate(sorted(trades, key=lambda x: x.get("ticker", ""))):
+            result = e.get("result", "")
+            if result == "EARLY EXIT":
+                result_str   = "EXIT ↩"
+                result_color = YELLOW
+            elif e["won"]:
+                result_str   = "WON ✓"
+                result_color = ACCENT
+            else:
+                result_str   = "LOST ✗"
+                result_color = RED
+
+            market = _city_from_ticker(e["ticker"]) or e["ticker"]
+            side   = e.get("side", "")
+            pnl    = e["net_pnl"]
+
+            vals = [
+                (market,                           TEXT_PRI),
+                (side,                             ACCENT if side == "NO" else YELLOW),
+                (str(e.get("contracts", 1)),       TEXT_PRI),
+                (result_str,                       result_color),
+                (f"${e.get('fee', 0):.2f}",       TEXT_SEC),
+                (f"${pnl:+.2f}",                  ACCENT if pnl >= 0 else RED),
+            ]
+            for ci, (val, color) in enumerate(vals):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QColor(color))
+                table.setItem(ri, ci, item)
+
+        layout.addWidget(table, stretch=1)
+
+        # ── Close button ─────────────────────────────────────────────────
+        close_btn = QPushButton("Close")
+        close_btn.setFixedWidth(80)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {BG_PANEL}; color: {TEXT_SEC};
+                border: 1px solid {BORDER}; border-radius: 4px; padding: 6px 12px;
+            }}
+            QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
+        """)
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
 # ---------------------------------------------------------------------------
 # PnL tab
 # ---------------------------------------------------------------------------
@@ -1613,12 +1719,26 @@ class PnLTab(QWidget):
         inner_tabs.setStyleSheet("QTabBar::tab { padding: 6px 18px; font-size: 11px; }")
 
         self.daily_table = self._make_table()
+        self.daily_table.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.daily_table.cellDoubleClicked.connect(self._on_day_row_clicked)
         inner_tabs.addTab(self.daily_table, "By Day")
 
         self.settlements_table = self._make_table()
         inner_tabs.addTab(self.settlements_table, "All Settlements")
 
         layout.addWidget(inner_tabs, stretch=1)
+
+    def _on_day_row_clicked(self, row: int, _col: int):
+        """Open DayDetailDialog for the clicked day row."""
+        date_item = self.daily_table.item(row, 0)
+        if not date_item:
+            return
+        date = date_item.text()
+        trades = self._by_day.get(date, [])
+        if not trades:
+            return
+        dlg = DayDetailDialog(date, trades, parent=self)
+        dlg.exec()
 
     def _make_table(self) -> QTableWidget:
         t = QTableWidget()
@@ -2008,6 +2128,7 @@ class PnLTab(QWidget):
                 "cum_pnl":         round(cum, 2),
             })
         day_rows.reverse()   # newest first for display
+        self._by_day = dict(by_day)  # store for day detail dialog
 
         hdrs = ["Date", "Trades", "Wins", "Losses", "Stopped", "Win%", "Fees", "Net PnL", "Cum PnL"]
         self.daily_table.setColumnCount(len(hdrs))
@@ -2142,15 +2263,15 @@ class SessionTab(QWidget):
 
         # ── Table ─────────────────────────────────────────────────────────
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(
-            ["Time", "Market", "Side", "Qty", "Entry", "Score", "Status"]
+            ["Time", "Market", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
         )
         th = self.table.horizontalHeader()
         th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         th.setStretchLastSection(True)
-        # Time, Market, Side, Qty, Entry, Score, Status
-        for col, width in enumerate([90, 200, 60, 50, 70, 65, 90]):
+        # Time, Market, Side, Qty, Entry, Score, Unreal. PnL, Status
+        for col, width in enumerate([90, 200, 60, 50, 70, 65, 90, 90]):
             self.table.setColumnWidth(col, width)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2164,6 +2285,22 @@ class SessionTab(QWidget):
         """Add a new position entry from this session."""
         self._entries.append({**pos, "status": "Open"})
         self._rebuild()
+
+    def update_pnl(self, live_positions: list):
+        """Refresh unrealised_pnl for open entries from latest live positions."""
+        pnl_by_ticker = {
+            p["ticker"]: p.get("unrealised_pnl", 0)
+            for p in live_positions
+        }
+        updated = False
+        for entry in self._entries:
+            if entry.get("status") == "Open":
+                ticker = entry.get("ticker", "")
+                if ticker in pnl_by_ticker:
+                    entry["unrealised_pnl"] = pnl_by_ticker[ticker]
+                    updated = True
+        if updated:
+            self._rebuild()
 
     def update_status(self, ticker: str, status: str):
         """Update status of an existing entry (e.g. 'Stopped Out')."""
@@ -2213,6 +2350,11 @@ class SessionTab(QWidget):
             else:  # Settled
                 status_color = TEXT_SEC
 
+            unreal     = e.get("unrealised_pnl", 0) or 0
+            unreal_sign  = "+" if unreal >= 0 else ""
+            unreal_color = ACCENT if unreal > 0 else (RED if unreal < 0 else TEXT_SEC)
+            unreal_str   = f"{unreal_sign}${unreal:.2f}" if status == "Open" else "—"
+
             vals = [
                 (e.get("entered_at", "—"),                          TEXT_SEC),
                 (_city_from_ticker(e.get("ticker","")) or e.get("ticker",""), TEXT_PRI),
@@ -2220,6 +2362,7 @@ class SessionTab(QWidget):
                 (str(e.get("contracts", 1)), TEXT_PRI),
                 (f"${avg_cost:.2f}",          TEXT_PRI),
                 (f"{score}/3",                TEXT_PRI),
+                (unreal_str,                  unreal_color),
                 (status,                      status_color),
             ]
 
@@ -2442,6 +2585,20 @@ class MainWindow(QMainWindow):
             worker.session_exit.connect(
                 lambda ticker, reason: self.session_tab.update_status(ticker, reason)
             )
+            # Refresh unrealised PnL on every positions update
+            worker.positions_updated.connect(self._refresh_session_pnl)
+
+    def _refresh_session_pnl(self):
+        """Fetch latest positions and push unrealised PnL to session tab."""
+        client = self.home_tab._client
+        if client is None:
+            return
+        try:
+            import trader as _t
+            live = _t.sync_from_kalshi(client)
+            self.session_tab.update_pnl(live)
+        except Exception:
+            pass
 
     def _open_settings(self):
         """Open credential dialog — only when scheduler is not running."""
