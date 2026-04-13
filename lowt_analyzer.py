@@ -1,198 +1,246 @@
 """
-lowt_analyzer.py
+lowt_observer.py
 ----------------
-Review of temperature market observations collected by lowt_observer.py.
-Analyzes both HIGH and LOWT markets.
+Passive observer for Kalshi temperature markets — both HIGH and LOWT.
+No trading — read-only. Polls every 15 minutes and records bracket
+prices alongside NWS observed temperatures and forecasts.
 
-  python lowt_analyzer.py           # analyze all data
-  python lowt_analyzer.py --type high  # only high temperature markets
-  python lowt_analyzer.py --type lowt  # only low temperature markets
+Run before bed or throughout the day:
+  python lowt_observer.py
+
+Output: data/lowt_observations.json
+        data/lowt_observations.csv
+
+Stops automatically at STOP_HOUR_LISBON.
+
+Schema note
+-----------
+Each row uses explicit field names for the observed and forecast values:
+  HIGH rows  → observed_high_f, forecast_high_f  (observed_low_f / forecast_low_f = null)
+  LOWT rows  → observed_low_f,  forecast_low_f   (observed_high_f / forecast_high_f = null)
+
+This makes rows self-documenting and lets consumers filter by field name
+directly, without having to inspect market_type first.
 """
 
 import json
-import argparse
+import time
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
+from zoneinfo import ZoneInfo
 
-BOUNDARY_BUFFER    = 3.0
-NO_MAX_YES_PRICE   = 0.25
-NO_MAX_ENTRY_PRICE = 0.87
+try:
+    import requests
+except ImportError:
+    raise SystemExit("Please install requests:  pip install requests")
 
-OUTPUT_JSON = Path("data/lowt_observations.json")
+# City registry and NWS feed are now shared modules — no local duplicates.
+from cities import OBSERVE_CITIES as CITIES
+import nws_feed
 
 # ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-def load() -> list[dict]:
-    if not OUTPUT_JSON.exists():
-        print("No observation file found. Run lowt_observer.py first.")
+POLL_INTERVAL_SECS = 15 * 60   # 15 minutes
+
+OUTPUT_JSON = Path("data/lowt_observations.json")
+OUTPUT_CSV  = Path("data/lowt_observations.csv")
+
+CSV_FIELDS = [
+    "poll_time_utc", "city", "market_type", "local_time", "local_hour",
+    "observed_high_f", "forecast_high_f",
+    "observed_low_f",  "forecast_low_f",
+    "ticker", "bracket", "yes_price", "no_price",
+    "spread", "volume", "open_interest",
+]
+
+# ---------------------------------------------------------------------------
+# Kalshi data fetching
+# ---------------------------------------------------------------------------
+
+def fetch_brackets(series: str) -> list[dict]:
+    """Fetch today's open brackets for a given series from Kalshi."""
+    today = datetime.now(timezone.utc).strftime("%y%b%d").upper()
+    try:
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"series_ticker": series, "status": "open"},
+            timeout=10,
+        )
+        markets = resp.json().get("markets", [])
+        return [m for m in markets if today in m.get("ticker", "").upper()]
+    except Exception as e:
+        print(f"  Kalshi error for {series}: {e}")
         return []
-    return json.loads(OUTPUT_JSON.read_text())
 
 
-def analyze(market_filter: str = None):
-    obs = load()
-    if not obs:
-        return
+# ---------------------------------------------------------------------------
+# Observation recorder
+# ---------------------------------------------------------------------------
 
-    # Filter by market type if requested
-    if market_filter:
-        obs = [o for o in obs if o.get("market_type") == market_filter]
+def load_observations() -> list[dict]:
+    if OUTPUT_JSON.exists():
+        try:
+            return json.loads(OUTPUT_JSON.read_text())
+        except Exception:
+            return []
+    return []
 
-    print("=" * 75)
-    print(f"  Temperature Market Analysis  —  {len(obs)} observations")
-    if market_filter:
-        print(f"  Market type filter: {market_filter.upper()}")
-    print("=" * 75)
 
-    # Group by market_type → city → ticker → poll_time
-    by_type_city = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
-    for o in obs:
-        by_type_city[o.get("market_type", "?")][o["city"]][o["ticker"]].append(o)
+def save_observations(obs: list[dict]):
+    OUTPUT_JSON.parent.mkdir(exist_ok=True)
+    OUTPUT_JSON.write_text(json.dumps(obs, indent=2))
+    with open(OUTPUT_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(obs)
 
-    for market_type in sorted(by_type_city.keys()):
-        print(f"\n{'#'*75}")
-        print(f"  {'HIGH TEMPERATURE' if market_type == 'high' else 'LOW TEMPERATURE'} MARKETS")
-        print(f"{'#'*75}")
 
-        by_city = by_type_city[market_type]
+def poll_once(observations: list[dict]) -> int:
+    """
+    Run one poll cycle. Returns number of bracket rows recorded.
 
-        for city in sorted(by_city.keys()):
-            tickers = by_city[city]
-            print(f"\n{'─'*75}")
-            print(f"  {city.upper()}")
-            print(f"{'─'*75}")
+    NWS data is fetched once per city via nws_feed.snapshot(), which:
+      - uses the shared CITIES registry (no duplication)
+      - applies LST boundary logic correctly (not a 24-hr rolling window)
+      - benefits from retry logic and the grid cache
+    """
+    poll_time  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows_added = 0
 
-            # Get unique poll times for this city/type
-            poll_times = sorted(set(
-                o["poll_time_utc"]
-                for ticker_obs in tickers.values()
-                for o in ticker_obs
-            ))
+    # Single NWS pass for all cities — reuse results across HIGH and LOWT loops.
+    print(f"\n[{poll_time}] Fetching NWS data for {len(CITIES)} cities...")
+    nws_results = nws_feed.snapshot()
 
-            all_tickers = sorted(tickers.keys())
-            bracket_labels = [t.split("-")[-1] for t in all_tickers]
+    for city, cfg in CITIES.items():
+        tz         = ZoneInfo(cfg["tz"])
+        local_now  = datetime.now(tz)
+        local_time = local_now.strftime("%H:%M %Z")
+        local_hour = local_now.hour
 
-            print(f"\n  Price evolution (YES%):")
-            print(f"  {'Time':>8}", end="")
-            for b in bracket_labels:
-                print(f"  {b:>8}", end="")
-            print()
+        # Pull pre-fetched NWS data — no extra HTTP calls per city.
+        nws = nws_results.get(city, {})
 
-            for pt in poll_times:
-                time_str = pt[11:16]
-                print(f"  {time_str:>8}", end="")
-                for t in all_tickers:
-                    pt_obs = [o for o in tickers[t] if o["poll_time_utc"] == pt]
-                    if pt_obs:
-                        yes = pt_obs[0]["yes_price"]
-                        print(f"  {yes:>7.0%}", end="")
-                    else:
-                        print(f"  {'—':>8}", end="")
-                print()
+        for market_type in ("high", "lowt"):
+            series = cfg.get(f"{market_type}_series") or cfg.get(market_type)
+            if not series:
+                continue
+            brackets = fetch_brackets(series)
+            if not brackets:
+                continue
 
-            # Convergence detection (>90%)
-            convergence_time = None
-            for pt in poll_times:
-                pt_obs = [
-                    o for ticker_obs in tickers.values()
-                    for o in ticker_obs
-                    if o["poll_time_utc"] == pt
-                ]
-                if any(o["yes_price"] >= 0.90 for o in pt_obs):
-                    convergence_time = pt[11:16]
-                    break
-
-            print(f"\n  Converged at: {convergence_time or 'not yet'}")
-
-            # Check for tradeable signals
-            tradeable = []
-            for pt in poll_times:
-                pt_obs = [
-                    o for ticker_obs in tickers.values()
-                    for o in ticker_obs
-                    if o["poll_time_utc"] == pt
-                ]
-                fcst_f = pt_obs[0].get("forecast_f") if pt_obs else None
-                obs_f  = pt_obs[0].get("observed_f") if pt_obs else None
-
-                ref_f = fcst_f or obs_f
-                if ref_f is None:
-                    continue
-
-                for o in pt_obs:
-                    yes = o["yes_price"]
-                    no  = o["no_price"]
-
-                    if not (NO_MAX_YES_PRICE >= yes > 0.02):
-                        continue
-                    if no > NO_MAX_ENTRY_PRICE:
-                        continue
-
-                    bracket = o["bracket"]
-                    try:
-                        if bracket.startswith("B"):
-                            floor = float(bracket[1:]) - 1
-                            cap   = float(bracket[1:])
-                        elif bracket.startswith("T"):
-                            floor = float(bracket[1:])
-                            cap   = None
-                        else:
-                            continue
-                    except ValueError:
-                        continue
-
-                    if cap and abs(ref_f - cap) < BOUNDARY_BUFFER:
-                        continue
-                    if abs(ref_f - floor) < BOUNDARY_BUFFER:
-                        continue
-
-                    tradeable.append({
-                        "time":   pt[11:16],
-                        "ticker": o["ticker"],
-                        "yes":    yes,
-                        "no":     no,
-                        "ref_f":  ref_f,
-                        "obs_f":  obs_f,
-                    })
-
-            if tradeable:
-                print(f"\n  ✓ Potential NO signals:")
-                seen = set()
-                for w in tradeable:
-                    key = (w["time"], w["ticker"])
-                    if key not in seen:
-                        seen.add(key)
-                        print(f"    {w['time']}  {w['ticker'][-12:]:>14}  "
-                              f"YES={w['yes']:.0%}  NO={w['no']:.2f}  "
-                              f"ref={w['ref_f']}°  obs={w['obs_f']}°")
+            # Map nws_feed.snapshot() keys to explicit per-type fields.
+            # nws_feed uses LST boundary logic — correct for CLI settlement.
+            # Null out the other market type's fields so every row has the
+            # same schema regardless of market_type.
+            if market_type == "high":
+                observed_high_f  = nws.get("observed_high_f")
+                forecast_high_f  = nws.get("forecast_high_f")
+                observed_low_f   = None
+                forecast_low_f   = None
+                if observed_high_f is None:
+                    print(f"  [WARN] {city} HIGH: observed_high_f is None "
+                          f"(NWS error: {nws.get('error')})")
             else:
-                print(f"  ✗ No tradeable signals found")
+                observed_high_f  = None
+                forecast_high_f  = None
+                observed_low_f   = nws.get("observed_low_f")
+                forecast_low_f   = nws.get("forecast_low_f")
+                if observed_low_f is None:
+                    print(f"  [WARN] {city} LOWT: observed_low_f is None "
+                          f"(NWS error: {nws.get('error')})")
 
-    print(f"\n{'='*75}")
-    print(f"  Key questions:")
-    print(f"    1. When does each market converge?")
-    print(f"    2. Are there NO signals before convergence?")
-    print(f"    3. Does HIGH converge differently from LOWT?")
-    print(f"{'='*75}\n")
+            for m in brackets:
+                ticker        = m.get("ticker", "")
+                yes_price     = float(m.get("yes_bid_dollars") or 0)
+                no_price      = float(m.get("no_bid_dollars")  or 0)
+                volume        = float(m.get("volume_fp") or 0)
+                open_interest = float(m.get("open_interest_fp") or 0)
+                bracket       = ticker.split("-")[-1] if "-" in ticker else ticker
+
+                yes_ask = round(1.0 - no_price, 4) if no_price > 0 else None
+                spread  = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
+
+                observations.append({
+                    "poll_time_utc":  poll_time,
+                    "city":           city,
+                    "market_type":    market_type,
+                    "local_time":     local_time,
+                    "local_hour":     local_hour,
+                    "observed_high_f": observed_high_f,
+                    "forecast_high_f": forecast_high_f,
+                    "observed_low_f":  observed_low_f,
+                    "forecast_low_f":  forecast_low_f,
+                    "ticker":         ticker,
+                    "bracket":        bracket,
+                    "yes_price":      yes_price,
+                    "no_price":       no_price,
+                    "spread":         spread,
+                    "volume":         volume,
+                    "open_interest":  open_interest,
+                })
+                rows_added += 1
+
+        # Summary line per city
+        high_brackets = fetch_brackets(cfg.get("high_series") or cfg.get("high", ""))
+        lowt_brackets = fetch_brackets(cfg.get("lowt_series") or cfg.get("lowt", ""))
+
+        def leading(brackets):
+            if not brackets:
+                return "—", 0, None, 0
+            top     = max(brackets, key=lambda x: float(x.get("yes_bid_dollars") or 0))
+            bracket = top.get("ticker", "").split("-")[-1]
+            yes_p   = float(top.get("yes_bid_dollars") or 0)
+            no_p    = float(top.get("no_bid_dollars")  or 0)
+            yes_ask = round(1.0 - no_p, 4) if no_p > 0 else None
+            spread  = round(yes_ask - yes_p, 4) if yes_ask and yes_p > 0 else None
+            volume  = float(top.get("volume_fp") or 0)
+            return bracket, yes_p, spread, volume
+
+        hi_bracket, hi_pct, hi_spread, hi_vol = leading(high_brackets)
+        lo_bracket, lo_pct, lo_spread, lo_vol = leading(lowt_brackets)
+
+        hi_spread_str = f"spd={hi_spread:.2f}" if hi_spread else "spd=—"
+        lo_spread_str = f"spd={lo_spread:.2f}" if lo_spread else "spd=—"
+
+        current_temp = nws.get("current_temp_f", "?")
+        print(f"  {city:<14} {local_time}  obs={current_temp}°  "
+              f"HIGH: {hi_bracket}@{hi_pct:.0%} {hi_spread_str} vol={hi_vol:.0f}  "
+              f"LOWT: {lo_bracket}@{lo_pct:.0%} {lo_spread_str} vol={lo_vol:.0f}")
+
+    return rows_added
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    print("=" * 70)
+    print("  Temperature Market Observer  —  HIGH + LOWT")
+    print(f"  Poll interval : {POLL_INTERVAL_SECS // 60} min")
+    print(f"  Cities        : {len(CITIES)} ({', '.join(CITIES.keys())})")
+    print(f"  Output        : {OUTPUT_JSON}")
+    print("  Runs continuously — Ctrl+C to stop.")
+    print("  Auto-switches to new day's markets at UTC midnight.")
+    print("=" * 70)
+
+    observations = load_observations()
+    print(f"  Loaded {len(observations)} existing observations.\n")
+
+    try:
+        while True:
+            added = poll_once(observations)
+            save_observations(observations)
+            print(f"  Saved {added} new rows ({len(observations)} total). "
+                  f"Next poll in {POLL_INTERVAL_SECS // 60} min.")
+            time.sleep(POLL_INTERVAL_SECS)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user. Observations saved.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--type", choices=["high", "lowt"],
-                        help="Filter to one market type")
-    parser.add_argument("--output", default="data/analysis_output.txt",
-                        help="Output file path (default: data/analysis_output.txt)")
-    args = parser.parse_args()
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(exist_ok=True)
-
-    import sys
-    original_stdout = sys.stdout
-    with open(out_path, "w", encoding="utf-8") as f:
-        sys.stdout = f
-        analyze(market_filter=args.type)
-    sys.stdout = original_stdout
-
-    print(f"Analysis written to: {out_path}")
-    print(f"Open with: notepad {out_path}  (or your editor of choice)")
+    main()

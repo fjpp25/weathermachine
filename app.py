@@ -755,8 +755,8 @@ class CityDetailDialog(QDialog):
     def __init__(self, city: str, positions: list, client, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{city} — Detail")
-        self.setMinimumWidth(560)
-        self.setMinimumHeight(400)
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(460)
         self.setStyleSheet(f"""
             QDialog {{ background: {BG_DARK}; color: {TEXT_PRI}; }}
             QLabel  {{ color: {TEXT_PRI}; }}
@@ -803,7 +803,7 @@ class CityDetailDialog(QDialog):
             pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
             pos_table.horizontalHeader().setStretchLastSection(True)
             pos_table.verticalHeader().setVisible(False)
-            for col, w in enumerate([200, 55, 45, 80, 90]):
+            for col, w in enumerate([190, 75, 65, 100, 70]):
                 pos_table.setColumnWidth(col, w)
 
             for row, pos in enumerate(city_positions):
@@ -844,16 +844,17 @@ class CityDetailDialog(QDialog):
         self.stats_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
         layout.addWidget(self.stats_label)
 
-        self.hist_table = QTableWidget()
-        self.hist_table.setColumnCount(5)
-        self.hist_table.setHorizontalHeaderLabels(["Date", "Bracket", "Side", "Result", "PnL"])
-        self.hist_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.hist_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.hist_table.horizontalHeader().setStretchLastSection(True)
-        self.hist_table.verticalHeader().setVisible(False)
-        for col, w in enumerate([100, 160, 50, 80, 80]):
-            self.hist_table.setColumnWidth(col, w)
-        layout.addWidget(self.hist_table, stretch=1)
+        self.hist_tabs = QTabWidget()
+        self.hist_tabs.setStyleSheet(
+            "QTabBar::tab { padding: 5px 16px; font-size: 11px; }"
+        )
+        self.hist_table_all  = self._make_hist_table()
+        self.hist_table_high = self._make_hist_table()
+        self.hist_table_low  = self._make_hist_table()
+        self.hist_tabs.addTab(self.hist_table_all,  "All")
+        self.hist_tabs.addTab(self.hist_table_high, "High")
+        self.hist_tabs.addTab(self.hist_table_low,  "Low")
+        layout.addWidget(self.hist_tabs, stretch=1)
 
         # Close button
         close_btn = QPushButton("Close")
@@ -878,6 +879,38 @@ class CityDetailDialog(QDialog):
             threading.Thread(target=self._load_stats, daemon=True).start()
         else:
             self.stats_label.setText("No client connected — start trading to see stats.")
+
+    def _make_hist_table(self) -> QTableWidget:
+        t = QTableWidget()
+        t.setColumnCount(5)
+        t.setHorizontalHeaderLabels(["Date", "Bracket", "Side", "Result", "PnL"])
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        t.horizontalHeader().setStretchLastSection(True)
+        t.verticalHeader().setVisible(False)
+        t.setStyleSheet(f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}")
+        for col, w in enumerate([120, 175, 70, 95, 70]):
+            t.setColumnWidth(col, w)
+        return t
+
+    def _fill_hist_table(self, table: QTableWidget, rows: list):
+        """Populate a single history table from a list of enriched trade dicts."""
+        sorted_rows = sorted(rows, key=lambda x: x["date"], reverse=True)
+        table.setRowCount(len(sorted_rows))
+        for row, e in enumerate(sorted_rows):
+            won = e["won"]
+            for col, (val, color) in enumerate([
+                (e["date"],                TEXT_SEC),
+                (e["bracket"],             TEXT_PRI),
+                (e["side"],                ACCENT if e["side"] == "NO" else YELLOW),
+                ("Win" if won else "Loss", ACCENT if won else RED),
+                (f"${e['net_pnl']:+.2f}", ACCENT if won else RED),
+            ]):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QColor(color))
+                table.setItem(row, col, item)
 
     def _load_stats(self):
         """Fetch settlements + fills for this city and compute stats."""
@@ -970,6 +1003,7 @@ class CityDetailDialog(QDialog):
                     "side":    our_side.upper(),
                     "won":     won,
                     "net_pnl": net_pnl,
+                    "mtype":   mtype,
                 })
 
             QMetaObject.invokeMethod(
@@ -1002,21 +1036,17 @@ class CityDetailDialog(QDialog):
             f"color: {ACCENT if net_pnl >= 0 else RED}; font-size: 12px; font-weight: bold;"
         )
 
-        sorted_e = sorted(enriched, key=lambda x: x["date"], reverse=True)
-        self.hist_table.setRowCount(len(sorted_e))
-        for row, e in enumerate(sorted_e):
-            won = e["won"]
-            for col, (val, color) in enumerate([
-                (e["date"],              TEXT_SEC),
-                (e["bracket"],           TEXT_PRI),
-                (e["side"],              ACCENT if e["side"] == "NO" else YELLOW),
-                ("Win" if won else "Loss", ACCENT if won else RED),
-                (f"${e['net_pnl']:+.2f}", ACCENT if won else RED),
-            ]):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                item.setForeground(QColor(color))
-                self.hist_table.setItem(row, col, item)
+        high_rows = [e for e in enriched if e.get("mtype") == "HIGH"]
+        low_rows  = [e for e in enriched if e.get("mtype") == "LOW"]
+
+        self._fill_hist_table(self.hist_table_all,  enriched)
+        self._fill_hist_table(self.hist_table_high, high_rows)
+        self._fill_hist_table(self.hist_table_low,  low_rows)
+
+        # Update tab labels with counts so it's clear at a glance
+        self.hist_tabs.setTabText(0, f"All ({total})")
+        self.hist_tabs.setTabText(1, f"High ({len(high_rows)})")
+        self.hist_tabs.setTabText(2, f"Low ({len(low_rows)})")
 
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1167,7 @@ class HomeTab(QWidget):
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         hdr.setStretchLastSection(True)
         # Ticker, Side, Qty, Avg Cost, Current, Unreal PnL, Opened, Status
-        for col, width in enumerate([260, 60, 50, 90, 90, 160, 180, 90]):
+        for col, width in enumerate([240, 85, 75, 110, 110, 130, 155, 65]):
             self.pos_table.setColumnWidth(col, width)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1310,7 +1340,7 @@ class HomeTab(QWidget):
         self.log_line.emit(text)
 
     def sync_positions_from_kalshi(self):
-        """Fetch live positions directly from Kalshi and update the table."""
+        """Fetch live positions and balance directly from Kalshi and update the UI."""
         if not hasattr(self, '_client') or self._client is None:
             return  # no client yet — wait for scheduler to connect
 
@@ -1319,9 +1349,15 @@ class HomeTab(QWidget):
         client = self._client
 
         def fetch():
-            return _trader_preload.sync_from_kalshi(client)
+            positions = _trader_preload.sync_from_kalshi(client)
+            balance   = _trader_preload.get_balance(client)
+            return positions, balance
 
-        def on_done(positions):
+        def on_done(result):
+            positions, balance = result
+            self._last_balance = balance
+            self.balance_label.setText(f"Balance  ${balance:.2f}")
+            self.deployable_label.setText(f"Deployable  ${balance * 0.70:.2f}")
             self._update_positions_table(positions)
             self.sync_btn.setEnabled(True)
             self.sync_btn.setText("⟳  Sync")
@@ -1546,7 +1582,7 @@ class DayDetailDialog(QDialog):
         )
         table.horizontalHeader().setStretchLastSection(True)
         table.verticalHeader().setVisible(False)
-        for col, w in enumerate([220, 60, 45, 90, 90, 120]):
+        for col, w in enumerate([240, 80, 65, 100, 90, 100]):
             table.setColumnWidth(col, w)
 
         table.setRowCount(len(trades))
@@ -2138,7 +2174,7 @@ class PnLTab(QWidget):
         dh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         dh.setStretchLastSection(True)
         # Date, Trades, Wins, Losses, Stopped, Win%, Fees, Net PnL, Cum PnL
-        for col, width in enumerate([180, 70, 65, 70, 75, 70, 120, 160, 160]):
+        for col, width in enumerate([165, 90, 85, 90, 90, 80, 110, 130, 100]):
             self.daily_table.setColumnWidth(col, width)
 
         for ri, row in enumerate(day_rows):
@@ -2165,7 +2201,7 @@ class PnLTab(QWidget):
         sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         sh.setStretchLastSection(True)
         # Date, Market, Side, Qty, Result, Fee, Net PnL
-        for col, width in enumerate([180, 220, 60, 50, 90, 120, 160]):
+        for col, width in enumerate([165, 240, 80, 70, 100, 110, 100]):
             self.settlements_table.setColumnWidth(col, width)
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
@@ -2290,7 +2326,7 @@ class SessionTab(QWidget):
         th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         th.setStretchLastSection(True)
         # Time, Market, Side, Qty, Entry, Score, Unreal. PnL, Status
-        for col, width in enumerate([90, 200, 60, 50, 70, 65, 90, 90]):
+        for col, width in enumerate([120, 220, 80, 70, 90, 80, 110, 65]):
             self.table.setColumnWidth(col, width)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
