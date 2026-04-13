@@ -22,9 +22,14 @@ Each entry contains:
                       Based on entry_window_analysis.py — update as data accumulates.
                       Rationale: before this hour the NWS forecast is still settling from
                       the overnight model run and NO entry prices are noisy.
-  trade_start_lowt  — Earliest local hour for LOWT market entries (None = global default)
-                      Not yet set — LOWT markets are observe-only. Will be populated once
-                      entry_window_analysis has ≥15 days of LOWT observations.
+  trade_end_high    — Latest local hour for HIGH market entries (None = global default).
+                      Set ~2h after median convergence — no new entries after this hour
+                      since the market has already resolved and there is no edge left.
+  trade_start_lowt  — Earliest local hour for LOWT market entries (None = global default).
+                      Not yet set — observe-only until enough data accumulated.
+  trade_end_lowt    — Latest local hour for LOWT entries. Hard deadline based on
+                      10:00am ET expiry converted to city local time, with 1h buffer.
+                      ET=9, CT=8, MT=7, PT=6.
 
 Convenience views at the bottom of this file:
   TRADING_CITIES      — subset where trading=True
@@ -53,7 +58,9 @@ CITIES: dict[str, dict] = {
         "trading":          True,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@14:00, fcst unstable overnight
+        "trade_end_high":    17,          # conv@15:00 median, no edge after
         "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)        # observe-only — not yet calibrated
     },
     "Chicago": {
         "icao":             "KMDW",
@@ -68,7 +75,9 @@ CITIES: dict[str, dict] = {
         "trading":          True,
         "observe":          True,
         "trade_start_high": 10,          # 3 days: sharp fcst revision at 07:00–08:00 local
-        "trade_start_lowt": None,
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Miami": {
         "icao":             "KMIA",
@@ -83,7 +92,9 @@ CITIES: dict[str, dict] = {
         "trading":          True,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@13:00, no forecast instability
-        "trade_start_lowt": None,
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
     "Austin": {
         "icao":             "KAUS",
@@ -98,7 +109,9 @@ CITIES: dict[str, dict] = {
         "trading":          True,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@17:00, overnight instability clears by 09:00
-        "trade_start_lowt": None,
+        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Los Angeles": {
         "icao":             "KLAX",
@@ -110,10 +123,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023174",
         "high_series":      "KXHIGHLAX",
         "lowt_series":      "KXLOWTLAX",
-        "trading":          False,       # PAUSED: 50% WR, -$1.79 across 8 trades
+        "trading":          True,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
         "observe":          True,
-        "trade_start_high": 10,          # 3 days: conv@13:00, overnight instability
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 4 days: conv@12:00, best signal quality in dataset
+        "trade_end_high":    15,          # conv@13:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
     "San Francisco": {
         "icao":             "KSFO",
@@ -128,8 +143,10 @@ CITIES: dict[str, dict] = {
         "lowt_series":      "KXLOWTSFO",
         "trading":          True,
         "observe":          True,
-        "trade_start_high": 10,          # 1 day: provisional, similar pattern to LA
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 2 days: non-convergence risk (marine layer), provisional
+        "trade_end_high":    20,          # conv@18:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
     "Denver": {
         "icao":             "KDEN",
@@ -144,7 +161,9 @@ CITIES: dict[str, dict] = {
         "trading":          True,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@16:00, no significant instability
-        "trade_start_lowt": None,
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
     },
     "Philadelphia": {
         "icao":             "KPHL",
@@ -156,15 +175,16 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013739",
         "high_series":      "KXHIGHPHIL",
         "lowt_series":      "KXLOWTPHIL",
-        "trading":          False,       # PAUSED: 0% WR, -$2.15 across 2 trades
+        "trading":          True,        # RE-ENABLED: 100% conv rate, 4 days obs
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: same pattern as New York
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 4 days: conv@16:30, same pattern as New York
+        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
 
     # -------------------------------------------------------------------------
-    # Extended — observation / future trading candidates
-    # trade_start_high = None for all until entry_window_analysis has ≥5 days
+    # Extended cities — mix of enabled and paused based on observation data
     # -------------------------------------------------------------------------
 
     "Atlanta": {
@@ -177,10 +197,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013874",
         "high_series":      "KXHIGHTATL",
         "lowt_series":      "KXLOWTATL",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 100% conv, 2 days obs
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 2 days: conv@17:00, stable NO from ~08:00
+        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
     "Boston": {
         "icao":             "KBOS",
@@ -192,10 +214,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00014739",
         "high_series":      "KXHIGHTBOS",
         "lowt_series":      "KXLOWTBOS",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 100% conv, 2 days obs
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 2 days: conv@16:00, stable NO from ~08:00
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
     "Washington DC": {
         "icao":             "KDCA",
@@ -207,10 +231,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013743",
         "high_series":      "KXHIGHTDC",
         "lowt_series":      "KXLOWTDC",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
     "Houston": {
         "icao":             "KHOU",
@@ -222,10 +248,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012918",
         "high_series":      "KXHIGHTHOU",
         "lowt_series":      "KXLOWTHOU",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Phoenix": {
         "icao":             "KPHX",
@@ -237,10 +265,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023183",
         "high_series":      "KXHIGHTPHX",
         "lowt_series":      "KXLOWTPHX",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 2 days: conv@14:00, non-conv risk
+        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
     },
     "Las Vegas": {
         "icao":             "KLAS",
@@ -252,10 +282,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023169",
         "high_series":      "KXHIGHTLV",
         "lowt_series":      "KXLOWTLV",
-        "trading":          False,
+        "trading":          False,       # PAUSED: 0% convergence over 2 days
         "observe":          True,
-        "trade_start_high": None,        # 1 day — insufficient
-        "trade_start_lowt": None,
+        "trade_start_high": None,        # non-converging — keep paused
+        "trade_end_high":    None,        # paused — no close needed
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
     "Dallas": {
         "icao":             "KDFW",
@@ -267,10 +299,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00003927",
         "high_series":      "KXHIGHTDAL",
         "lowt_series":      "KXLOWTDAL",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 100% conv, 2 days obs
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 2 days: conv@15:30, tight spreads
+        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "San Antonio": {
         "icao":             "KSAT",
@@ -282,10 +316,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012921",
         "high_series":      "KXHIGHTSATX",
         "lowt_series":      "KXLOWTSATX",
-        "trading":          False,
+        "trading":          False,       # PAUSED: 50% conv, wider spreads
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": None,        # insufficient data
+        "trade_end_high":    None,        # paused — no close needed
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Seattle": {
         "icao":             "KSEA",
@@ -297,10 +333,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00024233",
         "high_series":      "KXHIGHTSEA",
         "lowt_series":      "KXLOWTSEA",
-        "trading":          False,
+        "trading":          False,       # PAUSED: 0% convergence over 2 days
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": None,        # non-converging
+        "trade_end_high":    None,        # paused — no close needed
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
     "New Orleans": {
         "icao":             "KMSY",
@@ -312,10 +350,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012916",
         "high_series":      "KXHIGHTNOLA",
         "lowt_series":      "KXLOWTNOLA",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": 10,          # 2 days: conv@14:00, later start for safety
+        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Minneapolis": {
         "icao":             "KMSP",
@@ -327,10 +367,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00014922",
         "high_series":      "KXHIGHTMIN",
         "lowt_series":      "KXLOWTMIN",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 100% conv, 2 days obs
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 2 days: conv@14:00, strong early NO quality
+        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
     "Oklahoma City": {
         "icao":             "KOKC",
@@ -342,10 +384,12 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013967",
         "high_series":      "KXHIGHTOKC",
         "lowt_series":      "KXLOWTOKC",
-        "trading":          False,
+        "trading":          True,        # ENABLED: 100% conv, 3 days obs
         "observe":          True,
-        "trade_start_high": None,
-        "trade_start_lowt": None,
+        "trade_start_high": 9,           # 3 days: conv@17:00, 80% pct_80 at peak
+        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_lowt": None,        # observe-only — not yet calibrated
+        "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
 }
 # fmt: on

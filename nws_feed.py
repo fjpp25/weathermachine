@@ -343,11 +343,11 @@ def snapshot(city_filter: str = None) -> dict:
 
 def display(results: dict):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"\n{'='*72}")
+    print(f"\n{'='*80}")
     print(f"  NWS Live Feed  —  {now_utc}")
-    print(f"{'='*72}")
-    print(f"{'City':<16} {'LocalTime':>12} {'LSTHr':>6} {'CurrF':>6} {'ObsHi':>6} {'FcstHi':>7} {'FcstLo':>7}")
-    print(f"{'-'*72}")
+    print(f"{'='*80}")
+    print(f"{'City':<16} {'LocalTime':>12} {'LSTHr':>6} {'CurrF':>6} {'ObsHi':>6} {'ObsLo':>6} {'FcstHi':>7} {'FcstLo*':>8}")
+    print(f"{'-'*80}")
 
     for city, d in results.items():
         if d.get("error"):
@@ -360,12 +360,14 @@ def display(results: dict):
             f"{d.get('city_lst_hour', '?'):>6} "
             f"{fmt(d.get('current_temp_f')):>6} "
             f"{fmt(d.get('observed_high_f')):>6} "
+            f"{fmt(d.get('observed_low_f')):>6} "
             f"{fmt(d.get('forecast_high_f')):>7} "
-            f"{fmt(d.get('forecast_low_f')):>7}"
+            f"{fmt(d.get('forecast_low_f')):>8}"
         )
 
-    print(f"{'='*72}")
-    print("  LocalTime=wall clock  LSTHr=CLI reporting hour  ObsHi=today's high so far")
+    print(f"{'='*80}")
+    print("  LocalTime=wall clock  LSTHr=CLI reporting hour  ObsHi/Lo=today's observed range")
+    print("  FcstLo* = tonight's overnight low forecast (not today's observed minimum)")
 
 
 def fmt(val) -> str:

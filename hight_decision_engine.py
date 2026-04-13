@@ -1,44 +1,38 @@
 """
-decision_engine.py
-------------------
+hight_decision_engine.py
+------------------------
 Synthesizes city profiles, NWS live feed, and Kalshi scanner data into
-actionable trade signals for temperature markets.
+actionable NO trade signals for temperature HIGH markets.
 
-Two trade types are evaluated per bracket:
+Only NO trades are generated — buying NO on brackets the forecast or
+observed temperatures make unlikely, collecting premium as the market
+converges to resolution.
 
-  YES trade  — buy YES on the bracket the forecast points to
-               requires strong signal score (≥2/3)
-               exit when price appreciates Y% or at a stop-loss
-
-  NO trade   — buy NO on brackets that are already unlikely
-               lower signal bar, driven by forecast + observed floor
-               collect premium as market converges toward resolution
-
-Gates (applied in order, any failure skips to next bracket):
-  1. Timing      — city_local_hour must be within the city's entry window.
-                   Per-city start hours are defined in cities.py (trade_start_high /
-                   trade_start_lowt), calibrated from entry_window_analysis.py.
-                   Falls back to TRADE_WINDOW_START/END when no per-city value is set.
-                   Currently TRADE_WINDOW_END = 24 (no hard close — scheduler handles timing).
+Gates (applied in order — any failure skips to next bracket):
+  1. Timing      — city_local_hour ≥ TRADE_WINDOW_START (global floor, currently 6am local).
+                   No per-city overrides — 6am is early enough for obs signals and the
+                   NWS morning forecast, while keeping overnight noise out.
   2. Liquidity   — spread ≤ MAX_SPREAD and depth ≥ MIN_DEPTH
-  3. Boundary    — forecast is ≥ BOUNDARY_BUFFER°F inside bracket edges
+  3. Boundary    — bias-corrected forecast is ≥ dynamic_buffer°F from both bracket edges
+                   (dynamic_buffer scales with city's tmax_stddev from city_profiles.json)
 
-Signal scoring (0–3, used to decide YES vs NO and position size):
-  +1 forecast signal   — NWS forecast high falls in this bracket
-  +1 obs floor signal  — observed high so far today ≥ bracket floor
-  +1 momentum signal   — price has moved toward YES in last N candles
-                         (only scored if candle data is available)
+Signal scoring (0–3):
+  +1 obs_eliminates_bracket  — observed high ≥ bracket cap (bracket physically impossible)
+  +1 obs_below_floor         — observed high < bracket floor − buffer (bracket not yet in play)
+  +1 forecast_well_clear     — corrected forecast ≥ FORECAST_WELL_CLEAR°F from nearest edge
+  +1 momentum_flat_or_down   — no upward price momentum in recent candles
 
 Usage:
-  python decision_engine.py                 # run full analysis, all cities
-  python decision_engine.py --city Miami    # single city
-  python decision_engine.py --paper         # paper-trade mode (log only)
+  python hight_decision_engine.py                 # run full analysis, all cities
+  python hight_decision_engine.py --city Miami    # single city
+  python hight_decision_engine.py --paper         # paper-trade mode (log only)
 
 Dependencies:
   city_profiles.py   (data/city_profiles.json must exist)
-  nws_feed.py        (imported directly)
-  kalshi_scanner.py  (imported directly)
-  cities.py          (trade_start_high / trade_start_lowt per city)
+  bias_calculator.py (data/forecast_bias.json used when available)
+  nws_feed.py
+  kalshi_scanner.py
+  cities.py
 """
 
 import json
@@ -56,18 +50,23 @@ from cities import CITIES as _CITY_REGISTRY
 # ---------------------------------------------------------------------------
 
 # Gate thresholds
-TRADE_WINDOW_START  = 0        # local hour — global fallback when no per-city value set
-TRADE_WINDOW_END    = 24       # local hour — gate currently DISABLED (0–24 = always open)
-                               # Timing is handled by scheduler.py's dynamic interval.
-                               # To re-enable a hard close: set TRADE_WINDOW_END = 14
+TRADE_WINDOW_START  = 6        # local hour — no trading before 6am (obs signals meaningless overnight)
+                               # Early enough to catch first morning obs + NWS forecast (~7am)
+TRADE_WINDOW_END    = 24       # local hour — no hard close (scheduler handles late-day tapering)
+                               # To re-enable: set TRADE_WINDOW_END = 14
 MAX_SPREAD          = 0.05     # max acceptable bid-ask spread ($)
                                # relaxed from 0.03 — was blocking too many valid signals
 MIN_DEPTH           = 500      # min contracts on the side we're buying
 
-BOUNDARY_BUFFER     = 3.0      # °F — forecast must be this far inside bracket edges
-                               # 2.0 → too loose (NYC 76-77° loss, Mar 31 2026)
-                               # 4.0 → too strict (blocks ~67% of bracket range)
-                               # 3.0 → balanced starting point, revisit with backtest data
+# Dynamic boundary buffer — scales with tmax_stddev from city_profiles.json
+# dynamic_buffer = clamp(BOUNDARY_BUFFER_STDDEV_FACTOR * stddev, MIN, MAX)
+# Higher stddev cities (Chicago winter) get a wider buffer than stable cities (Miami summer).
+BOUNDARY_BUFFER_STDDEV_FACTOR = 0.6
+BOUNDARY_BUFFER_MIN           = 2.0   # °F floor
+BOUNDARY_BUFFER_MAX           = 5.0   # °F ceiling
+
+# Fallback buffer if city profile or stddev is unavailable
+BOUNDARY_BUFFER_FALLBACK      = 3.0   # °F
 
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
@@ -75,7 +74,7 @@ NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
 NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
                                # data: below 0.75 market is pricing in real uncertainty
 NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract
-                               # data: 0.75-0.92 gives 86.5% WR across 37 trades
+                               # data: 0.75–0.92 gives 86.5% WR across 37 trades
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for HIGH markets
                                # spring/summer: temps trending up → asymmetric risk upward
@@ -83,22 +82,90 @@ NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for 
 MAX_CONTRACTS       = 2        # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
-# Exit targets
-YES_EXIT_TARGET     = 0.25     # take profit when YES price rises 25%
-YES_STOP_LOSS       = 0.40     # stop loss if YES price falls 40% from entry
-NO_EXIT_TARGET      = 0.15     # take profit when NO price rises 15%
-
 # Momentum detection
 MIN_CANDLES_FOR_MOMENTUM = 3   # need at least this many candles to score momentum
 MOMENTUM_LOOKBACK        = 3   # look at last N candles for direction
 
-# NWS forecast warm bias correction (from research: forecasts run ~1°F warm)
-FORECAST_BIAS_CORRECTION = -1.0   # subtract this from NWS forecast high
+# Global NWS forecast bias fallback (used when data/forecast_bias.json has no entry for city)
+# Overridden per city by data/forecast_bias.json when available.
+FORECAST_BIAS_CORRECTION = -1.0   # °F — subtract from NWS forecast high
 
-# Forecast well-clear threshold for NO trade scoring
+# Forecast well-clear threshold for scoring
 # Bracket must be this far from the corrected forecast to score the forecast point
-# (higher bar than BOUNDARY_BUFFER gate — gate=3°F, score=6°F)
+# (higher bar than boundary buffer gate — gate≈3°F, score=6°F)
 FORECAST_WELL_CLEAR = 6.0
+
+
+# ---------------------------------------------------------------------------
+# Per-city bias — loaded from data/forecast_bias.json at import time
+# ---------------------------------------------------------------------------
+
+_BIAS_FILE = Path("data/forecast_bias.json")
+
+def _load_forecast_bias() -> dict[str, dict]:
+    """
+    Load per-city bias computed by bias_calculator.py.
+    Accepts both the new format {city: {"bias": float, "stddev": float}}
+    and the legacy flat format {city: float} for backwards compatibility.
+    Falls back gracefully — missing cities use FORECAST_BIAS_CORRECTION.
+    """
+    if not _BIAS_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(_BIAS_FILE.read_text())
+        normalised = {}
+        for city, val in raw.items():
+            if isinstance(val, (int, float)):
+                normalised[city] = {"bias": float(val), "stddev": 0.0}
+            else:
+                normalised[city] = val
+        return normalised
+    except Exception as e:
+        print(f"[decision_engine] Warning: could not load {_BIAS_FILE}: {e}")
+        return {}
+
+_FORECAST_BIAS: dict[str, dict] = _load_forecast_bias()
+
+
+def _city_bias(city: str) -> float:
+    """Return per-city bias correction, falling back to global constant."""
+    entry = _FORECAST_BIAS.get(city)
+    if entry is not None:
+        return entry["bias"]
+    return FORECAST_BIAS_CORRECTION
+
+
+def _city_bias_stddev(city: str) -> float:
+    """Return the stddev of per-city bias errors (0.0 if unknown)."""
+    entry = _FORECAST_BIAS.get(city)
+    if entry is not None:
+        return entry.get("stddev", 0.0)
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Dynamic boundary buffer — derived from city profile stddev
+# ---------------------------------------------------------------------------
+
+def _dynamic_buffer(city: str, profiles: dict) -> float:
+    """
+    Compute the boundary buffer for a city based on its current-month tmax_stddev.
+
+    Higher stddev (e.g. Chicago in March) → wider buffer → fewer but higher-confidence trades.
+    Lower stddev (e.g. Miami in July)     → tighter buffer → more trades with less edge dilution.
+
+    Falls back to BOUNDARY_BUFFER_FALLBACK if profile data is unavailable.
+    """
+    try:
+        month   = str(datetime.now().month)
+        monthly = profiles.get(city, {}).get("monthly", {}).get(month, {})
+        stddev  = monthly.get("tmax_stddev")
+        if stddev is not None and stddev > 0:
+            raw = BOUNDARY_BUFFER_STDDEV_FACTOR * stddev
+            return round(max(BOUNDARY_BUFFER_MIN, min(BOUNDARY_BUFFER_MAX, raw)), 1)
+    except Exception:
+        pass
+    return BOUNDARY_BUFFER_FALLBACK
 
 
 # ---------------------------------------------------------------------------
@@ -138,19 +205,16 @@ PAUSED_CITIES: set[str] = _build_paused_cities()
 
 def _trade_start_for(city: str, market_type: str = "high") -> int:
     """
-    Return the earliest local hour for entering trades in this city.
+    Return the earliest local hour for entering HIGH trades.
 
-    Looks up trade_start_high or trade_start_lowt from cities.py.
-    Falls back to TRADE_WINDOW_START (global default) if not set.
+    Previously used per-city calibrated values from cities.py. Replaced with
+    a single global floor (TRADE_WINDOW_START = 6) — the per-city values were
+    calibrated for forecast-only signals and were too conservative once
+    obs_eliminates_bracket became a first-class signal.
 
-    The per-city values are calibrated from entry_window_analysis.py and
-    reflect when the NWS morning forecast has stabilised enough for NO
-    entries to be reliable.
+    Returns TRADE_WINDOW_START for all cities.
     """
-    meta = _CITY_REGISTRY.get(city, {})
-    key  = "trade_start_high" if market_type == "high" else "trade_start_lowt"
-    val  = meta.get(key)
-    return val if val is not None else TRADE_WINDOW_START
+    return TRADE_WINDOW_START
 
 
 # ---------------------------------------------------------------------------
@@ -181,83 +245,76 @@ def load_profiles() -> dict:
 
 def get_forecast_bracket(forecast_high: float, brackets: list[dict]) -> dict | None:
     """Find which bracket the (bias-corrected) forecast high falls into."""
-    corrected = forecast_high + FORECAST_BIAS_CORRECTION
-    for b in brackets:
-        floor = b.get("floor")
-        cap   = b.get("cap")
-        if floor is None and cap is not None:
-            if corrected < cap:
-                return b
-        elif cap is None and floor is not None:
-            if corrected >= floor:
-                return b
-        elif floor is not None and cap is not None:
-            if floor <= corrected < cap:
-                return b
+    for bracket in brackets:
+        floor = bracket.get("floor")
+        cap   = bracket.get("cap")
+        if floor is not None and cap is not None:
+            if floor <= forecast_high < cap:
+                return bracket
+        elif floor is not None:
+            if forecast_high >= floor:
+                return bracket
+        elif cap is not None:
+            if forecast_high < cap:
+                return bracket
     return None
 
 
-def score_momentum(candles: list[dict]) -> int:
+def score_momentum(candles: list[dict]) -> bool:
     """
-    Returns +1 if price has been trending upward in the last N candles, else 0.
-    Returns 0 (no score) if insufficient candle data.
+    Returns True if price is moving upward (toward YES) over recent candles.
+    Uses close prices from the last MOMENTUM_LOOKBACK candles.
+    Returns False (no momentum) if there are fewer than MIN_CANDLES_FOR_MOMENTUM candles.
     """
     if len(candles) < MIN_CANDLES_FOR_MOMENTUM:
-        return 0
-
-    recent = candles[-MOMENTUM_LOOKBACK:]
-    closes = [c["price_close"] for c in recent if c.get("price_close") is not None]
-
-    if len(closes) < 2:
-        return 0
-
-    return 1 if closes[-1] > closes[0] else 0
-
-
-def bracket_contains_temp(bracket: dict, temp: float) -> bool:
-    """Does a temperature value fall within this bracket?"""
-    floor = bracket.get("floor")
-    cap   = bracket.get("cap")
-    if floor is None and cap is not None:
-        return temp < cap
-    elif cap is None and floor is not None:
-        return temp >= floor
-    elif floor is not None and cap is not None:
-        return floor <= temp < cap
-    return False
-
-
-def is_forecast_inside_boundary(bracket: dict, forecast_high: float) -> bool:
-    """
-    Returns True if the bias-corrected forecast is at least BOUNDARY_BUFFER°F
-    away from either edge of the bracket.
-    """
-    corrected = forecast_high + FORECAST_BIAS_CORRECTION
-    floor = bracket.get("floor")
-    cap   = bracket.get("cap")
-
-    if floor is not None and (corrected - floor) < BOUNDARY_BUFFER:
         return False
-    if cap is not None and (cap - corrected) < BOUNDARY_BUFFER:
+    recent = candles[-MOMENTUM_LOOKBACK:]
+    closes = [c.get("yes_price_close") or c.get("close") or 0 for c in recent]
+    if len(closes) < 2:
+        return False
+    return closes[-1] > closes[0]
+
+
+def is_forecast_inside_boundary(bracket: dict, forecast: float, buffer: float) -> bool:
+    """Check forecast is at least `buffer`°F inside both bracket edges."""
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+    if floor is not None and forecast - floor < buffer:
+        return False
+    if cap is not None and cap - forecast < buffer:
         return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# Per-bracket evaluator
+# Per-bracket evaluator (NO trades only)
 # ---------------------------------------------------------------------------
 
 def evaluate_bracket(
-    bracket:             dict,
-    forecast_high:       float,
-    observed_high:       float,
-    city_local_hour:     int,
-    is_forecast_bracket: bool,
-    trade_start_hour:    int = 0,    # per-city entry window start (from cities.py)
-) -> dict | None:
+    bracket:          dict,
+    forecast_high:    float,
+    observed_high:    float | None,
+    city_local_hour:  int,
+    trade_start_hour: int,
+    city_bias:        float,
+    dynamic_buffer:   float,
+) -> dict:
     """
-    Run all gates and scoring for a single bracket.
-    Returns a signal dict, or None.
+    Evaluate a single bracket for a NO trade signal.
+
+    Forecast brackets are never traded — caller should skip them before calling here.
+
+    Args:
+        bracket:          Bracket dict from kalshi_scanner (includes orderbook fields).
+        forecast_high:    Raw NWS forecast high (°F) — bias correction applied internally.
+        observed_high:    Observed high so far today (°F), or None if not yet available.
+        city_local_hour:  Current local hour for the city.
+        trade_start_hour: Earliest local hour for entering trades (global floor, currently 6am).
+        city_bias:        Per-city NWS bias correction (°F). Applied as: corrected = forecast + bias.
+        dynamic_buffer:   Boundary buffer (°F) scaled to city stddev.
+
+    Returns:
+        Signal dict with trade_type="NO" if actionable, else trade_type=None with skip_reason.
     """
     signal = {
         "ticker":       bracket["ticker"],
@@ -277,6 +334,8 @@ def evaluate_bracket(
         "score_detail": [],
         "trade_type":   None,
         "skip_reason":  None,
+        "city_bias":    city_bias,
+        "dynamic_buffer": dynamic_buffer,
     }
 
     # --- Gate 0: Market must be active ---
@@ -285,14 +344,12 @@ def evaluate_bracket(
         return signal
 
     # --- Gate 0b: Ban NO trades on above-threshold (T) brackets for HIGH markets ---
-    if (not is_forecast_bracket and NO_BAN_ABOVE_BRACKETS
-            and bracket.get("cap") is None and bracket.get("floor") is not None):
-        signal["skip_reason"] = "NO on above-threshold bracket banned (spring upward bias)"
+    # cap=None + floor set means "above X°F" — asymmetric upside risk in spring/summer
+    if NO_BAN_ABOVE_BRACKETS and bracket.get("cap") is None and bracket.get("floor") is not None:
+        signal["skip_reason"] = "NO on above-threshold bracket banned (spring/summer upward bias)"
         return signal
 
     # --- Gate 1: Timing — per-city entry window ---
-    # trade_start_hour comes from cities.py (calibrated from observations).
-    # TRADE_WINDOW_END is the global close — currently 24 (disabled).
     if not (trade_start_hour <= city_local_hour < TRADE_WINDOW_END):
         signal["skip_reason"] = (
             f"Before entry window (local hour={city_local_hour}, "
@@ -301,82 +358,56 @@ def evaluate_bracket(
         return signal
 
     # --- Gate 2: Liquidity ---
-    spread = bracket.get("ob_spread")
+    spread    = bracket.get("ob_spread")
+    no_depth  = bracket.get("ob_no_depth") or 0
+    yes_depth = bracket.get("ob_yes_depth") or 0
+
     if spread is None or spread > MAX_SPREAD:
         signal["skip_reason"] = f"Spread too wide or missing ({spread})"
         return signal
-
-    no_depth  = bracket.get("ob_no_depth") or 0
-    yes_depth = bracket.get("ob_yes_depth") or 0
 
     if no_depth < MIN_DEPTH and yes_depth < MIN_DEPTH:
         signal["skip_reason"] = f"Insufficient depth (yes={yes_depth}, no={no_depth})"
         return signal
 
-    # --- Gate 3: Boundary buffer ---
-    if is_forecast_bracket:
-        if not is_forecast_inside_boundary(bracket, forecast_high):
-            signal["skip_reason"] = f"Forecast too close to bracket edge (buffer={BOUNDARY_BUFFER}°F)"
-            return signal
-    else:
-        corrected = forecast_high + FORECAST_BIAS_CORRECTION
-        floor     = bracket.get("floor")
-        cap       = bracket.get("cap")
-        distances = []
-        if floor is not None:
-            distances.append(abs(corrected - floor))
-        if cap is not None:
-            distances.append(abs(corrected - cap))
-        if distances and min(distances) < BOUNDARY_BUFFER:
-            signal["skip_reason"] = f"NO bracket too close to forecast (buffer={BOUNDARY_BUFFER}°F)"
-            return signal
+    # --- Gate 3: Boundary buffer (using per-city bias and dynamic buffer) ---
+    corrected = forecast_high + city_bias
+    floor     = bracket.get("floor")
+    cap       = bracket.get("cap")
+
+    distances = []
+    if floor is not None:
+        distances.append(abs(corrected - floor))
+    if cap is not None:
+        distances.append(abs(corrected - cap))
+
+    if distances and min(distances) < dynamic_buffer:
+        signal["skip_reason"] = (
+            f"NO bracket too close to corrected forecast "
+            f"(corrected={corrected:.1f}°, buffer={dynamic_buffer}°F)"
+        )
+        return signal
 
     # --- Signal scoring ---
     score   = 0
     details = []
-    floor   = bracket.get("floor")
-    cap     = bracket.get("cap")
 
-    if is_forecast_bracket:
-        # ── YES trade scoring ─────────────────────────────────────────────
+    if observed_high is not None:
+        if cap is not None and observed_high >= cap:
+            score += 1
+            details.append("obs_eliminates_bracket")
+        elif floor is not None and observed_high < floor - dynamic_buffer:
+            score += 1
+            details.append("obs_below_floor")
 
+    if distances and min(distances) >= FORECAST_WELL_CLEAR:
         score += 1
-        details.append("forecast_match")
+        details.append("forecast_well_clear")
 
-        if observed_high is not None and floor is not None and observed_high >= floor:
-            score += 1
-            details.append("obs_floor_cleared")
-
-        candles = bracket.get("candles", [])
-        if score_momentum(candles):
-            score += 1
-            details.append("momentum_up")
-
-    else:
-        # ── NO trade scoring ──────────────────────────────────────────────
-
-        if observed_high is not None:
-            if cap is not None and observed_high >= cap:
-                score += 1
-                details.append("obs_eliminates_bracket")
-            elif floor is not None and observed_high < floor - BOUNDARY_BUFFER:
-                score += 1
-                details.append("obs_below_floor")
-
-        corrected = forecast_high + FORECAST_BIAS_CORRECTION
-        distances = []
-        if floor is not None:
-            distances.append(abs(corrected - floor))
-        if cap is not None:
-            distances.append(abs(corrected - cap))
-        if distances and min(distances) >= FORECAST_WELL_CLEAR:
-            score += 1
-            details.append("forecast_well_clear")
-
-        candles = bracket.get("candles", [])
-        if not score_momentum(candles):
-            score += 1
-            details.append("momentum_flat_or_down")
+    candles = bracket.get("candles", [])
+    if not score_momentum(candles):
+        score += 1
+        details.append("momentum_flat_or_down")
 
     signal["score"]        = score
     signal["score_detail"] = details
@@ -385,30 +416,21 @@ def evaluate_bracket(
     yes_ask = bracket.get("ob_yes_ask")
     no_ask  = bracket.get("ob_no_ask")
 
-    if is_forecast_bracket and score >= 2 and yes_ask is not None:
-        signal["trade_type"]  = "YES"
-        signal["entry_price"] = yes_ask
-        signal["exit_target"] = round(yes_ask * (1 + YES_EXIT_TARGET), 2)
-        signal["stop_loss"]   = round(yes_ask * (1 - YES_STOP_LOSS),   2)
-
-    elif (
-        not is_forecast_bracket
-        and no_ask is not None
+    if (
+        no_ask is not None
         and NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE
         and yes_ask is not None
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
     ):
-        if no_ask < 0.75 and signal.get("score", 0) < 3:
-            signal["trade_type"]  = None
+        if no_ask < 0.75 and score < 3:
             signal["skip_reason"] = (
                 f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
-                f"(got {signal.get('score', 0)}/3)"
+                f"(got {score}/3)"
             )
         else:
             signal["trade_type"]    = "NO"
             signal["entry_price"]   = no_ask
-            signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
             signal["stop_loss"]     = None
             signal["max_contracts"] = MAX_CONTRACTS
 
@@ -420,10 +442,10 @@ def evaluate_bracket(
 # ---------------------------------------------------------------------------
 
 def evaluate_city(
-    city:      str,
-    nws_data:  dict,
-    scan_data: dict,
-    profiles:  dict,
+    city:        str,
+    nws_data:    dict,
+    scan_data:   dict,
+    profiles:    dict,
     market_type: str = "high",
 ) -> dict:
     """
@@ -466,32 +488,43 @@ def evaluate_city(
         result["error"] = "No forecast high — NWS grid not cached yet (will retry next poll)"
         return result
 
-    # Look up per-city entry window start from cities.py
-    trade_start = _trade_start_for(city, market_type)
+    # Resolve per-city bias and dynamic buffer
+    city_bias      = _city_bias(city)
+    dyn_buffer     = _dynamic_buffer(city, profiles)
+    trade_start    = _trade_start_for(city, market_type)
 
-    forecast_bracket = get_forecast_bracket(forecast_high, brackets)
+    # Identify the forecast bracket so we can skip it — we only trade NO on non-forecast brackets
+    corrected_forecast = forecast_high + city_bias
+    forecast_bracket   = get_forecast_bracket(corrected_forecast, brackets)
+
+    result["city_bias"]      = city_bias
+    result["dynamic_buffer"] = dyn_buffer
 
     for bracket in brackets:
+        # Skip the forecast bracket — we don't trade YES, and NO on the
+        # forecast bracket is the highest-risk position (most likely to resolve YES)
         is_forecast = (
             forecast_bracket is not None
             and bracket["ticker"] == forecast_bracket["ticker"]
         )
+        if is_forecast:
+            continue
+
         signal = evaluate_bracket(
-            bracket             = bracket,
-            forecast_high       = forecast_high,
-            observed_high       = observed_high,
-            city_local_hour     = city_local_hour,
-            is_forecast_bracket = is_forecast,
-            trade_start_hour    = trade_start,
+            bracket          = bracket,
+            forecast_high    = forecast_high,
+            observed_high    = observed_high,
+            city_local_hour  = city_local_hour,
+            trade_start_hour = trade_start,
+            city_bias        = city_bias,
+            dynamic_buffer   = dyn_buffer,
         )
         if signal:
             result["signals"].append(signal)
 
-    # Limit NO signals to MAX_NO_PER_CITY, keeping those furthest from forecast
+    # Limit NO signals to MAX_NO_PER_CITY, keeping those furthest from corrected forecast
     no_signals = [s for s in result["signals"] if s.get("trade_type") == "NO"]
     if len(no_signals) > MAX_NO_PER_CITY:
-        corrected_forecast = (forecast_high or 0) + FORECAST_BIAS_CORRECTION
-
         def distance_from_forecast(signal):
             floor = signal.get("floor")
             cap   = signal.get("cap")
@@ -534,39 +567,9 @@ def run(city_filter: str = None, paper: bool = False) -> list[dict]:
     evaluations = []
 
     for city in list(nws_results.keys()):
-        nws_data  = nws_results.get(city, {})
-        scan_data = kalshi_results.get(city, {})
+        nws_data    = nws_results.get(city, {})
+        scan_data   = kalshi_results.get(city, {})
         eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="high")
-        evaluations.append(eval_result)
-
-    return evaluations
-
-
-def run_lowt_observe(city_filter: str = None) -> list[dict]:
-    """
-    Scan LOWT markets and evaluate signals — but mark all as observe-only.
-    No orders will ever be placed from these evaluations.
-    """
-    profiles = load_profiles()
-
-    nws_results    = nws_feed.snapshot(city_filter)
-    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="low")
-
-    evaluations = []
-    for city, nws_data in nws_results.items():
-        scan_data = kalshi_results.get(city, {})
-        if not scan_data or scan_data.get("error"):
-            continue
-
-        eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="lowt")
-
-        for signal in eval_result.get("signals", []):
-            if signal.get("trade_type"):
-                signal["observe_only"] = True
-                signal["skip_reason"]  = "LOWT observe-only mode"
-                signal["trade_type"]   = None
-
-        eval_result["market_type"] = "lowt"
         evaluations.append(eval_result)
 
     return evaluations
@@ -578,8 +581,11 @@ def run_lowt_observe(city_filter: str = None) -> list[dict]:
 
 def display(evaluations: list[dict]):
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    bias_source = "per-city (forecast_bias.json)" if _FORECAST_BIAS else f"global fallback ({FORECAST_BIAS_CORRECTION:+.1f}°F)"
+
     print(f"\n{'='*72}")
     print(f"  Decision Engine  —  {now_utc}")
+    print(f"  Bias source: {bias_source}")
     print(f"{'='*72}")
 
     any_signal = False
@@ -591,13 +597,22 @@ def display(evaluations: list[dict]):
             print(f"\n{city}: ERROR — {ev['error']}")
             continue
 
-        snap = ev["nws_snapshot"]
+        snap        = ev["nws_snapshot"]
         trade_start = _trade_start_for(city)
-        print(f"\n{city}  |  local: {snap.get('local_time','?')}  "
-              f"curr: {fmt(snap.get('current_temp_f'))}°  "
-              f"obs_hi: {fmt(snap.get('observed_high_f'))}°  "
-              f"fcst_hi: {fmt(snap.get('forecast_high_f'))}°  "
-              f"window: {trade_start:02d}:00+")
+        bias        = ev.get("city_bias", FORECAST_BIAS_CORRECTION)
+        bias_std    = _city_bias_stddev(city)
+        buf         = ev.get("dynamic_buffer", BOUNDARY_BUFFER_FALLBACK)
+
+        fmt = lambda v: f"{v:.1f}" if v is not None else "N/A"
+        std_str = f" ±{bias_std:.1f}" if bias_std > 0 else ""
+        print(
+            f"\n{city}  |  local: {snap.get('local_time','?')}  "
+            f"curr: {fmt(snap.get('current_temp_f'))}°  "
+            f"obs_hi: {fmt(snap.get('observed_high_f'))}°  "
+            f"fcst_hi: {fmt(snap.get('forecast_high_f'))}°  "
+            f"bias: {bias:+.2f}{std_str}°  buf: {buf}°  "
+            f"window: {trade_start:02d}:00+"
+        )
 
         active_signals = [s for s in ev["signals"] if s.get("trade_type")]
         skipped        = [s for s in ev["signals"] if not s.get("trade_type")]
@@ -608,8 +623,8 @@ def display(evaluations: list[dict]):
             continue
 
         any_signal = True
-        print(f"  {'Bracket':<22} {'Type':>5} {'Entry':>7} {'Target':>8} {'Score':>6}  Details")
-        print(f"  {'-'*68}")
+        print(f"  {'Bracket':<22} {'Type':>5} {'Entry':>7} {'Score':>6}  Details")
+        print(f"  {'-'*60}")
 
         for s in active_signals:
             floor = s.get("floor")
@@ -628,7 +643,6 @@ def display(evaluations: list[dict]):
                 f"  {bracket_str:<22} "
                 f"{s['trade_type']:>5} "
                 f"${s['entry_price']:.2f}  "
-                f"${s['exit_target']:.2f}    "
                 f"{s['score']}/3    "
                 f"{detail_str}"
             )
@@ -636,11 +650,6 @@ def display(evaluations: list[dict]):
     print(f"\n{'='*72}")
     if not any_signal:
         print("  No actionable signals at this time.")
-    print(f"  Bias correction applied: {FORECAST_BIAS_CORRECTION:+.1f}°F to all NWS forecasts")
-
-
-def fmt(val) -> str:
-    return f"{val:.1f}" if val is not None else "N/A"
 
 
 # ---------------------------------------------------------------------------
