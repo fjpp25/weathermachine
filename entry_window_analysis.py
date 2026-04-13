@@ -21,6 +21,21 @@ Usage:
   python entry_window_analysis.py --trades data/trades.csv
   python entry_window_analysis.py --type high
   python entry_window_analysis.py --min-days 5   # skip cities with < N data-days
+  python entry_window_analysis.py --city "New York" --verbose
+
+Schema note
+-----------
+Handles both observation CSV schemas transparently:
+
+  Old schema (lowt_observer.py before Apr 7 2026):
+    observed_f, forecast_f   — generic field, meaning depends on market_type
+
+  New schema (lowt_observer.py after Apr 7 2026 fix):
+    observed_high_f, forecast_high_f  — for HIGH market rows
+    observed_low_f,  forecast_low_f   — for LOWT market rows
+
+Both are normalised to observed_f / forecast_f internally so all
+downstream analysis code is unchanged.
 """
 
 import csv
@@ -52,6 +67,49 @@ OUTPUT_DAILY = Path("data/entry_window_daily.csv")
 # Loader
 # ---------------------------------------------------------------------------
 
+def _normalise_obs_fields(r: dict) -> dict:
+    """
+    Normalise observed/forecast temperature fields to the canonical internal
+    names (observed_f, forecast_f) regardless of which CSV schema the row
+    came from.
+
+    Old schema  : observed_f / forecast_f  (single generic field per row)
+    New schema  : observed_high_f + forecast_high_f  for HIGH rows
+                  observed_low_f  + forecast_low_f   for LOWT rows
+
+    The new schema was introduced when lowt_observer.py was updated to write
+    explicit field names per market type. Both schemas coexist in the same
+    file during the transition period, so this function handles either.
+    """
+    mtype = r.get("market_type", "")
+
+    # Detect new schema by presence of any of the explicit column names.
+    # An empty string from the CSV counts as "present but null" — we still
+    # treat it as new schema and let the float-parse below handle the null.
+    has_new_schema = (
+        "observed_high_f" in r or
+        "observed_low_f"  in r or
+        "forecast_high_f" in r or
+        "forecast_low_f"  in r
+    )
+
+    if has_new_schema:
+        if mtype == "high":
+            raw_obs  = r.get("observed_high_f") or ""
+            raw_fcst = r.get("forecast_high_f") or ""
+        else:
+            raw_obs  = r.get("observed_low_f")  or ""
+            raw_fcst = r.get("forecast_low_f")  or ""
+    else:
+        # Old schema — fields already named observed_f / forecast_f
+        raw_obs  = r.get("observed_f")  or ""
+        raw_fcst = r.get("forecast_f")  or ""
+
+    r["observed_f"] = float(raw_obs)  if raw_obs  else None
+    r["forecast_f"] = float(raw_fcst) if raw_fcst else None
+    return r
+
+
 def load_observations(path: Path) -> list[dict]:
     rows = []
     with open(path, newline="", encoding="utf-8") as f:
@@ -60,13 +118,15 @@ def load_observations(path: Path) -> list[dict]:
             if not r.get("market_type") or not r.get("yes_price"):
                 continue
             try:
-                r["yes_price"]   = float(r["yes_price"])
-                r["no_price"]    = float(r["no_price"])   if r["no_price"]   else 0.0
-                r["local_hour"]  = int(r["local_hour"])
-                r["observed_f"]  = float(r["observed_f"]) if r["observed_f"] else None
-                r["forecast_f"]  = float(r["forecast_f"]) if r["forecast_f"] else None
-                r["volume"]      = float(r["volume"])      if r["volume"]     else 0.0
-                r["date"]        = r["poll_time_utc"][:10]
+                r["yes_price"]  = float(r["yes_price"])
+                r["no_price"]   = float(r["no_price"])  if r.get("no_price")  else 0.0
+                r["local_hour"] = int(r["local_hour"])
+                r["volume"]     = float(r["volume"])    if r.get("volume")    else 0.0
+                r["date"]       = r["poll_time_utc"][:10]
+
+                # Normalise observed/forecast fields — handles both schemas
+                r = _normalise_obs_fields(r)
+
                 rows.append(r)
             except (ValueError, KeyError):
                 continue
@@ -152,10 +212,36 @@ def analyse_city(
             if fcsts:
                 forecasts_per_poll.append(mean(fcsts))
 
-        # Forecast instability: std dev of forecast across polls in this hour
-        fcst_instability = stdev(forecasts_per_poll) if len(forecasts_per_poll) >= 2 else 0.0
+        # Forecast instability: mean intra-day forecast swing within this hour.
+        #
+        # Old approach (broken): stddev of forecast across ALL polls at this hour,
+        # which mixes polls from different days — dominated by day-to-day temperature
+        # variance (e.g. Chicago swings 40°F across April) and not by genuine NWS
+        # model-run noise. Result: every hour flagged ⚠ for volatile cities.
+        #
+        # New approach: for each day separately, compute max-min of forecast values
+        # observed at this local hour. Average those per-day swings across all days.
+        # This measures "how much does the forecast revise within one hour of trading,
+        # on a typical day?" — which is the actual risk we care about.
+        # A swing >= RISKY_FORECAST_SWING°F on average means NWS is still actively
+        # updating its model during this hour and entry prices are unreliable.
+        daily_swings = []
+        for date in dates:
+            day_fcsts = []
+            for pt, pt_rows in polls.items():
+                if pt[:10] != date:
+                    continue
+                fcsts = [r["forecast_f"] for r in pt_rows if r["forecast_f"] is not None]
+                if fcsts:
+                    day_fcsts.append(mean(fcsts))
+            if len(day_fcsts) >= 2:
+                daily_swings.append(max(day_fcsts) - min(day_fcsts))
+            elif len(day_fcsts) == 1:
+                daily_swings.append(0.0)   # single poll — no swing evidence
 
-        # Average forecast level
+        fcst_instability = round(mean(daily_swings), 2) if daily_swings else 0.0
+
+        # Average forecast level (still uses cross-poll mean — fine for display)
         avg_forecast = mean(forecasts_per_poll) if forecasts_per_poll else None
 
         by_hour[h] = {
@@ -298,8 +384,8 @@ def print_city_report(result: dict):
     print(f"\n{'─'*80}")
     print(f"  {city}  [{mtype}]  —  {n_days} day(s) of data")
     print(f"{'─'*80}")
-    print(f"  Convergence hour : {fmt_hour(conv_hr)}")
-    print(f"  Unstable fcst    : {[fmt_hour(h) for h in unstable] or 'none'}")
+    print(f"  Convergence hour   : {fmt_hour(conv_hr)}")
+    print(f"  Unstable fcst hrs  : {[fmt_hour(h) for h in unstable] or 'none'}")
     print(f"  Recommended window : {fmt_hour(rec_start)} – {fmt_hour(rec_end)}")
     if n_days < 5:
         print(f"  ⚠  LOW CONFIDENCE — only {n_days} day(s). Collect ≥5 days before relying on this.")
@@ -368,7 +454,7 @@ def print_summary_table(results: list[dict]):
               f"{'; '.join(notes)[:40]}")
 
     print(f"\n  ► = hour is within recommended window")
-    print(f"  ⚠ fcst = NWS forecast swings ≥{RISKY_FORECAST_SWING}°F in this hour (risky entry)")
+    print(f"  ⚠ fcst = avg intra-day forecast swing ≥{RISKY_FORECAST_SWING}°F at this hour (NWS still updating)")
     print(f"  ✗ conv = leading bracket already ≥{CONVERGENCE_THRESHOLD:.0%} YES (market decided)")
     print(f"  ✗ sig  = < 1 tradeable NO signal on average")
     print()
@@ -415,6 +501,8 @@ def write_daily_csv(results: list[dict], path: Path):
                 "in_rec_window":    in_rec,
                 "convergence_hour": r["convergence_hour"],
             })
+    if not rows:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
@@ -428,18 +516,20 @@ def write_daily_csv(results: list[dict], path: Path):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Entry window analysis for Kalshi temperature markets")
-    parser.add_argument("--obs",       type=Path, default=INPUT_OBS,
+    parser = argparse.ArgumentParser(
+        description="Entry window analysis for Kalshi temperature markets"
+    )
+    parser.add_argument("--obs",      type=Path, default=INPUT_OBS,
                         help=f"Path to lowt_observations.csv (default: {INPUT_OBS})")
-    parser.add_argument("--trades",    type=Path, default=None,
-                        help="Path to trades CSV from pnl_registry.py (optional)")
-    parser.add_argument("--type",      choices=["high", "lowt", "both"], default="both",
+    parser.add_argument("--trades",   type=Path, default=None,
+                        help="Path to trades CSV (optional — overlays win rates per hour)")
+    parser.add_argument("--type",     choices=["high", "lowt", "both"], default="both",
                         help="Market type to analyse (default: both)")
-    parser.add_argument("--min-days",  type=int, default=1,
+    parser.add_argument("--min-days", type=int, default=1,
                         help="Minimum data-days required per city (default: 1)")
-    parser.add_argument("--city",      type=str, default=None,
-                        help="Filter to one city")
-    parser.add_argument("--verbose",   action="store_true",
+    parser.add_argument("--city",     type=str, default=None,
+                        help="Filter to one city (e.g. 'New York')")
+    parser.add_argument("--verbose",  action="store_true",
                         help="Print per-hour detail for every city")
     args = parser.parse_args()
 
@@ -449,6 +539,12 @@ def main():
     print(f"\nLoading observations from {args.obs}...")
     obs    = load_observations(args.obs)
     trades = load_trades(args.trades) if args.trades else []
+
+    # Report schema mix so the user knows what's in the file
+    new_schema = sum(1 for r in obs if r.get("observed_f") is not None
+                     and ("observed_high_f" in r or "observed_low_f" in r
+                          or r.get("observed_f") is not None))
+    print(f"  {len(obs):,} rows loaded.")
 
     cities = sorted({r["city"] for r in obs})
     if args.city:
@@ -460,7 +556,7 @@ def main():
     if args.type in ("lowt", "both"):
         types.append("lowt")
 
-    print(f"Analysing {len(cities)} cities × {len(types)} market type(s)...\n")
+    print(f"  Analysing {len(cities)} cities × {len(types)} market type(s)...\n")
 
     results = []
     for city in cities:
