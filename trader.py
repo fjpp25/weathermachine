@@ -660,6 +660,15 @@ SETTLEMENT_CLEAR_BUFFER = 5.0   # °F
 SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the observation
 
 
+# ---------------------------------------------------------------------------
+# Session-scoped ticker blacklist
+# Tickers added here after any exit are never re-entered within the same
+# app session. Resets naturally on restart (daily markets reset anyway).
+# ---------------------------------------------------------------------------
+
+_exited_this_session: set[str] = set()
+
+
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
     """
     Extract (floor, ceiling) from a bracket ticker suffix.
@@ -837,8 +846,11 @@ def check_exits(
             floor, ceiling = _bracket_floor_ceiling(ticker)
 
             # ── Settlement hold override ───────────────────────────────────
-            # If it's late and the observed value is well clear of the
-            # dangerous boundary, hold to settlement — don't exit early.
+            # If it's late AND the observed value is well clear of the
+            # dangerous boundary, suppress all exits and hold to settlement.
+            # This is a `continue` guard — if it fires, nothing below runs.
+            # If it doesn't fire (obs not clear enough), all checks below
+            # still run normally regardless of the hour.
             if local_hour >= SETTLEMENT_HOLD_HOUR and obs_val is not None:
                 if not is_lowt and floor is not None:
                     # HIGH: safe if observed high is well below bracket floor
@@ -858,7 +870,9 @@ def check_exits(
                         continue
 
             # ── Probability ceiling ────────────────────────────────────────
-            elif yes_price >= NO_YES_CEILING:
+            # Runs at any hour — if YES crosses 50¢ the thesis is dead
+            # regardless of time of day or obs clearance.
+            if yes_price >= NO_YES_CEILING:
                 exit_reason = "yes_ceiling"
                 exit_price  = no_price
                 print(f"  YES CEILING: {ticker}  YES={yes_price:.2f} ≥ {NO_YES_CEILING:.2f}  "
@@ -866,17 +880,29 @@ def check_exits(
                       f"thesis dead — market says coin flip")
 
             # ── Forecast anchor ────────────────────────────────────────────
-            elif obs_val is not None:
+            # Runs at any hour — a dangerous obs reading demands an exit
+            # even late in the day (especially late in the day).
+            #
+            # HIGH guard: only fire if obs_val < ceiling (bracket's upper edge).
+            # If obs_high is already above the cap, the bracket is physically
+            # eliminated — the day's high can't un-happen. Firing the anchor in
+            # that case causes false exits on winning positions (Denver bug).
+            # When obs >= cap, the settlement hold or normal expiry handles it.
+            if exit_reason is None and obs_val is not None:
                 anchor_triggered = False
                 if not is_lowt and floor is not None:
-                    # HIGH: dangerous if observed high approaching bracket floor
-                    gap = floor - obs_val
-                    if gap <= FORECAST_ANCHOR_BUFFER:
-                        anchor_triggered = True
-                        print(f"  FORECAST ANCHOR: {ticker}  "
-                              f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F")
+                    # HIGH: dangerous if observed high approaching bracket floor,
+                    # BUT only while obs hasn't yet cleared the bracket cap.
+                    _cap = ceiling if ceiling is not None else round(floor + 2.0, 1)
+                    if obs_val < _cap:
+                        gap = floor - obs_val
+                        if gap <= FORECAST_ANCHOR_BUFFER:
+                            anchor_triggered = True
+                            print(f"  FORECAST ANCHOR: {ticker}  "
+                                  f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F")
                 elif is_lowt and ceiling is not None:
-                    # LOWT: dangerous if observed low approaching bracket ceiling
+                    # LOWT: dangerous if observed low approaching (or below) bracket ceiling.
+                    # Negative gap is correct here — obs already below cap means YES resolving.
                     gap = obs_val - ceiling
                     if gap <= FORECAST_ANCHOR_BUFFER:
                         anchor_triggered = True
@@ -921,6 +947,7 @@ def check_exits(
                         paper         = False,
                     )
                     exited[ticker] = "Stopped Out"
+                    _exited_this_session.add(ticker)
                     print(f"  Exit order placed: {ticker} SELL {side.upper()} "
                           f"@ ${exit_price:.2f}  reason={exit_reason}")
                 except Exception as e:
@@ -928,6 +955,7 @@ def check_exits(
                     continue
             else:
                 exited[ticker] = "Stopped Out"
+                _exited_this_session.add(ticker)
                 print(f"    [PAPER] Would exit {ticker} SELL {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
 
@@ -1013,6 +1041,11 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             side      = signal["trade_type"].lower()
             price     = signal["entry_price"]
             ticker    = signal["ticker"]
+
+            # Same-ticker cooldown: never re-enter a ticker exited this session
+            if ticker in _exited_this_session:
+                print(f"  Skipping {ticker} — exited this session (cooldown)")
+                continue
 
             # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets
             max_per_city = signal.get("max_contracts", 2)

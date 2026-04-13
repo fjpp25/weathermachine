@@ -3,12 +3,15 @@ nws_feed.py
 -----------
 Fetches live data for each Kalshi settlement station:
 
-  1. current_temp_f   : Latest observed temperature (°F) at the ASOS station
-  2. forecast_high_f  : NWS forecast high for today (°F)
-  3. forecast_low_f   : NWS forecast low for today (°F)
-  4. observed_high_f  : Highest temperature observed so far today (°F)
-  5. observed_low_f   : Lowest temperature observed so far today (°F)
-  6. as_of_utc        : Timestamp of the latest observation (UTC ISO string)
+  1. current_temp_f    : Latest observed temperature (°F) at the ASOS station
+  2. forecast_high_f   : NWS forecast high for today (°F)
+  3. forecast_low_f    : NWS forecast low for today (°F)
+  4. observed_high_f   : Highest temperature observed so far today (°F)
+  5. observed_low_f    : Lowest temperature observed so far today (°F)
+  6. as_of_utc         : Timestamp of the latest observation (UTC ISO string)
+  7. forecast_issued_at: When the NWS forecast grid was last issued (UTC ISO string)
+  8. hazards           : List of currently active NWS hazard codes (e.g. ["FF.A", "TO.W"])
+                         Empty list if no active hazards.
 
 All data comes from api.weather.gov — no API key required.
 
@@ -16,7 +19,8 @@ Endpoints used:
   - /stations/{ICAO}/observations/latest       → current observation
   - /stations/{ICAO}/observations?limit=48     → today's observed high/low
   - /points/{lat},{lon}                        → resolves forecast grid URL
-  - /gridpoints/{office}/{x},{y}/forecast      → today's forecast high/low
+  - /gridpoints/{office}/{x},{y}/forecast      → today's forecast high/low + updateTime
+  - /gridpoints/{office}/{x},{y}               → active hazards layer
 
 The /points lookup result is cached per city (it never changes) to avoid
 redundant calls. Only observations and forecasts are re-fetched each poll.
@@ -248,9 +252,18 @@ def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
     The forecast periods alternate Day/Night. We want:
       - high: the first daytime period for today
       - low:  the first nighttime period for today
+
+    Also captures updateTime from the response properties — this is when
+    the NWS forecast office last issued this grid, used to compute forecast
+    age at analysis time (forecast_age_hours = poll_time - forecast_issued_at).
     """
     data    = get(forecast_url)
-    periods = data["properties"]["periods"]
+    props   = data["properties"]
+    periods = props["periods"]
+
+    # Forecast vintage: when the NWS forecast office last issued this grid.
+    # ISO 8601 UTC string, e.g. "2026-04-13T06:38:15+00:00"
+    forecast_issued_at = props.get("updateTime")
 
     local_tz   = ZoneInfo(tz_name)
     today_date = datetime.now(local_tz).date()
@@ -275,9 +288,84 @@ def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
             forecast_low = c_to_f(temp) if unit == "C" else float(temp)
 
     return {
-        "forecast_high_f": forecast_high,
-        "forecast_low_f":  forecast_low,
+        "forecast_high_f":    forecast_high,
+        "forecast_low_f":     forecast_low,
+        "forecast_issued_at": forecast_issued_at,
     }
+
+
+def _parse_iso8601_duration(duration: str) -> timedelta:
+    """
+    Parse a basic ISO 8601 duration string into a timedelta.
+    Handles the subset returned by NWS: PT6H, PT12H, P1D, P1DT12H, etc.
+    Returns timedelta(0) for unrecognised formats.
+    """
+    import re
+    pattern = re.compile(
+        r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?)?$"
+    )
+    m = pattern.match(duration)
+    if not m:
+        return timedelta(0)
+    days    = int(m.group(1) or 0)
+    hours   = int(m.group(2) or 0)
+    minutes = int(m.group(3) or 0)
+    return timedelta(days=days, hours=hours, minutes=minutes)
+
+
+def fetch_hazards(office: str, grid_x: int, grid_y: int) -> list[str]:
+    """
+    Fetch currently active NWS hazard codes for a gridpoint.
+
+    Returns a list of strings like ["FF.A", "TO.W"] — phenomenon.significance —
+    for any hazard whose validTime interval covers the current UTC moment.
+    Returns an empty list if no active hazards or if the fetch fails.
+
+    Common codes:
+      FF.A  Flash Flood Watch       SV.W  Severe Thunderstorm Warning
+      FF.W  Flash Flood Warning     TO.A  Tornado Watch
+      HT.Y  Heat Advisory           TO.W  Tornado Warning
+      EH.W  Excessive Heat Warning  WS.W  Winter Storm Warning
+      WI.Y  Wind Advisory           BZ.W  Blizzard Warning
+    """
+    url = f"{API_BASE}/gridpoints/{office}/{grid_x},{grid_y}"
+    try:
+        data   = get(url)
+        values = data["properties"].get("hazards", {}).get("values", [])
+    except Exception as e:
+        print(f"  [hazards] Fetch failed for {office}/{grid_x},{grid_y}: {e}")
+        return []
+
+    now    = datetime.now(timezone.utc)
+    active = []
+
+    for entry in values:
+        valid_time = entry.get("validTime", "")
+        hazard_list = entry.get("value", [])
+        if not hazard_list:
+            continue
+
+        # validTime format: "2026-04-13T10:00:00+00:00/PT12H"
+        try:
+            start_str, duration_str = valid_time.split("/")
+            start    = datetime.fromisoformat(start_str)
+            duration = _parse_iso8601_duration(duration_str)
+            end      = start + duration
+        except Exception:
+            continue
+
+        if not (start <= now < end):
+            continue
+
+        for hazard in hazard_list:
+            phenomenon   = hazard.get("phenomenon", "")
+            significance = hazard.get("significance", "")
+            if phenomenon and significance:
+                code = f"{phenomenon}.{significance}"
+                if code not in active:
+                    active.append(code)
+
+    return active
 
 
 # ---------------------------------------------------------------------------
@@ -311,15 +399,28 @@ def snapshot(city_filter: str = None) -> dict:
             forecast_url = get_forecast_url(city, meta, grid_cache)
             if forecast_url:
                 fcst = fetch_forecast_high_low(forecast_url, meta["tz"])
-                result.update(fcst)
+                result.update(fcst)   # spreads forecast_high_f, forecast_low_f, forecast_issued_at
             else:
-                result["forecast_high_f"] = None
-                result["forecast_low_f"]  = None
+                result["forecast_high_f"]    = None
+                result["forecast_low_f"]     = None
+                result["forecast_issued_at"] = None
+
+            # Hazards — requires grid coordinates from cache
+            city_cache = grid_cache.get(city, {})
+            if city_cache.get("office") and city_cache.get("grid_x") is not None:
+                result["hazards"] = fetch_hazards(
+                    city_cache["office"],
+                    city_cache["grid_x"],
+                    city_cache["grid_y"],
+                )
+            else:
+                result["hazards"] = []
 
             result["error"] = None
 
         except Exception as e:
-            result["error"] = str(e)
+            result["error"]   = str(e)
+            result["hazards"] = []
 
         local_now_dt = local_now(meta["tz"])
         lst_tz       = timezone(timedelta(hours=meta["lst_offset"]))

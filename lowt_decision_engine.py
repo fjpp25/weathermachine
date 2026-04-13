@@ -71,6 +71,29 @@ from cities import CITIES as _CITY_REGISTRY
 # Pilot city whitelist — expand after edge confirmed
 LOWT_CITIES: set[str] = {"New York", "Los Angeles", "Chicago"}
 
+# Timing — LOWT markets close at 10am ET regardless of city.
+# trade_end_lowt in cities.py converts this to city local time with a 1hr buffer.
+# No global start floor — overnight entries are the whole thesis for LOWT.
+TRADE_WINDOW_END_LOWT = 24   # fallback only — cities.py trade_end_lowt overrides this
+
+
+def _trade_end_for_lowt(city: str) -> int:
+    """
+    Return the latest local hour for LOWT entries for a city.
+    Uses trade_end_lowt from cities.py. Falls back to TRADE_WINDOW_END_LOWT.
+
+    These values reflect the 10am ET Kalshi market close, converted to
+    city local time with a 1-hour buffer:
+      ET cities (NY, MIA, PHI, ATL, BOS, DC): 9
+      CT cities (CHI, AUS, DAL, HOU, OKC):    8
+      MT cities (DEN):                         7
+      PT cities (LA, LV, SEA):                 6
+    """
+    per_city = _CITY_REGISTRY.get(city, {}).get("trade_end_lowt")
+    if per_city is not None:
+        return per_city
+    return TRADE_WINDOW_END_LOWT
+
 # Liquidity
 MAX_SPREAD      = 0.05   # max bid-ask spread ($)
 MIN_DEPTH_LOWT  = 100    # min contracts on buying side
@@ -308,13 +331,26 @@ def evaluate_city_lowt(
         result["error"] = f"Kalshi error: {scan_data['error']}"
         return result
 
-    current_temp = nws_data.get("current_temp_f")
-    observed_low = nws_data.get("observed_low_f")
-    forecast_low = nws_data.get("forecast_low_f")
-    brackets     = scan_data.get("brackets", [])
+    current_temp     = nws_data.get("current_temp_f")
+    observed_low     = nws_data.get("observed_low_f")
+    forecast_low     = nws_data.get("forecast_low_f")
+    city_local_hour  = nws_data.get("city_local_hour", 0)
+    brackets         = scan_data.get("brackets", [])
 
     if current_temp is None and observed_low is None:
         result["error"] = "No temperature data available"
+        return result
+
+    # --- Timing gate: enforce market close window ---
+    # LOWT markets close at 10am ET. trade_end_lowt in cities.py converts
+    # this to city local time with a 1-hour buffer. No start gate — overnight
+    # entries are valid and are the primary thesis for LOWT markets.
+    trade_end = _trade_end_for_lowt(city)
+    if city_local_hour >= trade_end:
+        result["error"] = (
+            f"Past LOWT entry window (local hour={city_local_hour}, "
+            f"close={trade_end:02d}:00 — market expires 10am ET)"
+        )
         return result
 
     for bracket in brackets:
@@ -402,14 +438,16 @@ def display(evaluations: list[dict]):
             print(f"\n{city}: SKIP — {ev['error']}")
             continue
 
-        snap = ev["nws_snapshot"]
-        fmt  = lambda v: f"{v:.1f}" if v is not None else "N/A"
+        snap      = ev["nws_snapshot"]
+        trade_end = _trade_end_for_lowt(city)
+        fmt       = lambda v: f"{v:.1f}" if v is not None else "N/A"
 
         print(
             f"\n{city}  |  local: {snap.get('local_time','?')}  "
             f"curr: {fmt(snap.get('current_temp_f'))}°  "
             f"obs_lo: {fmt(snap.get('observed_low_f'))}°  "
-            f"fcst_lo: {fmt(snap.get('forecast_low_f'))}°"
+            f"fcst_lo: {fmt(snap.get('forecast_low_f'))}°  "
+            f"close: {trade_end:02d}:00"
         )
 
         active_signals = [s for s in ev["signals"] if s.get("trade_type")]

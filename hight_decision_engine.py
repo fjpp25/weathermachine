@@ -50,10 +50,14 @@ from cities import CITIES as _CITY_REGISTRY
 # ---------------------------------------------------------------------------
 
 # Gate thresholds
-TRADE_WINDOW_START  = 6        # local hour — no trading before 6am (obs signals meaningless overnight)
-                               # Early enough to catch first morning obs + NWS forecast (~7am)
-TRADE_WINDOW_END    = 24       # local hour — no hard close (scheduler handles late-day tapering)
-                               # To re-enable: set TRADE_WINDOW_END = 14
+TRADE_WINDOW_START  = 9        # local hour — global floor, no trading before 9am.
+                               # Before 9am the NWS morning forecast hasn't settled and
+                               # there's no meaningful obs signal to confirm direction.
+                               # Per-city trade_start_high values in cities.py override
+                               # this upward (e.g. Chicago=10 for forecast stability).
+TRADE_WINDOW_END    = 24       # local hour — no global hard close needed.
+                               # Per-city trade_end_high values in cities.py control close.
+                               # Price gate ($0.75–$0.92) and date filter handle edge cases.
 MAX_SPREAD          = 0.05     # max acceptable bid-ask spread ($)
                                # relaxed from 0.03 — was blocking too many valid signals
 MIN_DEPTH           = 500      # min contracts on the side we're buying
@@ -205,16 +209,31 @@ PAUSED_CITIES: set[str] = _build_paused_cities()
 
 def _trade_start_for(city: str, market_type: str = "high") -> int:
     """
-    Return the earliest local hour for entering HIGH trades.
+    Return the earliest local hour for HIGH entries for a city.
 
-    Previously used per-city calibrated values from cities.py. Replaced with
-    a single global floor (TRADE_WINDOW_START = 6) — the per-city values were
-    calibrated for forecast-only signals and were too conservative once
-    obs_eliminates_bracket became a first-class signal.
-
-    Returns TRADE_WINDOW_START for all cities.
+    Uses the per-city trade_start_high value from cities.py, with
+    TRADE_WINDOW_START (9am) as the global floor. No city should
+    start before 9am — before that the NWS forecast is still
+    settling from the overnight model run and obs signals are sparse.
     """
+    per_city = _CITY_REGISTRY.get(city, {}).get("trade_start_high")
+    if per_city is not None:
+        return max(per_city, TRADE_WINDOW_START)
     return TRADE_WINDOW_START
+
+
+def _trade_end_for(city: str, market_type: str = "high") -> int:
+    """
+    Return the latest local hour for HIGH entries for a city.
+
+    Uses the per-city trade_end_high value from cities.py.
+    Falls back to TRADE_WINDOW_END (24) if not set — the price gate
+    and date filter prevent bad late entries in that case.
+    """
+    per_city = _CITY_REGISTRY.get(city, {}).get("trade_end_high")
+    if per_city is not None:
+        return per_city
+    return TRADE_WINDOW_END
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +315,7 @@ def evaluate_bracket(
     observed_high:    float | None,
     city_local_hour:  int,
     trade_start_hour: int,
+    trade_end_hour:   int,
     city_bias:        float,
     dynamic_buffer:   float,
 ) -> dict:
@@ -309,7 +329,8 @@ def evaluate_bracket(
         forecast_high:    Raw NWS forecast high (°F) — bias correction applied internally.
         observed_high:    Observed high so far today (°F), or None if not yet available.
         city_local_hour:  Current local hour for the city.
-        trade_start_hour: Earliest local hour for entering trades (global floor, currently 6am).
+        trade_start_hour: Earliest local hour for entering trades (per-city, floor 9am).
+        trade_end_hour:   Latest local hour for entering trades (per-city from cities.py).
         city_bias:        Per-city NWS bias correction (°F). Applied as: corrected = forecast + bias.
         dynamic_buffer:   Boundary buffer (°F) scaled to city stddev.
 
@@ -350,10 +371,10 @@ def evaluate_bracket(
         return signal
 
     # --- Gate 1: Timing — per-city entry window ---
-    if not (trade_start_hour <= city_local_hour < TRADE_WINDOW_END):
+    if not (trade_start_hour <= city_local_hour < trade_end_hour):
         signal["skip_reason"] = (
-            f"Before entry window (local hour={city_local_hour}, "
-            f"window opens at {trade_start_hour:02d}:00)"
+            f"Outside entry window (local hour={city_local_hour}, "
+            f"window={trade_start_hour:02d}:00–{trade_end_hour:02d}:00)"
         )
         return signal
 
@@ -488,10 +509,11 @@ def evaluate_city(
         result["error"] = "No forecast high — NWS grid not cached yet (will retry next poll)"
         return result
 
-    # Resolve per-city bias and dynamic buffer
+    # Resolve per-city bias, dynamic buffer, and entry window
     city_bias      = _city_bias(city)
     dyn_buffer     = _dynamic_buffer(city, profiles)
     trade_start    = _trade_start_for(city, market_type)
+    trade_end      = _trade_end_for(city, market_type)
 
     # Identify the forecast bracket so we can skip it — we only trade NO on non-forecast brackets
     corrected_forecast = forecast_high + city_bias
@@ -516,6 +538,7 @@ def evaluate_city(
             observed_high    = observed_high,
             city_local_hour  = city_local_hour,
             trade_start_hour = trade_start,
+            trade_end_hour   = trade_end,
             city_bias        = city_bias,
             dynamic_buffer   = dyn_buffer,
         )
@@ -599,6 +622,7 @@ def display(evaluations: list[dict]):
 
         snap        = ev["nws_snapshot"]
         trade_start = _trade_start_for(city)
+        trade_end   = _trade_end_for(city)
         bias        = ev.get("city_bias", FORECAST_BIAS_CORRECTION)
         bias_std    = _city_bias_stddev(city)
         buf         = ev.get("dynamic_buffer", BOUNDARY_BUFFER_FALLBACK)
@@ -611,7 +635,7 @@ def display(evaluations: list[dict]):
             f"obs_hi: {fmt(snap.get('observed_high_f'))}°  "
             f"fcst_hi: {fmt(snap.get('forecast_high_f'))}°  "
             f"bias: {bias:+.2f}{std_str}°  buf: {buf}°  "
-            f"window: {trade_start:02d}:00+"
+            f"window: {trade_start:02d}:00–{trade_end:02d}:00"
         )
 
         active_signals = [s for s in ev["signals"] if s.get("trade_type")]

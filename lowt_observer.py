@@ -60,7 +60,7 @@ CSV_FIELDS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
     "observed_high_f", "forecast_high_f",
     "observed_low_f",  "forecast_low_f",
-    "forecast_issued_at",
+    "forecast_issued_at", "hazards",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
 ]
@@ -87,9 +87,11 @@ def normalize_row(row: dict) -> dict:
     """
     # Already v2 — has at least one of the explicit fields present as a key
     if "observed_high_f" in row or "observed_low_f" in row:
-        # Ensure forecast_issued_at key exists even if absent (older v2 rows)
+        # Ensure newer fields exist even if absent (older v2 rows)
         if "forecast_issued_at" not in row:
             row = {**row, "forecast_issued_at": None}
+        if "hazards" not in row:
+            row = {**row, "hazards": []}
         return row
 
     # v1 row — promote observed_f / forecast_f to explicit fields
@@ -97,7 +99,7 @@ def normalize_row(row: dict) -> dict:
     obs_f  = row.get("observed_f")
     fcst_f = row.get("forecast_f")
 
-    upgraded = {**row, "forecast_issued_at": None}
+    upgraded = {**row, "forecast_issued_at": None, "hazards": []}
 
     if market_type == "high":
         upgraded["observed_high_f"] = obs_f
@@ -186,9 +188,10 @@ def poll_once(observations: list[dict]) -> int:
         # Pull pre-fetched NWS data — no extra HTTP calls per city.
         nws = nws_results.get(city, {})
 
-        # forecast_issued_at is shared across HIGH and LOWT for the same city
-        # since both use the same NWS grid.
+        # forecast_issued_at and hazards are shared across HIGH and LOWT for
+        # the same city since both use the same NWS grid.
         forecast_issued_at = nws.get("forecast_issued_at")
+        hazards            = nws.get("hazards", [])
 
         for market_type in ("high", "lowt"):
             series = cfg.get(f"{market_type}_series") or cfg.get(market_type)
@@ -239,6 +242,7 @@ def poll_once(observations: list[dict]) -> int:
                     "observed_low_f":     observed_low_f,
                     "forecast_low_f":     forecast_low_f,
                     "forecast_issued_at": forecast_issued_at,
+                    "hazards":            hazards,
                     "ticker":             ticker,
                     "bracket":            bracket,
                     "yes_price":          yes_price,
@@ -282,7 +286,8 @@ def poll_once(observations: list[dict]) -> int:
             except Exception:
                 pass
 
-        print(f"  {city:<14} {local_time}  obs={current_temp}°{fcst_age_str}  "
+        hazard_str = f"  ⚠ {','.join(hazards)}" if hazards else ""
+        print(f"  {city:<14} {local_time}  obs={current_temp}°{fcst_age_str}{hazard_str}  "
               f"HIGH: {hi_bracket}@{hi_pct:.0%} {hi_spread_str} vol={hi_vol:.0f}  "
               f"LOWT: {lo_bracket}@{lo_pct:.0%} {lo_spread_str} vol={lo_vol:.0f}")
 
