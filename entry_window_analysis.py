@@ -57,6 +57,20 @@ NO_MAX_ENTRY_PRICE  = 0.92
 
 CONVERGENCE_THRESHOLD = 0.80   # leading YES above this = market has decided
 RISKY_FORECAST_SWING  = 2.0    # °F — forecast change above this in one hour = unstable
+                                # Note: this metric measures intra-day revision, not forecast
+                                # quality. A stale overnight forecast scores 0 here because
+                                # it hasn't changed — not because it's accurate. Use
+                                # avg_forecast_age_h as the primary freshness gate instead.
+
+STALE_FORECAST_HOURS  = 10.0   # hours — forecasts older than this at entry are unreliable.
+                                # NWS morning update typically posts 06:00–08:00 local.
+                                # A 10h threshold clears the ~07:00 update by 09:00 at worst.
+                                # Requires forecast_issued_at field in observations (v2+ schema).
+
+TRADE_WINDOW_FLOOR    = 9      # global earliest hour floor, matching hight_decision_engine.py.
+                                # Even if forecast looks fresh and stable, don't recommend
+                                # entry before 09:00 — obs signals are sparse and the morning
+                                # NWS grid update may not have propagated to all city grids yet.
 
 INPUT_OBS    = Path("data/lowt_observations.csv")
 OUTPUT_CSV   = Path("data/entry_window_recommendations.csv")
@@ -193,6 +207,8 @@ def analyse_city(
         forecasts_per_poll   = []
         no_prices_tradeable  = []
 
+        forecast_ages_per_poll = []
+
         for pt, pt_rows in polls.items():
             # Leading bracket
             max_yes = max(r["yes_price"] for r in pt_rows)
@@ -211,6 +227,22 @@ def analyse_city(
             fcsts = [r["forecast_f"] for r in pt_rows if r["forecast_f"] is not None]
             if fcsts:
                 forecasts_per_poll.append(mean(fcsts))
+
+            # Forecast age — how old is the NWS grid at this poll?
+            # forecast_issued_at is present in v2+ rows. Missing in old data → skip.
+            issued_vals = [
+                r.get("forecast_issued_at") for r in pt_rows
+                if r.get("forecast_issued_at") and r.get("forecast_issued_at") != ""
+            ]
+            if issued_vals:
+                try:
+                    poll_dt   = datetime.fromisoformat(pt.replace("Z", "+00:00"))
+                    issued_dt = datetime.fromisoformat(issued_vals[0].replace("Z", "+00:00"))
+                    age_h = (poll_dt - issued_dt).total_seconds() / 3600
+                    if 0 <= age_h < 72:   # sanity-check: ignore implausible values
+                        forecast_ages_per_poll.append(age_h)
+                except Exception:
+                    pass
 
         # Forecast instability: mean intra-day forecast swing within this hour.
         #
@@ -244,15 +276,21 @@ def analyse_city(
         # Average forecast level (still uses cross-poll mean — fine for display)
         avg_forecast = mean(forecasts_per_poll) if forecasts_per_poll else None
 
+        avg_forecast_age_h = round(mean(forecast_ages_per_poll), 1) if forecast_ages_per_poll else None
+        forecast_stale     = (avg_forecast_age_h is not None
+                              and avg_forecast_age_h >= STALE_FORECAST_HOURS)
+
         by_hour[h] = {
-            "n_polls":          len(polls),
-            "avg_leading_yes":  mean(leading_yes_per_poll),
-            "max_leading_yes":  max(leading_yes_per_poll),
-            "avg_safe_count":   mean(safe_no_per_poll),
-            "avg_no_price":     mean(no_prices_tradeable) if no_prices_tradeable else 0.0,
-            "n_tradeable_obs":  len(no_prices_tradeable),
-            "fcst_instability": round(fcst_instability, 2),
-            "avg_forecast":     avg_forecast,
+            "n_polls":             len(polls),
+            "avg_leading_yes":     mean(leading_yes_per_poll),
+            "max_leading_yes":     max(leading_yes_per_poll),
+            "avg_safe_count":      mean(safe_no_per_poll),
+            "avg_no_price":        mean(no_prices_tradeable) if no_prices_tradeable else 0.0,
+            "n_tradeable_obs":     len(no_prices_tradeable),
+            "fcst_instability":    round(fcst_instability, 2),
+            "avg_forecast":        avg_forecast,
+            "avg_forecast_age_h":  avg_forecast_age_h,   # None if forecast_issued_at not in data
+            "forecast_stale":      forecast_stale,
         }
 
     # ── Convergence hour: first hour where avg leading YES > threshold ────
@@ -312,26 +350,33 @@ def analyse_city(
         }
 
     # ── Recommended entry window ──────────────────────────────────────────
-    # Logic: start = first hour after unstable forecast zone where safe
-    #        signals are consistently available
-    #        end   = one hour before convergence (market is deciding)
+    # Logic: start = first stable hour at or after TRADE_WINDOW_FLOOR where
+    #        signals are consistently available and forecast is fresh.
+    #        end   = one hour before convergence (market is deciding).
+    #
+    # Forecast freshness: prefer hours where avg_forecast_age_h < STALE_FORECAST_HOURS.
+    # When forecast_issued_at is absent from the data (old rows), forecast_stale=False
+    # for all hours — the filter is a no-op and we fall back to the instability metric.
 
-    # Find a stable zone: consecutive hours with
-    #   - fcst_instability < threshold
-    #   - avg_safe_count >= 1
-    #   - avg_leading_yes < convergence threshold
     candidate_hours = [
         h for h in sorted(by_hour.keys())
         if by_hour[h]["fcst_instability"] < RISKY_FORECAST_SWING
+        and not by_hour[h]["forecast_stale"]
         and by_hour[h]["avg_safe_count"] >= 1
         and by_hour[h]["avg_leading_yes"] < CONVERGENCE_THRESHOLD
-        and 6 <= h <= 20   # reasonable trading hours only
+        and TRADE_WINDOW_FLOOR <= h <= 20   # respect global engine floor; cap at 20:00
     ]
 
-    rec_start = candidate_hours[0]  if candidate_hours else None
-    rec_end   = (convergence_hour - 1) if convergence_hour is not None else None
-    if rec_end is not None and rec_start is not None and rec_end <= rec_start:
-        rec_end = rec_start + 2   # minimum 2-hour window
+    # Non-converging cities: convergence_hour is None, meaning the market never
+    # reliably decides intraday. Don't recommend entry — these cities need manual review.
+    if convergence_hour is None:
+        rec_start = None
+        rec_end   = None
+    else:
+        rec_start = candidate_hours[0]  if candidate_hours else None
+        rec_end   = (convergence_hour - 1) if convergence_hour is not None else None
+        if rec_end is not None and rec_start is not None and rec_end <= rec_start:
+            rec_end = rec_start + 2   # minimum 2-hour window
 
     return {
         "city":              city,
@@ -359,7 +404,9 @@ def fmt_hour(h: int | None) -> str:
 def risk_flag(hour_data: dict, unstable_hours: list) -> str:
     h = hour_data
     flags = []
-    if h["fcst_instability"] >= RISKY_FORECAST_SWING:
+    if h["forecast_stale"]:
+        flags.append("⚠ stale")
+    elif h["fcst_instability"] >= RISKY_FORECAST_SWING:
         flags.append("⚠ fcst")
     if h["avg_leading_yes"] >= CONVERGENCE_THRESHOLD:
         flags.append("✗ conv")
@@ -390,12 +437,19 @@ def print_city_report(result: dict):
     if n_days < 5:
         print(f"  ⚠  LOW CONFIDENCE — only {n_days} day(s). Collect ≥5 days before relying on this.")
 
+    has_ages  = any(d.get("avg_forecast_age_h") is not None for d in by_hour.values())
     has_trades = bool(trades)
+    age_col    = "  FcstAge" if has_ages else ""
     trade_cols = "  Trades  WinRate  AvgPnL" if has_trades else ""
 
+    if conv_hr is None:
+        print(f"  ⚠  NON-CONVERGING — no entry window recommended. Monitor only.")
+
     print()
-    print(f"  {'Hr':>3}  {'LeadYES':>8}  {'SafeSig':>7}  {'AvgNO':>6}  {'FcstSd':>7}  {'Status':<16}{trade_cols}")
-    print(f"  {'─'*3}  {'─'*8}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*16}", end="")
+    print(f"  {'Hr':>3}  {'LeadYES':>8}  {'SafeSig':>7}  {'AvgNO':>6}  {'FcstSd':>7}  {'Status':<18}{age_col}{trade_cols}")
+    print(f"  {'─'*3}  {'─'*8}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*18}", end="")
+    if has_ages:
+        print(f"  {'─'*7}", end="")
     if has_trades:
         print(f"  {'─'*6}  {'─'*7}  {'─'*6}", end="")
     print()
@@ -407,12 +461,18 @@ def print_city_report(result: dict):
                   and rec_start <= h <= rec_end)
         marker = "►" if in_rec else " "
 
+        age_str = ""
+        if has_ages:
+            age_val = d.get("avg_forecast_age_h")
+            age_str = f"  {age_val:>6.1f}h" if age_val is not None else "       N/A"
+
         line = (f"{marker} {h:02d}  "
                 f"{d['avg_leading_yes']:>8.0%}  "
                 f"{d['avg_safe_count']:>7.1f}  "
                 f"{d['avg_no_price']:>6.2f}  "
                 f"{d['fcst_instability']:>7.2f}  "
-                f"{status:<16}")
+                f"{status:<18}"
+                f"{age_str}")
 
         if has_trades and h in trades:
             t = trades[h]
@@ -440,10 +500,13 @@ def print_summary_table(results: list[dict]):
     for r in sorted(results, key=lambda x: (x["city"], x["market_type"])):
         warn   = "*" if r["n_days"] < 5 else " "
         notes  = []
-        if r["unstable_hours"]:
-            notes.append(f"fcst unstable {[fmt_hour(h) for h in r['unstable_hours'][:2]]}")
-        if r["convergence_hour"] is not None and r["convergence_hour"] <= 11:
-            notes.append("early convergence")
+        if r["convergence_hour"] is None:
+            notes.append("NON-CONVERGING — monitor only")
+        else:
+            if r["unstable_hours"]:
+                notes.append(f"fcst unstable {[fmt_hour(h) for h in r['unstable_hours'][:2]]}")
+            if r["convergence_hour"] is not None and r["convergence_hour"] <= 11:
+                notes.append("early convergence")
 
         print(f"  {r['city']:<16}{warn} {r['market_type'].upper():>5} "
               f"{r['n_days']:>5}  "
@@ -454,9 +517,11 @@ def print_summary_table(results: list[dict]):
               f"{'; '.join(notes)[:40]}")
 
     print(f"\n  ► = hour is within recommended window")
-    print(f"  ⚠ fcst = avg intra-day forecast swing ≥{RISKY_FORECAST_SWING}°F at this hour (NWS still updating)")
-    print(f"  ✗ conv = leading bracket already ≥{CONVERGENCE_THRESHOLD:.0%} YES (market decided)")
-    print(f"  ✗ sig  = < 1 tradeable NO signal on average")
+    print(f"  ⚠ stale = avg forecast age ≥{STALE_FORECAST_HOURS:.0f}h at this hour (pre-morning-update data)")
+    print(f"  ⚠ fcst  = avg intra-day forecast swing ≥{RISKY_FORECAST_SWING}°F (NWS actively revising)")
+    print(f"  ✗ conv  = leading bracket already ≥{CONVERGENCE_THRESHOLD:.0%} YES (market decided)")
+    print(f"  ✗ sig   = < 1 tradeable NO signal on average")
+    print(f"  Window floor: {TRADE_WINDOW_FLOOR:02d}:00 local (matches hight_decision_engine.py TRADE_WINDOW_START)")
     print()
 
 

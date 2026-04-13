@@ -641,7 +641,13 @@ YES_STOP_LOSS = 0.30   # stop loss if YES falls 30% from entry
 # but a late-day move against us is real information.
 NO_STOP_LOSS_MORNING   = 0.60   # before 11am local — hold unless catastrophic
 NO_STOP_LOSS_PEAK      = 0.40   # 11am–1pm — peak forecast uncertainty window
-NO_STOP_LOSS_AFTERNOON = 0.25   # after 1pm — observations largely in, trust the market
+NO_STOP_LOSS_AFTERNOON = 0.30   # after 1pm — observations largely in, trust the market
+                                # Was 0.25. Raised after audit showed 4 WHW exits triggered
+                                # by 21–23% intraday NO drops that fully recovered by settlement.
+                                # At 0.30, the afternoon threshold sits comfortably above the
+                                # 0.23 max drop seen on any would-have-won position.
+                                # Tradeoff: Austin B84.5 Apr-12 slips through (exits at $0.61
+                                # rather than $0.59) — cost ~$0.24 at 2 contracts.
 
 # NO position: probability ceiling
 # Exit if YES crosses this regardless of our entry price — thesis is dead.
@@ -650,7 +656,13 @@ NO_YES_CEILING = 0.50
 # NO position: forecast anchor
 # For HIGH: exit if observed high is within this many °F of the bracket floor.
 # For LOWT: exit if observed low is within this many °F of the bracket ceiling.
-FORECAST_ANCHOR_BUFFER = 3.0   # °F
+FORECAST_ANCHOR_BUFFER = 1.5   # °F — was 3.0.
+                                # Tightened after audit: 10 WHW exits were triggered by the
+                                # anchor firing when the observed high was 2–3°F below the
+                                # bracket floor, but the high subsequently peaked below the
+                                # floor (NO wins) or blasted above the ceiling (also NO wins).
+                                # At 1.5°F we only exit when the temperature is genuinely
+                                # inside the danger zone, not just approaching it.
 
 # NO position: settlement hold override
 # If the observed value is this many °F clear of the dangerous bracket boundary
@@ -897,9 +909,30 @@ def check_exits(
                     if obs_val < _cap:
                         gap = floor - obs_val
                         if gap <= FORECAST_ANCHOR_BUFFER:
-                            anchor_triggered = True
-                            print(f"  FORECAST ANCHOR: {ticker}  "
-                                  f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F")
+                            # Forecast bypass: if the corrected NWS forecast is already
+                            # well below the floor (by more than the buffer), the anchor
+                            # is a false positive — the model still thinks the high will
+                            # miss the bracket. Only fire if the forecast is ambiguous.
+                            corrected_fcst = nws.get("forecast_high_f")
+                            if corrected_fcst is not None:
+                                from hight_decision_engine import _city_bias as _get_bias
+                                try:
+                                    corrected_fcst = corrected_fcst + _get_bias(city)
+                                except Exception:
+                                    pass
+                                if corrected_fcst < floor - FORECAST_ANCHOR_BUFFER:
+                                    print(f"  ANCHOR BYPASS: {ticker}  "
+                                          f"obs_high={obs_val}°F near floor {floor}°F BUT "
+                                          f"corrected_fcst={corrected_fcst:.1f}°F is well below — holding")
+                                else:
+                                    anchor_triggered = True
+                                    print(f"  FORECAST ANCHOR: {ticker}  "
+                                          f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F  "
+                                          f"corrected_fcst={corrected_fcst:.1f}°F")
+                            else:
+                                anchor_triggered = True
+                                print(f"  FORECAST ANCHOR: {ticker}  "
+                                      f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F")
                 elif is_lowt and ceiling is not None:
                     # LOWT: dangerous if observed low approaching (or below) bracket ceiling.
                     # Negative gap is correct here — obs already below cap means YES resolving.
