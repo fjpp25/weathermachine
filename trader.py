@@ -72,11 +72,11 @@ BASE_CONTRACTS = 1
 SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
 
 # Exit monitor poll interval (seconds)
-MONITOR_INTERVAL = 60
+MONITOR_INTERVAL = 30
 
 
 # ---------------------------------------------------------------------------
-# Trade log � persists signal metadata for post-hoc score analysis
+# Trade log — persists signal metadata for post-hoc score analysis
 # ---------------------------------------------------------------------------
 
 TRADE_LOG_FILE = Path("data/trade_log.json")
@@ -432,8 +432,6 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
         contracts = int(abs(position_fp))
 
         # Opened-at timestamp: use earliest buy fill's created_time.
-        # last_updated_ts reflects when Kalshi last touched the record,
-        # not when the order was placed — so fills are more accurate.
         buy_fills = [
             f for f in fills_by_ticker.get(ticker, [])
             if f.get("action") == "buy" and f.get("side") == side
@@ -475,7 +473,6 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             unrealised_pnl = round((current_price - avg_cost) * contracts, 4)
             live           = p.get("status", "") in ("active", "initialized")
         else:
-            # No price data — PnL unknown until Kalshi posts result
             current_price  = avg_cost
             unrealised_pnl = 0.0
 
@@ -636,29 +633,120 @@ def contracts_for_signal(signal: dict) -> int:
 # Exit monitor
 # ---------------------------------------------------------------------------
 
-NO_STOP_LOSS_DROP = 0.50   # exit NO if NO price falls more than 50% from entry (e.g. $0.04 → $0.02)
-YES_EXIT_TARGET   = 0.50   # take profit if YES rises 50% from entry
-YES_STOP_LOSS     = 0.30   # stop loss if YES falls 30% from entry
+# YES position exits
+YES_STOP_LOSS = 0.30   # stop loss if YES falls 30% from entry
+
+# NO position: time-weighted stop loss thresholds (fraction drop from entry NO price)
+# Tightens as the day progresses — early illiquidity should not trigger an exit,
+# but a late-day move against us is real information.
+NO_STOP_LOSS_MORNING   = 0.60   # before 11am local — hold unless catastrophic
+NO_STOP_LOSS_PEAK      = 0.40   # 11am–1pm — peak forecast uncertainty window
+NO_STOP_LOSS_AFTERNOON = 0.25   # after 1pm — observations largely in, trust the market
+
+# NO position: probability ceiling
+# Exit if YES crosses this regardless of our entry price — thesis is dead.
+NO_YES_CEILING = 0.50
+
+# NO position: forecast anchor
+# For HIGH: exit if observed high is within this many °F of the bracket floor.
+# For LOWT: exit if observed low is within this many °F of the bracket ceiling.
+FORECAST_ANCHOR_BUFFER = 3.0   # °F
+
+# NO position: settlement hold override
+# If the observed value is this many °F clear of the dangerous bracket boundary
+# AND it's past SETTLEMENT_HOLD_HOUR local time, hold to settlement rather than
+# taking an early exit — the position will resolve correctly.
+SETTLEMENT_CLEAR_BUFFER = 5.0   # °F
+SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the observation
+
+
+def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
+    """
+    Extract (floor, ceiling) from a bracket ticker suffix.
+
+    HIGH brackets:
+      B88   → (88.0, 90.0)   between bracket, 2°F Kalshi spacing
+      T90   → (90.0, None)   above threshold — no ceiling
+
+    LOWT brackets:
+      B52   → (52.0, 54.0)   between bracket
+      T31   → (None, 31.0)   below threshold — no floor
+
+    Returns (None, None) if the bracket suffix cannot be parsed.
+    """
+    try:
+        bracket = ticker.split("-")[-1]
+        is_lowt = "LOWT" in ticker
+
+        if bracket.startswith("B"):
+            floor = float(bracket[1:])
+            return floor, round(floor + 2.0, 1)
+
+        elif bracket.startswith("T"):
+            val = float(bracket[1:])
+            if is_lowt:
+                return None, val    # below-threshold bracket — ceiling is T value
+            else:
+                return val, None    # above-threshold bracket — floor is T value
+
+    except (ValueError, IndexError):
+        pass
+
+    return None, None
+
+
+def _no_stop_threshold(local_hour: int) -> float:
+    """
+    Return the NO stop loss fraction (drop from entry) based on city local hour.
+    A higher value means we tolerate more of a drop before exiting.
+    """
+    if local_hour < 11:
+        return NO_STOP_LOSS_MORNING
+    elif local_hour < 13:
+        return NO_STOP_LOSS_PEAK
+    else:
+        return NO_STOP_LOSS_AFTERNOON
+
+
+def _city_local_hour(city: str) -> int:
+    """Return the current local hour for a city. Defaults to 12 if unknown."""
+    try:
+        from cities import CITIES as _CITIES
+        tz_name = _CITIES.get(city, {}).get("tz")
+        if tz_name:
+            return datetime.now(ZoneInfo(tz_name)).hour
+    except Exception:
+        pass
+    return 12
 
 
 def check_exits(
     client:         KalshiClient,
     paper:          bool  = False,
     live_positions: list  = None,   # pass pre-fetched positions to skip redundant sync
+    nws_snapshot:   dict  = None,   # pass pre-fetched NWS data to skip redundant fetch
 ) -> dict:
     """
     Check all open positions and trigger exits where appropriate.
     Sources positions directly from Kalshi — not from local positions.json.
 
-    NO trades:
-      - Stop loss if NO price falls NO_STOP_LOSS_DROP% below entry (e.g. $0.04 → $0.02)
-      - Take profit if NO price rises YES_EXIT_TARGET% above entry
+    NO trades — three combined exit mechanisms:
+      1. Time-weighted price stop: threshold tightens from 60% drop (morning)
+         to 25% drop (afternoon) as observations firm up.
+      2. Probability ceiling: exit if YES crosses 50¢ — thesis is dead
+         regardless of our entry price.
+      3. Forecast anchor: exit if the observed temperature comes within
+         FORECAST_ANCHOR_BUFFER °F of the dangerous bracket boundary.
+      Settlement hold override: if observed is SETTLEMENT_CLEAR_BUFFER °F
+         clear of the bracket AND it's past SETTLEMENT_HOLD_HOUR, suppress
+         all exits and hold to settlement.
 
     YES trades:
-      - Take profit when price rises YES_EXIT_TARGET% from entry
       - Stop loss when price falls YES_STOP_LOSS% from entry
+      - No take profit — ride to resolution.
 
-    Pass live_positions if already fetched this poll to avoid a redundant sync call.
+    Pass live_positions if already fetched this poll to avoid a redundant sync.
+    Pass nws_snapshot if already fetched this poll to avoid a redundant NWS call.
     Returns dict of {ticker: reason} for each position that was exited.
     """
     exited = {}
@@ -672,6 +760,15 @@ def check_exits(
 
     if not live_positions:
         return exited
+
+    # Fetch NWS snapshot once for all positions if not supplied by caller.
+    if nws_snapshot is None:
+        try:
+            import nws_feed
+            nws_snapshot = nws_feed.snapshot()
+        except Exception as e:
+            print(f"  NWS snapshot failed (forecast anchor disabled): {e}")
+            nws_snapshot = {}
 
     tickers = [p["ticker"] for p in live_positions]
     prices  = {}
@@ -696,6 +793,8 @@ def check_exits(
     except Exception as e:
         print(f"  Batch price fetch failed: {e} — skipping exit check")
         return exited
+
+    from cities import SERIES_TO_CITY as _SERIES_TO_CITY
 
     for pos in live_positions:
         ticker    = pos["ticker"]
@@ -724,32 +823,87 @@ def check_exits(
         exit_price  = None
 
         if side == "no":
-            stop_threshold  = round(avg_cost * (1 - NO_STOP_LOSS_DROP), 2)
-            take_profit     = round(avg_cost * (1 + YES_EXIT_TARGET),    2)
+            # ── Resolve city and NWS data for this position ───────────────
+            series      = ticker.split("-")[0]
+            city        = _SERIES_TO_CITY.get(series)
+            local_hour  = _city_local_hour(city) if city else 12
+            is_lowt     = "LOWT" in ticker
 
-            if no_price <= stop_threshold:
-                exit_reason = "no_stop_loss"
+            nws         = nws_snapshot.get(city, {}) if city else {}
+            obs_high    = nws.get("observed_high_f")
+            obs_low     = nws.get("observed_low_f")
+            obs_val     = obs_low if is_lowt else obs_high
+
+            floor, ceiling = _bracket_floor_ceiling(ticker)
+
+            # ── Settlement hold override ───────────────────────────────────
+            # If it's late and the observed value is well clear of the
+            # dangerous boundary, hold to settlement — don't exit early.
+            if local_hour >= SETTLEMENT_HOLD_HOUR and obs_val is not None:
+                if not is_lowt and floor is not None:
+                    # HIGH: safe if observed high is well below bracket floor
+                    if (floor - obs_val) >= SETTLEMENT_CLEAR_BUFFER:
+                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                              f"obs_high={obs_val}°F is "
+                              f"{floor - obs_val:.1f}°F below bracket floor {floor}°F  "
+                              f"(local={local_hour}h)")
+                        continue
+                elif is_lowt and ceiling is not None:
+                    # LOWT: safe if observed low is well above bracket ceiling
+                    if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
+                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                              f"obs_low={obs_val}°F is "
+                              f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
+                              f"(local={local_hour}h)")
+                        continue
+
+            # ── Probability ceiling ────────────────────────────────────────
+            elif yes_price >= NO_YES_CEILING:
+                exit_reason = "yes_ceiling"
                 exit_price  = no_price
-                print(f"  NO STOP LOSS: {ticker} "
-                      f"NO fell to ${no_price:.2f} "
-                      f"(entry=${avg_cost:.2f} × {1 - NO_STOP_LOSS_DROP:.2f} "
-                      f"= threshold ${stop_threshold:.2f})")
-                print(f"    Avg cost=${avg_cost:.2f} → Exit=${exit_price:.2f} "
-                      f"PnL=${round((exit_price - avg_cost) * contracts, 2):+.2f}")
-            elif no_price >= take_profit:
-                exit_reason = "take_profit"
-                exit_price  = no_price
-                print(f"  NO TAKE PROFIT: {ticker} NO ${avg_cost:.2f} → ${no_price:.2f}")
+                print(f"  YES CEILING: {ticker}  YES={yes_price:.2f} ≥ {NO_YES_CEILING:.2f}  "
+                      f"(entry NO=${avg_cost:.2f}  current NO=${no_price:.2f})  "
+                      f"thesis dead — market says coin flip")
+
+            # ── Forecast anchor ────────────────────────────────────────────
+            elif obs_val is not None:
+                anchor_triggered = False
+                if not is_lowt and floor is not None:
+                    # HIGH: dangerous if observed high approaching bracket floor
+                    gap = floor - obs_val
+                    if gap <= FORECAST_ANCHOR_BUFFER:
+                        anchor_triggered = True
+                        print(f"  FORECAST ANCHOR: {ticker}  "
+                              f"obs_high={obs_val}°F within {gap:.1f}°F of bracket floor {floor}°F")
+                elif is_lowt and ceiling is not None:
+                    # LOWT: dangerous if observed low approaching bracket ceiling
+                    gap = obs_val - ceiling
+                    if gap <= FORECAST_ANCHOR_BUFFER:
+                        anchor_triggered = True
+                        print(f"  FORECAST ANCHOR: {ticker}  "
+                              f"obs_low={obs_val}°F within {gap:.1f}°F of bracket ceiling {ceiling}°F")
+
+                if anchor_triggered:
+                    exit_reason = "forecast_anchor"
+                    exit_price  = no_price
+
+            # ── Time-weighted price stop loss ──────────────────────────────
+            if exit_reason is None:
+                stop_pct       = _no_stop_threshold(local_hour)
+                stop_threshold = round(avg_cost * (1 - stop_pct), 2)
+                if no_price <= stop_threshold:
+                    exit_reason = "no_stop_loss"
+                    exit_price  = no_price
+                    print(f"  NO STOP LOSS: {ticker}  "
+                          f"NO fell to ${no_price:.2f}  "
+                          f"(entry=${avg_cost:.2f}  threshold=${stop_threshold:.2f}  "
+                          f"local={local_hour}h  stop_pct={stop_pct:.0%})")
 
         else:
-            take_profit = round(avg_cost * (1 + YES_EXIT_TARGET), 2)
-            stop_loss   = round(avg_cost * (1 - YES_STOP_LOSS),   2)
+            # ── YES position: stop loss only, ride to resolution ───────────
+            stop_loss = round(avg_cost * (1 - YES_STOP_LOSS), 2)
 
-            if yes_price >= take_profit:
-                exit_reason = "take_profit"
-                exit_price  = yes_price
-                print(f"  TAKE PROFIT: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
-            elif yes_price <= stop_loss:
+            if yes_price <= stop_loss:
                 exit_reason = "stop_loss"
                 exit_price  = yes_price
                 print(f"  STOP LOSS: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
@@ -760,22 +914,20 @@ def check_exits(
                     place_order(
                         client        = client,
                         ticker        = ticker,
-                        side          = side,    # sell what we hold
-                        action        = "sell",  # close the position
+                        side          = side,
+                        action        = "sell",
                         price_dollars = exit_price,
                         contracts     = contracts,
                         paper         = False,
                     )
-                    label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
-                    exited[ticker] = label
+                    exited[ticker] = "Stopped Out"
                     print(f"  Exit order placed: {ticker} SELL {side.upper()} "
                           f"@ ${exit_price:.2f}  reason={exit_reason}")
                 except Exception as e:
                     print(f"  Exit order failed for {ticker}: {e}")
                     continue
             else:
-                label          = "Take Profit" if exit_reason == "take_profit" else "Stopped Out"
-                exited[ticker] = label
+                exited[ticker] = "Stopped Out"
                 print(f"    [PAPER] Would exit {ticker} SELL {side.upper()} "
                       f"@ ${exit_price:.2f}  reason={exit_reason}")
 
@@ -863,7 +1015,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             ticker    = signal["ticker"]
 
             # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets
-            max_per_city = signal.get("max_contracts", 2)   # engines use same value for both limits
+            max_per_city = signal.get("max_contracts", 2)
             city_held    = held_per_city.get(city, 0)
             if city_held >= max_per_city:
                 print(f"  Skipping {ticker} — {city} already holds "
@@ -883,8 +1035,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             contracts = min(contracts, headroom)
 
             # Only trade today's markets — compare against city local date, not UTC
-            # (e.g. at 11pm Mountain time it's already tomorrow UTC but still today locally)
-            ticker_dt  = _ticker_date(ticker)
+            ticker_dt   = _ticker_date(ticker)
             today_local = _city_local_date(city)
             if ticker_dt is None:
                 print(f"  Skipping {ticker} — could not parse date from ticker")

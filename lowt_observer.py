@@ -11,7 +11,25 @@ Run before bed or throughout the day:
 Output: data/lowt_observations.json
         data/lowt_observations.csv
 
-Stops automatically at STOP_HOUR_LISBON.
+Runs continuously — Ctrl+C to stop.
+Auto-switches to new day's markets at UTC midnight.
+
+Schema note
+-----------
+New rows (v2) use explicit per-type field names:
+  HIGH rows  → observed_high_f, forecast_high_f  (observed_low_f / forecast_low_f = null)
+  LOWT rows  → observed_low_f,  forecast_low_f   (observed_high_f / forecast_high_f = null)
+
+Old rows (v1) used a single pair of fields regardless of market_type:
+  observed_f, forecast_f
+
+normalize_row() is applied at load time to upgrade v1 rows to the v2
+schema so all downstream consumers always see the same field names.
+New rows are passed through unchanged.
+
+forecast_issued_at records when the NWS forecast office last issued the
+grid at the time of each poll. Allows computing forecast_age_hours at
+analysis time to stratify forecast error by forecast freshness.
 """
 
 import json
@@ -26,7 +44,6 @@ try:
 except ImportError:
     raise SystemExit("Please install requests:  pip install requests")
 
-# City registry and NWS feed are now shared modules — no local duplicates.
 from cities import OBSERVE_CITIES as CITIES
 import nws_feed
 
@@ -41,13 +58,67 @@ OUTPUT_CSV  = Path("data/lowt_observations.csv")
 
 CSV_FIELDS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
-    "observed_f", "forecast_f",
+    "observed_high_f", "forecast_high_f",
+    "observed_low_f",  "forecast_low_f",
+    "forecast_issued_at",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
 ]
 
 # ---------------------------------------------------------------------------
-# Kalshi data fetching (unchanged — only NWS fetching was duplicated)
+# Schema normalisation
+# ---------------------------------------------------------------------------
+
+def normalize_row(row: dict) -> dict:
+    """
+    Upgrade a v1 row (observed_f / forecast_f) to the v2 schema
+    (observed_high_f / forecast_high_f / observed_low_f / forecast_low_f).
+
+    v2 rows are returned unchanged. The original row dict is not mutated —
+    a new dict is returned so callers can safely modify it.
+
+    v1 mapping logic:
+      market_type == "high"  → observed_f  → observed_high_f
+                                forecast_f  → forecast_high_f
+                                observed_low_f / forecast_low_f = None
+      market_type == "lowt"  → observed_f  → observed_low_f
+                                forecast_f  → forecast_low_f
+                                observed_high_f / forecast_high_f = None
+    """
+    # Already v2 — has at least one of the explicit fields present as a key
+    if "observed_high_f" in row or "observed_low_f" in row:
+        # Ensure forecast_issued_at key exists even if absent (older v2 rows)
+        if "forecast_issued_at" not in row:
+            row = {**row, "forecast_issued_at": None}
+        return row
+
+    # v1 row — promote observed_f / forecast_f to explicit fields
+    market_type = row.get("market_type", "high")
+    obs_f  = row.get("observed_f")
+    fcst_f = row.get("forecast_f")
+
+    upgraded = {**row, "forecast_issued_at": None}
+
+    if market_type == "high":
+        upgraded["observed_high_f"] = obs_f
+        upgraded["forecast_high_f"] = fcst_f
+        upgraded["observed_low_f"]  = None
+        upgraded["forecast_low_f"]  = None
+    else:
+        upgraded["observed_high_f"] = None
+        upgraded["forecast_high_f"] = None
+        upgraded["observed_low_f"]  = obs_f
+        upgraded["forecast_low_f"]  = fcst_f
+
+    # Remove the old keys so consumers never see the ambiguous fields
+    upgraded.pop("observed_f", None)
+    upgraded.pop("forecast_f", None)
+
+    return upgraded
+
+
+# ---------------------------------------------------------------------------
+# Kalshi data fetching
 # ---------------------------------------------------------------------------
 
 def fetch_brackets(series: str) -> list[dict]:
@@ -71,9 +142,11 @@ def fetch_brackets(series: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def load_observations() -> list[dict]:
+    """Load observations from disk, normalising any v1 rows to v2 schema."""
     if OUTPUT_JSON.exists():
         try:
-            return json.loads(OUTPUT_JSON.read_text())
+            raw = json.loads(OUTPUT_JSON.read_text())
+            return [normalize_row(r) for r in raw]
         except Exception:
             return []
     return []
@@ -105,31 +178,44 @@ def poll_once(observations: list[dict]) -> int:
     nws_results = nws_feed.snapshot()
 
     for city, cfg in CITIES.items():
-        tz        = ZoneInfo(cfg["tz"])
-        local_now = datetime.now(tz)
+        tz         = ZoneInfo(cfg["tz"])
+        local_now  = datetime.now(tz)
         local_time = local_now.strftime("%H:%M %Z")
         local_hour = local_now.hour
 
         # Pull pre-fetched NWS data — no extra HTTP calls per city.
         nws = nws_results.get(city, {})
 
+        # forecast_issued_at is shared across HIGH and LOWT for the same city
+        # since both use the same NWS grid.
+        forecast_issued_at = nws.get("forecast_issued_at")
+
         for market_type in ("high", "lowt"):
-            series   = cfg.get(f"{market_type}_series") or cfg.get(market_type)
+            series = cfg.get(f"{market_type}_series") or cfg.get(market_type)
             if not series:
                 continue
             brackets = fetch_brackets(series)
-
             if not brackets:
                 continue
 
-            # Map nws_feed.snapshot() keys to the values we need.
-            # nws_feed uses LST boundary logic — correct for CLI settlement.
+            # Use explicit per-type field names so rows are self-documenting.
+            # Null out the other market type's fields for schema consistency.
             if market_type == "high":
-                obs_f  = nws.get("observed_high_f")
-                fcst_f = nws.get("forecast_high_f")
+                observed_high_f = nws.get("observed_high_f")
+                forecast_high_f = nws.get("forecast_high_f")
+                observed_low_f  = None
+                forecast_low_f  = None
+                if observed_high_f is None:
+                    print(f"  [WARN] {city} HIGH: observed_high_f is None "
+                          f"(NWS error: {nws.get('error')})")
             else:
-                obs_f  = nws.get("observed_low_f")
-                fcst_f = nws.get("forecast_low_f")
+                observed_high_f = None
+                forecast_high_f = None
+                observed_low_f  = nws.get("observed_low_f")
+                forecast_low_f  = nws.get("forecast_low_f")
+                if observed_low_f is None:
+                    print(f"  [WARN] {city} LOWT: observed_low_f is None "
+                          f"(NWS error: {nws.get('error')})")
 
             for m in brackets:
                 ticker        = m.get("ticker", "")
@@ -143,20 +229,23 @@ def poll_once(observations: list[dict]) -> int:
                 spread  = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
 
                 observations.append({
-                    "poll_time_utc": poll_time,
-                    "city":          city,
-                    "market_type":   market_type,
-                    "local_time":    local_time,
-                    "local_hour":    local_hour,
-                    "observed_f":    obs_f,
-                    "forecast_f":    fcst_f,
-                    "ticker":        ticker,
-                    "bracket":       bracket,
-                    "yes_price":     yes_price,
-                    "no_price":      no_price,
-                    "spread":        spread,
-                    "volume":        volume,
-                    "open_interest": open_interest,
+                    "poll_time_utc":      poll_time,
+                    "city":               city,
+                    "market_type":        market_type,
+                    "local_time":         local_time,
+                    "local_hour":         local_hour,
+                    "observed_high_f":    observed_high_f,
+                    "forecast_high_f":    forecast_high_f,
+                    "observed_low_f":     observed_low_f,
+                    "forecast_low_f":     forecast_low_f,
+                    "forecast_issued_at": forecast_issued_at,
+                    "ticker":             ticker,
+                    "bracket":            bracket,
+                    "yes_price":          yes_price,
+                    "no_price":           no_price,
+                    "spread":             spread,
+                    "volume":             volume,
+                    "open_interest":      open_interest,
                 })
                 rows_added += 1
 
@@ -183,7 +272,17 @@ def poll_once(observations: list[dict]) -> int:
         lo_spread_str = f"spd={lo_spread:.2f}" if lo_spread else "spd=—"
 
         current_temp = nws.get("current_temp_f", "?")
-        print(f"  {city:<14} {local_time}  obs={current_temp}°  "
+        fcst_age_str = ""
+        if forecast_issued_at:
+            try:
+                issued  = datetime.fromisoformat(forecast_issued_at)
+                now_utc = datetime.now(timezone.utc)
+                age_h   = round((now_utc - issued).total_seconds() / 3600, 1)
+                fcst_age_str = f"  fcst_age={age_h}h"
+            except Exception:
+                pass
+
+        print(f"  {city:<14} {local_time}  obs={current_temp}°{fcst_age_str}  "
               f"HIGH: {hi_bracket}@{hi_pct:.0%} {hi_spread_str} vol={hi_vol:.0f}  "
               f"LOWT: {lo_bracket}@{lo_pct:.0%} {lo_spread_str} vol={lo_vol:.0f}")
 
