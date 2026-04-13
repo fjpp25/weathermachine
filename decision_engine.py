@@ -281,17 +281,6 @@ def score_momentum(candles: list[dict]) -> bool:
     return closes[-1] > closes[0]
 
 
-def is_forecast_inside_boundary(bracket: dict, forecast: float, buffer: float) -> bool:
-    """Check forecast is at least `buffer`°F inside both bracket edges."""
-    floor = bracket.get("floor")
-    cap   = bracket.get("cap")
-    if floor is not None and forecast - floor < buffer:
-        return False
-    if cap is not None and cap - forecast < buffer:
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Per-bracket evaluator (NO trades only)
 # ---------------------------------------------------------------------------
@@ -422,24 +411,29 @@ def evaluate_bracket(
     yes_ask = bracket.get("ob_yes_ask")
     no_ask  = bracket.get("ob_no_ask")
 
-    if (
-        no_ask is not None
-        and NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE
-        and yes_ask is not None
-        and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
-        and no_depth >= MIN_DEPTH
-    ):
-        if no_ask < 0.75 and score < 3:
-            signal["skip_reason"] = (
-                f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
-                f"(got {score}/3)"
-            )
-        else:
-            signal["trade_type"]    = "NO"
-            signal["entry_price"]   = no_ask
-            signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
-            signal["stop_loss"]     = None
-            signal["max_contracts"] = MAX_CONTRACTS
+    if no_ask is None or not (NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE):
+        signal["skip_reason"] = f"NO ask out of range or missing ({no_ask})"
+        return signal
+
+    if yes_ask is None or not (NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE):
+        signal["skip_reason"] = f"YES ask out of range or missing ({yes_ask})"
+        return signal
+
+    if no_depth < MIN_DEPTH:
+        signal["skip_reason"] = f"Insufficient NO depth ({no_depth} < {MIN_DEPTH})"
+        return signal
+
+    if no_ask < 0.75 and score < 3:
+        signal["skip_reason"] = (
+            f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
+            f"(got {score}/3)"
+        )
+    else:
+        signal["trade_type"]    = "NO"
+        signal["entry_price"]   = no_ask
+        signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
+        signal["stop_loss"]     = None
+        signal["max_contracts"] = MAX_CONTRACTS
 
     return signal
 
