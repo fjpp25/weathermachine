@@ -836,10 +836,18 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
     try:
         live_positions = sync_from_kalshi(client)
-        # Track contracts held per ticker so we can top up below MAX_CONTRACTS
+        # Track contracts held per ticker (for per-bracket headroom check)
         open_contracts = {p["ticker"]: p["contracts"] for p in live_positions}
+        # Track positions held per city (for MAX_NO_PER_CITY gate)
+        from cities import SERIES_TO_CITY as _SERIES_TO_CITY
+        held_per_city: dict[str, int] = {}
+        for ticker in open_contracts:
+            city_name = _SERIES_TO_CITY.get(ticker.split("-")[0])
+            if city_name:
+                held_per_city[city_name] = held_per_city.get(city_name, 0) + 1
     except Exception:
         open_contracts = {}
+        held_per_city  = {}
 
     executed = 0
     deployed = 0.0
@@ -849,6 +857,18 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
         signals = [s for s in ev.get("signals", []) if s.get("trade_type")]
 
         for signal in signals:
+            contracts = contracts_for_signal(signal)
+            side      = signal["trade_type"].lower()
+            price     = signal["entry_price"]
+            ticker    = signal["ticker"]
+
+            # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets
+            max_per_city = signal.get("max_contracts", 2)   # engines use same value for both limits
+            city_held    = held_per_city.get(city, 0)
+            if city_held >= max_per_city:
+                print(f"  Skipping {ticker} — {city} already holds "
+                      f"{city_held}/{max_per_city} positions today")
+                continue
             contracts = contracts_for_signal(signal)
             side      = signal["trade_type"].lower()
             price     = signal["entry_price"]
@@ -895,6 +915,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     paper         = paper,
                 )
                 open_contracts[ticker] = open_contracts.get(ticker, 0) + contracts
+                held_per_city[city]    = held_per_city.get(city, 0) + 1
                 deployed += cost
                 executed += 1
                 _append_trade_log({

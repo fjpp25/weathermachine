@@ -1,17 +1,17 @@
 """
-decision_engine.py
-------------------
+hight_decision_engine.py
+------------------------
 Synthesizes city profiles, NWS live feed, and Kalshi scanner data into
 actionable NO trade signals for temperature HIGH markets.
 
-Only NO trades are generated — buying NO on brackets the forecast
-makes unlikely, collecting premium as the market converges to resolution.
+Only NO trades are generated — buying NO on brackets the forecast or
+observed temperatures make unlikely, collecting premium as the market
+converges to resolution.
 
 Gates (applied in order — any failure skips to next bracket):
-  1. Timing      — city_local_hour must be within the city's entry window.
-                   Per-city start hours are defined in cities.py (trade_start_high /
-                   trade_start_lowt), calibrated from entry_window_analysis.py.
-                   TRADE_WINDOW_END is currently 24 (gate disabled — scheduler handles timing).
+  1. Timing      — city_local_hour ≥ TRADE_WINDOW_START (global floor, currently 6am local).
+                   No per-city overrides — 6am is early enough for obs signals and the
+                   NWS morning forecast, while keeping overnight noise out.
   2. Liquidity   — spread ≤ MAX_SPREAD and depth ≥ MIN_DEPTH
   3. Boundary    — bias-corrected forecast is ≥ dynamic_buffer°F from both bracket edges
                    (dynamic_buffer scales with city's tmax_stddev from city_profiles.json)
@@ -23,16 +23,16 @@ Signal scoring (0–3):
   +1 momentum_flat_or_down   — no upward price momentum in recent candles
 
 Usage:
-  python decision_engine.py                 # run full analysis, all cities
-  python decision_engine.py --city Miami    # single city
-  python decision_engine.py --paper         # paper-trade mode (log only)
+  python hight_decision_engine.py                 # run full analysis, all cities
+  python hight_decision_engine.py --city Miami    # single city
+  python hight_decision_engine.py --paper         # paper-trade mode (log only)
 
 Dependencies:
   city_profiles.py   (data/city_profiles.json must exist)
   bias_calculator.py (data/forecast_bias.json used when available)
   nws_feed.py
   kalshi_scanner.py
-  cities.py          (trade_start_high / trade_start_lowt per city)
+  cities.py
 """
 
 import json
@@ -50,10 +50,10 @@ from cities import CITIES as _CITY_REGISTRY
 # ---------------------------------------------------------------------------
 
 # Gate thresholds
-TRADE_WINDOW_START  = 0        # local hour — global fallback when no per-city value set
-TRADE_WINDOW_END    = 24       # local hour — gate currently DISABLED (0–24 = always open)
-                               # Timing is handled by scheduler.py's dynamic interval.
-                               # To re-enable a hard close: set TRADE_WINDOW_END = 14
+TRADE_WINDOW_START  = 6        # local hour — no trading before 6am (obs signals meaningless overnight)
+                               # Early enough to catch first morning obs + NWS forecast (~7am)
+TRADE_WINDOW_END    = 24       # local hour — no hard close (scheduler handles late-day tapering)
+                               # To re-enable: set TRADE_WINDOW_END = 14
 MAX_SPREAD          = 0.05     # max acceptable bid-ask spread ($)
                                # relaxed from 0.03 — was blocking too many valid signals
 MIN_DEPTH           = 500      # min contracts on the side we're buying
@@ -205,19 +205,16 @@ PAUSED_CITIES: set[str] = _build_paused_cities()
 
 def _trade_start_for(city: str, market_type: str = "high") -> int:
     """
-    Return the earliest local hour for entering trades in this city.
+    Return the earliest local hour for entering HIGH trades.
 
-    Looks up trade_start_high or trade_start_lowt from cities.py.
-    Falls back to TRADE_WINDOW_START (global default) if not set.
+    Previously used per-city calibrated values from cities.py. Replaced with
+    a single global floor (TRADE_WINDOW_START = 6) — the per-city values were
+    calibrated for forecast-only signals and were too conservative once
+    obs_eliminates_bracket became a first-class signal.
 
-    The per-city values are calibrated from entry_window_analysis.py and
-    reflect when the NWS morning forecast has stabilised enough for NO
-    entries to be reliable.
+    Returns TRADE_WINDOW_START for all cities.
     """
-    meta = _CITY_REGISTRY.get(city, {})
-    key  = "trade_start_high" if market_type == "high" else "trade_start_lowt"
-    val  = meta.get(key)
-    return val if val is not None else TRADE_WINDOW_START
+    return TRADE_WINDOW_START
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +309,7 @@ def evaluate_bracket(
         forecast_high:    Raw NWS forecast high (°F) — bias correction applied internally.
         observed_high:    Observed high so far today (°F), or None if not yet available.
         city_local_hour:  Current local hour for the city.
-        trade_start_hour: Earliest local hour for entering trades (per-city calibrated).
+        trade_start_hour: Earliest local hour for entering trades (global floor, currently 6am).
         city_bias:        Per-city NWS bias correction (°F). Applied as: corrected = forecast + bias.
         dynamic_buffer:   Boundary buffer (°F) scaled to city stddev.
 

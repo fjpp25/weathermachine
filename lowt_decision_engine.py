@@ -13,12 +13,15 @@ Strategy:
   no forecast is needed to know that position is dead.
 
 Signal scoring (0–3):
-  +1  obs_eliminates_bracket  — max(current_temp, observed_low) > cap + OBS_ELIM_MARGIN
-                                 Overnight temp is already far enough above cap that
-                                 cooling to it would require an extraordinary event.
-  +1  forecast_well_clear     — NWS forecast low > cap + FORECAST_LOW_MARGIN
-                                 Forecast independently confirms bracket is out of range.
-  +1  momentum_flat_or_down   — No upward price pressure on YES in recent candles.
+  +1  obs_eliminates_bracket    — max(current_temp, observed_low) > cap + OBS_ELIM_MARGIN
+                                   Overnight temp is already far enough above cap that
+                                   cooling to it would require an extraordinary event.
+  +1  tonight_fcst_well_clear   — NWS forecast low for tonight > cap + FORECAST_LOW_MARGIN
+                                   Note: NWS "forecast low" is the nighttime period for today
+                                   (tonight's low), not this morning's low. Both the observed
+                                   morning low AND tonight's forecast being above the cap
+                                   gives double confirmation.
+  +1  momentum_flat_or_down     — No upward price pressure on YES in recent candles.
                                  Market isn't repricing toward YES resolution.
 
 Gates (applied in order — any failure skips to next bracket):
@@ -79,7 +82,11 @@ OBS_ELIM_MARGIN     = 15.0   # current/observed temp must be this many °F above
                               # data: overnight signals at margins of +15–25°F had ~0% loss rate
 
 # Forecast confirmation gate
-FORECAST_LOW_MARGIN = 6.0    # NWS forecast low must be this many °F above bracket cap
+# NWS "forecast low" is actually tonight's overnight low (the nighttime period
+# for today's date), not the low that already occurred this morning.
+# Both are useful: if tonight's low is still well above the cap, the bracket
+# is doubly confirmed. But the observed morning low is the primary signal.
+FORECAST_LOW_MARGIN = 6.0    # tonight's NWS forecast low must be this many °F above bracket cap
                               # mirrors FORECAST_WELL_CLEAR from HIGH engine
 
 # Price gates — identical to HIGH engine
@@ -207,7 +214,7 @@ def evaluate_bracket_lowt(
 
     if forecast_low is not None and (forecast_low - cap) >= FORECAST_LOW_MARGIN:
         score += 1
-        details.append("forecast_well_clear")
+        details.append("tonight_fcst_well_clear")
 
     candles = bracket.get("candles", [])
     if not _score_momentum(candles):
@@ -220,13 +227,13 @@ def evaluate_bracket_lowt(
     # --- Gate: At least one positive signal before price check ---
     # Momentum alone doesn't justify entry — need obs or forecast confirmation.
     has_positive_signal = (
-        "obs_eliminates_bracket" in details or "forecast_well_clear" in details
+        "obs_eliminates_bracket" in details or "tonight_fcst_well_clear" in details
     )
     if not has_positive_signal:
         signal["skip_reason"] = (
             f"No elimination signal: "
             f"best_obs={best_obs}°F, cap={cap}°F, margin={OBS_ELIM_MARGIN}°F required; "
-            f"forecast_low={forecast_low}°F, margin={FORECAST_LOW_MARGIN}°F required"
+            f"tonight_fcst_low={forecast_low}°F, margin={FORECAST_LOW_MARGIN}°F required"
         )
         return signal
 
