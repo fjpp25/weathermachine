@@ -27,7 +27,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import trader
-import decision_engine
+import hight_decision_engine as decision_engine
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 # ---------------------------------------------------------------------------

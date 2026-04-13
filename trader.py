@@ -51,8 +51,8 @@ except ImportError:
         "  pip install requests cryptography"
     )
 
-import decision_engine
-from entry_snapshots import log_entry as _log_entry_snapshot
+import hight_decision_engine as decision_engine
+import lowt_decision_engine
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -76,7 +76,7 @@ MONITOR_INTERVAL = 60
 
 
 # ---------------------------------------------------------------------------
-# Trade log � persists signal metadata for post-hoc score analysis
+# Trade log � persists signal metadata for post-hoc score analysis
 # ---------------------------------------------------------------------------
 
 TRADE_LOG_FILE = Path("data/trade_log.json")
@@ -90,7 +90,7 @@ def _append_trade_log(entry: dict):
     so outcomes can later be joined against settlements by ticker.
 
     Fields saved:
-      ticker, city, side, score, score_detail,
+      ticker, city, side, market_type, score, score_detail,
       entry_price, contracts, placed_at (UTC ISO), paper (bool)
     """
     TRADE_LOG_FILE.parent.mkdir(exist_ok=True)
@@ -817,28 +817,18 @@ def _city_local_date(city: str):
 
 
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
-    """Run decision engine, then execute any actionable signals."""
+    """Run HIGH and LOWT decision engines, then execute any actionable signals."""
+    # ── HIGH markets ─────────────────────────────────────────────────────────
     evaluations = decision_engine.run(city_filter=city_filter)
     decision_engine.display(evaluations)
 
-    # LOWT observe-only scan — signals logged but never executed
+    # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
-        lowt_evals = decision_engine.run_lowt_observe(city_filter=city_filter)
-        if lowt_evals:
-            print("\n  ── LOWT Markets (observe only) ──────────────────────────")
-            for ev in lowt_evals:
-                city    = ev["city"]
-                signals = [s for s in ev.get("signals", []) if s.get("observe_only")]
-                if signals:
-                    for s in signals:
-                        print(f"  [OBS] {city} {s['ticker'].split('-',1)[1]}  "
-                              f"score={s.get('score', 0)}/3  "
-                              f"[{', '.join(s.get('score_detail', []))}]")
-            print()
+        lowt_evals = lowt_decision_engine.run(city_filter=city_filter, paper=paper)
+        lowt_decision_engine.display(lowt_evals)
+        evaluations = evaluations + lowt_evals
     except Exception as e:
-        print(f"  LOWT observe error: {e}")
-
-    evaluations = evaluations + (lowt_evals or [])
+        print(f"  LOWT pipeline error (non-fatal): {e}")
 
     balance    = get_balance(client)
     deployable = round(balance * 0.70, 2)
@@ -865,7 +855,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             ticker    = signal["ticker"]
 
             held      = open_contracts.get(ticker, 0)
-            max_contr = getattr(decision_engine, 'MAX_CONTRACTS', 2)
+            max_contr = signal.get("max_contracts", 2)
             headroom  = max_contr - held
             if headroom <= 0:
                 print(f"  Skipping {ticker} — already at max contracts ({held}/{max_contr})")
@@ -892,7 +882,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             print(f"\n  Executing: {city} {ticker}")
             print(f"    {side.upper()} {contracts}x @ ${price:.2f}  "
-                  f"target=${signal['exit_target']:.2f}  score={signal['score']}/3"
+                  f"score={signal['score']}/3"
                   f"  [{', '.join(signal.get('score_detail', []))}]")
 
             try:
@@ -911,6 +901,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     "ticker":       ticker,
                     "city":         city,
                     "side":         side,
+                    "market_type":  signal.get("market_type", "high"),
                     "score":        signal.get("score", 0),
                     "score_detail": signal.get("score_detail", []),
                     "entry_price":  price,
@@ -918,19 +909,6 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     "placed_at":    datetime.now(timezone.utc).isoformat(),
                     "paper":        paper,
                 })
-
-                # Log entry snapshot to entry_snapshots.csv
-                try:
-                    _log_entry_snapshot(
-                        city      = city,
-                        signal    = signal,
-                        ev        = ev,
-                        brackets  = [],   # brackets removed — was duplicate scanner call
-                        contracts = contracts,
-                        paper     = paper,
-                    )
-                except Exception as snap_err:
-                    print(f"  [snapshot] log error (non-fatal): {snap_err}")
 
             except Exception as e:
                 print(f"  Order failed for {ticker}: {e}")

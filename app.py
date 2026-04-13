@@ -529,7 +529,7 @@ class SchedulerWorker(QObject):
 
         try:
             import trader
-            import decision_engine
+            import hight_decision_engine
 
             client = trader.make_client(skip_confirmation=True)
             self.client_ready.emit(client)

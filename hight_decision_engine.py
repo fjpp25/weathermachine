@@ -82,9 +82,6 @@ NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for 
 MAX_CONTRACTS       = 2        # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
-# Exit target
-NO_EXIT_TARGET      = 0.15     # take profit when NO price rises 15%
-
 # Momentum detection
 MIN_CANDLES_FOR_MOMENTUM = 3   # need at least this many candles to score momentum
 MOMENTUM_LOOKBACK        = 3   # look at last N candles for direction
@@ -281,6 +278,17 @@ def score_momentum(candles: list[dict]) -> bool:
     return closes[-1] > closes[0]
 
 
+def is_forecast_inside_boundary(bracket: dict, forecast: float, buffer: float) -> bool:
+    """Check forecast is at least `buffer`°F inside both bracket edges."""
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+    if floor is not None and forecast - floor < buffer:
+        return False
+    if cap is not None and cap - forecast < buffer:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Per-bracket evaluator (NO trades only)
 # ---------------------------------------------------------------------------
@@ -411,29 +419,23 @@ def evaluate_bracket(
     yes_ask = bracket.get("ob_yes_ask")
     no_ask  = bracket.get("ob_no_ask")
 
-    if no_ask is None or not (NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE):
-        signal["skip_reason"] = f"NO ask out of range or missing ({no_ask})"
-        return signal
-
-    if yes_ask is None or not (NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE):
-        signal["skip_reason"] = f"YES ask out of range or missing ({yes_ask})"
-        return signal
-
-    if no_depth < MIN_DEPTH:
-        signal["skip_reason"] = f"Insufficient NO depth ({no_depth} < {MIN_DEPTH})"
-        return signal
-
-    if no_ask < 0.75 and score < 3:
-        signal["skip_reason"] = (
-            f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
-            f"(got {score}/3)"
-        )
-    else:
-        signal["trade_type"]    = "NO"
-        signal["entry_price"]   = no_ask
-        signal["exit_target"]   = min(round(no_ask + 0.04, 2), 0.99)
-        signal["stop_loss"]     = None
-        signal["max_contracts"] = MAX_CONTRACTS
+    if (
+        no_ask is not None
+        and NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE
+        and yes_ask is not None
+        and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
+        and no_depth >= MIN_DEPTH
+    ):
+        if no_ask < 0.75 and score < 3:
+            signal["skip_reason"] = (
+                f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
+                f"(got {score}/3)"
+            )
+        else:
+            signal["trade_type"]    = "NO"
+            signal["entry_price"]   = no_ask
+            signal["stop_loss"]     = None
+            signal["max_contracts"] = MAX_CONTRACTS
 
     return signal
 
@@ -576,36 +578,6 @@ def run(city_filter: str = None, paper: bool = False) -> list[dict]:
     return evaluations
 
 
-def run_lowt_observe(city_filter: str = None) -> list[dict]:
-    """
-    Scan LOWT markets and evaluate signals — but mark all as observe-only.
-    No orders will ever be placed from these evaluations.
-    """
-    profiles = load_profiles()
-
-    nws_results    = nws_feed.snapshot(city_filter)
-    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="low")
-
-    evaluations = []
-    for city, nws_data in nws_results.items():
-        scan_data = kalshi_results.get(city, {})
-        if not scan_data or scan_data.get("error"):
-            continue
-
-        eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="lowt")
-
-        for signal in eval_result.get("signals", []):
-            if signal.get("trade_type"):
-                signal["observe_only"] = True
-                signal["skip_reason"]  = "LOWT observe-only mode"
-                signal["trade_type"]   = None
-
-        eval_result["market_type"] = "lowt"
-        evaluations.append(eval_result)
-
-    return evaluations
-
-
 # ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
@@ -654,8 +626,8 @@ def display(evaluations: list[dict]):
             continue
 
         any_signal = True
-        print(f"  {'Bracket':<22} {'Type':>5} {'Entry':>7} {'Target':>8} {'Score':>6}  Details")
-        print(f"  {'-'*68}")
+        print(f"  {'Bracket':<22} {'Type':>5} {'Entry':>7} {'Score':>6}  Details")
+        print(f"  {'-'*60}")
 
         for s in active_signals:
             floor = s.get("floor")
@@ -674,7 +646,6 @@ def display(evaluations: list[dict]):
                 f"  {bracket_str:<22} "
                 f"{s['trade_type']:>5} "
                 f"${s['entry_price']:.2f}  "
-                f"${s['exit_target']:.2f}    "
                 f"{s['score']}/3    "
                 f"{detail_str}"
             )
