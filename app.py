@@ -2203,6 +2203,7 @@ class SessionTab(QWidget):
     def __init__(self):
         super().__init__()
         self._entries = []
+        self._client  = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -2212,6 +2213,22 @@ class SessionTab(QWidget):
         hdr = QHBoxLayout()
         title = QLabel("SESSION ACTIVITY")
         title.setStyleSheet(f"color: {TEXT_PRI}; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
+
+        self.refresh_btn = QPushButton("⟳  Refresh")
+        self.refresh_btn.setFixedWidth(100)
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {BG_PANEL};
+                color: {TEXT_SEC};
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                padding: 6px 12px;
+            }}
+            QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
+            QPushButton:disabled {{ border-color: {BORDER}; color: {TEXT_SEC}; }}
+        """)
+        self.refresh_btn.clicked.connect(self.refresh_statuses)
 
         self.clear_btn = QPushButton("✕  Clear")
         self.clear_btn.setFixedWidth(100)
@@ -2234,13 +2251,15 @@ class SessionTab(QWidget):
         hdr.addSpacing(16)
         hdr.addWidget(self.count_label)
         hdr.addStretch()
+        hdr.addWidget(self.refresh_btn)
+        hdr.addSpacing(8)
         hdr.addWidget(self.clear_btn)
         layout.addLayout(hdr)
 
         # ── Summary bar ───────────────────────────────────────────────────
         summary_row = QHBoxLayout()
         self.stat_labels = {}
-        for key in ["Entries", "Open", "Stopped Out", "Avg Score"]:
+        for key in ["Entries", "Open", "Stopped Out", "Avg Score", "Unrealised"]:
             frame = QFrame()
             frame.setStyleSheet(f"""
                 QFrame {{
@@ -2280,6 +2299,59 @@ class SessionTab(QWidget):
             f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
         )
         layout.addWidget(self.table, stretch=1)
+
+    def set_client(self, client):
+        """Store Kalshi client — enables the Refresh button."""
+        self._client = client
+        self.refresh_btn.setEnabled(True)
+
+    def refresh_statuses(self):
+        """
+        Re-sync Open entry statuses against live Kalshi data.
+        Resolves each as Won / Lost using the settlements endpoint.
+        """
+        if not self._client:
+            return
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("...")
+        client = self._client
+
+        def fetch():
+            import trader as _t
+            live         = _t.sync_from_kalshi(client)
+            live_tickers = {p["ticker"] for p in live}
+            data         = client.get("portfolio/settlements",
+                                      params={"limit": 200})
+            settled      = {
+                s["ticker"]: s.get("market_result", "").lower()
+                for s in data.get("settlements", [])
+            }
+            return live_tickers, settled
+
+        def on_done(result):
+            live_tickers, settled = result
+            for entry in self._entries:
+                if entry.get("status") != "Open":
+                    continue
+                ticker = entry.get("ticker", "")
+                if ticker in live_tickers:
+                    continue
+                if ticker in settled:
+                    our_side = entry.get("side", "").lower()
+                    entry["status"] = "Won" if settled[ticker] == our_side else "Lost"
+                else:
+                    entry["status"] = "Settled"
+            self._rebuild()
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("⟳  Refresh")
+
+        def on_error(msg):
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("⟳  Refresh")
+
+        self._ref_thread, self._ref_worker = run_in_background(
+            fetch, on_done, on_error
+        )
 
     def add_entry(self, pos: dict):
         """Add a new position entry from this session."""
@@ -2331,6 +2403,17 @@ class SessionTab(QWidget):
         )
         self.stat_labels["Avg Score"].setText(avg_score)
 
+        total_unreal = sum(e.get("unrealised_pnl", 0) or 0
+                         for e in entries if e.get("status") == "Open")
+        unreal_sign  = "+" if total_unreal >= 0 else ""
+        unreal_color = ACCENT if total_unreal > 0 else (RED if total_unreal < 0 else TEXT_SEC)
+        unreal_lbl   = self.stat_labels.get("Unrealised")
+        if unreal_lbl:
+            unreal_lbl.setText(f"{unreal_sign}${total_unreal:.2f}")
+            unreal_lbl.setStyleSheet(
+                f"color: {unreal_color}; font-size: 18px; font-weight: bold;"
+            )
+
         self.count_label.setText(
             f"{len(entries)} entr{'y' if len(entries)==1 else 'ies'} this session"
         )
@@ -2343,9 +2426,9 @@ class SessionTab(QWidget):
 
             if status == "Open":
                 status_color = ACCENT
-            elif status == "Stopped Out":
+            elif status in ("Stopped Out", "Lost"):
                 status_color = RED
-            elif status == "Take Profit":
+            elif status in ("Take Profit", "Won"):
                 status_color = ACCENT
             else:  # Settled
                 status_color = TEXT_SEC
@@ -2525,7 +2608,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(tabs)
 
         # Client ready → pass to PnL tab
-        self.home_tab._client_ready_callbacks = [self.pnl_tab.set_client]
+        self.home_tab._client_ready_callbacks = [
+            self.pnl_tab.set_client,
+            self.session_tab.set_client,
+        ]
         # Wire session tab when scheduler starts
         self.home_tab._start_trading_callbacks = [
             self._wire_session_signals,

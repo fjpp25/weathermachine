@@ -76,6 +76,35 @@ MONITOR_INTERVAL = 60
 
 
 # ---------------------------------------------------------------------------
+# Trade log — persists signal metadata for post-hoc score analysis
+# ---------------------------------------------------------------------------
+
+TRADE_LOG_FILE = Path("data/trade_log.json")
+
+
+def _append_trade_log(entry: dict):
+    """
+    Append one trade entry to data/trade_log.json.
+
+    Each entry captures the signal metadata at the moment of order placement
+    so outcomes can later be joined against settlements by ticker.
+
+    Fields saved:
+      ticker, city, side, score, score_detail,
+      entry_price, contracts, placed_at (UTC ISO), paper (bool)
+    """
+    TRADE_LOG_FILE.parent.mkdir(exist_ok=True)
+    existing: list = []
+    if TRADE_LOG_FILE.exists():
+        try:
+            existing = json.loads(TRADE_LOG_FILE.read_text())
+        except Exception:
+            existing = []
+    existing.append(entry)
+    TRADE_LOG_FILE.write_text(json.dumps(existing, indent=2, default=str))
+
+
+# ---------------------------------------------------------------------------
 # Auth client
 # ---------------------------------------------------------------------------
 
@@ -878,6 +907,17 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 open_contracts[ticker] = open_contracts.get(ticker, 0) + contracts
                 deployed += cost
                 executed += 1
+                _append_trade_log({
+                    "ticker":       ticker,
+                    "city":         city,
+                    "side":         side,
+                    "score":        signal.get("score", 0),
+                    "score_detail": signal.get("score_detail", []),
+                    "entry_price":  price,
+                    "contracts":    contracts,
+                    "placed_at":    datetime.now(timezone.utc).isoformat(),
+                    "paper":        paper,
+                })
 
                 # Log entry snapshot to entry_snapshots.csv
                 try:
