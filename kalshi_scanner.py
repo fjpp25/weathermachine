@@ -57,6 +57,66 @@ CANDLE_MIN = 60    # 1-hour candles for intraday history (60 = 1hr in minutes)
                    # switch to 1 for 1-minute candles (more data, more API calls)
 
 # ---------------------------------------------------------------------------
+# In-memory YES price history — persists across poll cycles within a process.
+# Used by hight_decision_engine for overnight sentiment gating on early entries.
+#
+# Structure: {ticker: [(utc_timestamp_str, yes_price), ...]}
+# Trimmed to PRICE_HISTORY_WINDOW entries per ticker on each update.
+# Resets on app restart — one warmup poll cycle required before early entries fire.
+# ---------------------------------------------------------------------------
+
+PRICE_HISTORY_WINDOW = 6   # ~90 minutes at 15-min polling interval
+
+_price_history: dict[str, list[tuple[str, float]]] = {}
+
+
+def record_price(ticker: str, yes_price: float, ts: str | None = None) -> None:
+    """Append a YES price observation to the in-memory history for a ticker."""
+    if ts is None:
+        ts = datetime.now(timezone.utc).isoformat()
+    history = _price_history.setdefault(ticker, [])
+    history.append((ts, yes_price))
+    if len(history) > PRICE_HISTORY_WINDOW:
+        del history[:-PRICE_HISTORY_WINDOW]
+
+
+def get_price_history(ticker: str) -> list[tuple[str, float]]:
+    """Return the stored YES price history for a ticker (oldest first)."""
+    return list(_price_history.get(ticker, []))
+
+
+def yes_trend(ticker: str, lookback: int = 3) -> str | None:
+    """
+    Compute the YES price trend over the last `lookback` observations.
+
+    Returns:
+      "declining"  — YES is falling (good for NO entry)
+      "flat"       — YES is stable within TREND_FLAT_THRESHOLD
+      "rising"     — YES is climbing (skip entry — market disagrees)
+      None         — insufficient history (< 2 points)
+
+    A rising trend is the key disqualifier for early entries: if the market
+    is pricing YES upward overnight on a high-clearance bracket, something
+    is moving against the forecast that we can't see.
+    """
+    history = _price_history.get(ticker, [])
+    if len(history) < 2:
+        return None
+    recent = [price for _, price in history[-lookback:]]
+    if len(recent) < 2:
+        return None
+    delta = recent[-1] - recent[0]
+    if delta > TREND_FLAT_THRESHOLD:
+        return "rising"
+    elif delta < -TREND_FLAT_THRESHOLD:
+        return "declining"
+    else:
+        return "flat"
+
+
+TREND_FLAT_THRESHOLD = 0.03   # YES moves of < 3¢ across lookback window = flat
+
+# ---------------------------------------------------------------------------
 # HTTP helper
 # ---------------------------------------------------------------------------
 
@@ -268,6 +328,18 @@ def scan_city(city: str, market_type: str = "high") -> dict:
             except Exception as e:
                 bracket["ob_error"] = str(e)
 
+            # Record YES price into in-memory history for sentiment tracking.
+            # Uses ob_yes_ask (what we'd pay for YES) as the cleaner price signal;
+            # falls back to yes_bid from the market snapshot if orderbook failed.
+            _yes_for_history = (
+                bracket.get("ob_yes_ask")
+                or bracket.get("yes_ask")
+                or bracket.get("yes_bid")
+            )
+            if _yes_for_history is not None:
+                record_price(ticker, float(_yes_for_history),
+                             ts=result["scanned_at_utc"])
+
             # Candlestick history
             try:
                 candles = get_candles(series_ticker, ticker)
@@ -277,6 +349,11 @@ def scan_city(city: str, market_type: str = "high") -> dict:
                 bracket["candles"]      = []
                 bracket["candle_count"] = 0
                 bracket["candle_error"] = str(e)
+
+            # Attach in-memory price history and computed trend.
+            # The engine uses yes_trend_direction to gate early overnight entries.
+            bracket["yes_price_history"]   = get_price_history(ticker)
+            bracket["yes_trend_direction"] = yes_trend(ticker)
 
             result["brackets"].append(bracket)
             time.sleep(0.15)   # gentle on the API

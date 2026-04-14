@@ -1927,9 +1927,11 @@ class PnLTab(QWidget):
                                 for f in our_buys + our_early_sells)
                 net_pnl   = round(proceeds - cost - fee, 4)
 
-                date = sorted(our_early_sells,
-                              key=lambda f: f.get("created_time", ""),
-                              reverse=True)[0].get("created_time", "")[:10]
+                # Use entry date (earliest buy fill) so early exits and settled wins
+                # from the same trading day appear on the same row in the By Day table.
+                date = sorted(our_buys,
+                              key=lambda f: f.get("created_time", ""))[0].get(
+                                  "created_time", "")[:10]
 
                 early_exits.append({
                     "ticker":    ticker,
@@ -1983,7 +1985,6 @@ class PnLTab(QWidget):
             ticker   = s.get("ticker", "")
             result   = s.get("market_result", "").lower()
             fee      = float(s.get("fee_cost") or 0)
-            settled  = s.get("settled_time", "")[:10]
 
             # Determine our side and cost purely from fills
             # Settlement fields for cost are unreliable — they reflect both sides
@@ -1994,6 +1995,14 @@ class PnLTab(QWidget):
                          if f.get("action") == "buy"]
             if not buy_fills:
                 continue
+
+            # Use entry date (earliest buy fill) so that settled wins and early
+            # exits from the same trading day land on the same row in the By Day
+            # table. Using settled_time caused wins to appear a day after their
+            # corresponding stops (settlement runs overnight after market close).
+            entry_date = sorted(buy_fills,
+                                key=lambda f: f.get("created_time", ""))[0].get(
+                                    "created_time", "")[:10]
 
             # Our side = what we bought
             sides = [f.get("side") for f in buy_fills]
@@ -2024,7 +2033,7 @@ class PnLTab(QWidget):
 
             enriched.append({
                 "ticker":    ticker,
-                "date":      settled,
+                "date":      entry_date,
                 "side":      our_side.upper(),
                 "contracts": contracts,
                 "result":    result.upper(),

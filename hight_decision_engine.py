@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 
 import nws_feed
 import kalshi_scanner
+import cascade_engine
 from cities import CITIES as _CITY_REGISTRY
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for HIGH markets
                                # spring/summer: temps trending up → asymmetric risk upward
                                # data: 29% WR, -$6.52 across 7 trades
-MAX_CONTRACTS       = 2        # hard cap on contracts per position
+MAX_CONTRACTS       = 3        # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
 # Momentum detection
@@ -595,6 +596,12 @@ def run(city_filter: str = None, paper: bool = False) -> list[dict]:
         eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="high")
         evaluations.append(eval_result)
 
+    # ── Cascade tier — pure market-confirmation signals ───────────────────────
+    # Reuses kalshi_results already fetched above — no extra API calls.
+    # Signals are tagged entry_tier="cascade_morning" or "cascade_afternoon".
+    cascade_evals = cascade_engine.run(kalshi_results, city_filter)
+    evaluations.extend(cascade_evals)
+
     return evaluations
 
 
@@ -674,6 +681,9 @@ def display(evaluations: list[dict]):
     print(f"\n{'='*72}")
     if not any_signal:
         print("  No actionable signals at this time.")
+
+    # Show cascade signals separately
+    cascade_engine.display(evaluations)
 
 
 # ---------------------------------------------------------------------------
