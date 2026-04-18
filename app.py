@@ -801,10 +801,12 @@ class CityDetailDialog(QDialog):
             pos_table.setRowCount(len(city_positions))
             pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-            pos_table.horizontalHeader().setStretchLastSection(True)
+            hdr_m = pos_table.horizontalHeader()
+            hdr_m.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            hdr_m.setMinimumSectionSize(1)
+            for col, pct in enumerate([30, 12, 9, 16, 16]):
+                hdr_m.resizeSection(col, pct)
             pos_table.verticalHeader().setVisible(False)
-            for col, w in enumerate([190, 75, 65, 100, 70]):
-                pos_table.setColumnWidth(col, w)
 
             for row, pos in enumerate(city_positions):
                 ticker  = pos.get("ticker", "")
@@ -887,11 +889,13 @@ class CityDetailDialog(QDialog):
         t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         t.setAlternatingRowColors(True)
-        t.horizontalHeader().setStretchLastSection(True)
+        hdr_h = t.horizontalHeader()
+        hdr_h.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hdr_h.setMinimumSectionSize(1)
+        for col, pct in enumerate([18, 26, 11, 15, 11]):
+            hdr_h.resizeSection(col, pct)
         t.verticalHeader().setVisible(False)
         t.setStyleSheet(f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}")
-        for col, w in enumerate([120, 175, 70, 95, 70]):
-            t.setColumnWidth(col, w)
         return t
 
     def _fill_hist_table(self, table: QTableWidget, rows: list):
@@ -1164,11 +1168,11 @@ class HomeTab(QWidget):
             ["Market", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened", "Status"]
         )
         hdr = self.pos_table.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hdr.setStretchLastSection(True)
-        # Ticker, Side, Qty, Avg Cost, Current, Unreal PnL, Opened, Status
-        for col, width in enumerate([240, 85, 75, 110, 110, 130, 155, 65]):
-            self.pos_table.setColumnWidth(col, width)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hdr.setMinimumSectionSize(1)
+        # Market, Side, Qty, Avg Cost, Current, Unreal PnL, Opened, Status
+        for col, pct in enumerate([26, 7, 5, 10, 10, 12, 14, 7]):
+            hdr.resizeSection(col, pct)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.pos_table.setAlternatingRowColors(True)
@@ -1985,6 +1989,14 @@ class PnLTab(QWidget):
             ticker   = s.get("ticker", "")
             result   = s.get("market_result", "").lower()
             fee      = float(s.get("fee_cost") or 0)
+            # Parse settled_time to local display string for All Settlements table
+            raw_ts   = s.get("settled_time", "")
+            try:
+                from zoneinfo import ZoneInfo as _ZI
+                _dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                settled_ts = _dt.astimezone(_ZI("Europe/Lisbon")).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                settled_ts = raw_ts[:16].replace("T", " ") if raw_ts else ""
 
             # Determine our side and cost purely from fills
             # Settlement fields for cost are unreliable — they reflect both sides
@@ -2032,29 +2044,31 @@ class PnLTab(QWidget):
                 net_pnl = round(-cost - fee, 4)
 
             enriched.append({
-                "ticker":    ticker,
-                "date":      entry_date,
-                "side":      our_side.upper(),
-                "contracts": contracts,
-                "result":    result.upper(),
-                "won":       won,
-                "cost":      cost,
-                "fee":       fee,
-                "net_pnl":   net_pnl,
+                "ticker":     ticker,
+                "date":       entry_date,
+                "settled_ts": settled_ts,
+                "side":       our_side.upper(),
+                "contracts":  contracts,
+                "result":     result.upper(),
+                "won":        won,
+                "cost":       cost,
+                "fee":        fee,
+                "net_pnl":    net_pnl,
             })
 
         # Add early exits (stop-losses, manual closes) to enriched list
         for ex in (early_exits or []):
             enriched.append({
-                "ticker":    ex["ticker"],
-                "date":      ex["date"],
-                "side":      ex["side"],
-                "contracts": ex["contracts"],
-                "result":    "EARLY EXIT",
-                "won":       ex["net_pnl"] > 0,
-                "cost":      ex["avg_buy"] * ex["contracts"],
-                "fee":       ex["fee"],
-                "net_pnl":   ex["net_pnl"],
+                "ticker":     ex["ticker"],
+                "date":       ex["date"],
+                "settled_ts": "",
+                "side":       ex["side"],
+                "contracts":  ex["contracts"],
+                "result":     "EARLY EXIT",
+                "won":        False,
+                "cost":       ex["avg_buy"] * ex["contracts"],
+                "fee":        ex["fee"],
+                "net_pnl":    ex["net_pnl"],
             })
 
         if not enriched:
@@ -2180,11 +2194,11 @@ class PnLTab(QWidget):
         self.daily_table.setHorizontalHeaderLabels(hdrs)
         self.daily_table.setRowCount(len(day_rows))
         dh = self.daily_table.horizontalHeader()
-        dh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        dh.setStretchLastSection(True)
-        # Date, Trades, Wins, Losses, Stopped, Win%, Fees, Net PnL, Cum PnL
-        for col, width in enumerate([165, 90, 85, 90, 90, 80, 110, 130, 100]):
-            self.daily_table.setColumnWidth(col, width)
+        dh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        dh.setMinimumSectionSize(1)
+        # Relative column weights: Date, Trades, Wins, Losses, Stopped, Win%, Fees, Net PnL, Cum PnL
+        for col, pct in enumerate([14, 8, 7, 8, 9, 7, 9, 10, 10]):
+            dh.resizeSection(col, pct)
 
         for ri, row in enumerate(day_rows):
             vals = [row["date"], str(row["trades"]), str(row["wins"]),
@@ -2202,16 +2216,16 @@ class PnLTab(QWidget):
                 self.daily_table.setItem(ri, ci, item)
 
         # ── All settlements table ─────────────────────────────────────
-        s_hdrs = ["Date", "Market", "Side", "Qty", "Result", "Fee", "Net PnL"]
+        s_hdrs = ["Settled", "Market", "Side", "Qty", "Result", "Fee", "Net PnL"]
         self.settlements_table.setColumnCount(len(s_hdrs))
         self.settlements_table.setHorizontalHeaderLabels(s_hdrs)
         self.settlements_table.setRowCount(len(enriched))
         sh = self.settlements_table.horizontalHeader()
-        sh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        sh.setStretchLastSection(True)
-        # Date, Market, Side, Qty, Result, Fee, Net PnL
-        for col, width in enumerate([165, 240, 80, 70, 100, 110, 100]):
-            self.settlements_table.setColumnWidth(col, width)
+        sh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        # Relative column weights: Settled, Market, Side, Qty, Result, Fee, Net PnL
+        for col, pct in enumerate([16, 26, 7, 6, 10, 8, 10]):
+            sh.setMinimumSectionSize(1)
+            sh.resizeSection(col, pct)
 
         for ri, e in enumerate(sorted(enriched, key=lambda x: x["date"], reverse=True)):
             result  = e.get("result", "")
@@ -2226,7 +2240,8 @@ class PnLTab(QWidget):
                 result_color = RED
 
             market = _city_from_ticker(e["ticker"]) or e["ticker"]
-            vals = [e["date"], market, e["side"], str(e["contracts"]),
+            display_ts = e.get("settled_ts") or e["date"]
+            vals = [display_ts, market, e["side"], str(e["contracts"]),
                     result_str, f"${e['fee']:.2f}", f"${e['net_pnl']:+.2f}"]
             for ci, val in enumerate(vals):
                 item = QTableWidgetItem(val)
@@ -2332,11 +2347,11 @@ class SessionTab(QWidget):
             ["Time", "Market", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
         )
         th = self.table.horizontalHeader()
-        th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        th.setStretchLastSection(True)
+        th.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        th.setMinimumSectionSize(1)
         # Time, Market, Side, Qty, Entry, Score, Unreal. PnL, Status
-        for col, width in enumerate([120, 220, 80, 70, 90, 80, 110, 65]):
-            self.table.setColumnWidth(col, width)
+        for col, pct in enumerate([10, 26, 7, 5, 9, 8, 12, 8]):
+            th.resizeSection(col, pct)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)

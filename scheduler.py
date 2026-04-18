@@ -5,11 +5,17 @@ Runs the full trading pipeline on a polling loop with a dynamic interval
 that tightens around the peak trading window.
 
 Interval schedule (per city local time):
-  Overnight (midnight–9am)  → 10 min  (bracket elimination from obs temps)
+  Overnight (midnight–9am)  →  5 min  (bracket elimination + next-market scan)
   9am–11am                  →  5 min  (approaching peak, forecasts updating)
   11am–1pm                  →  3 min  (peak — NWS model runs, market reprices fastest)
   1pm–3pm                   →  5 min  (post-peak, convergence settling)
-  3pm–midnight               → 10 min  (exit monitoring, slow convergence)
+  3pm–midnight               →  5 min  (next-market may appear at any time)
+
+Next-market scan:
+  Runs every poll cycle in parallel with the main pipeline — no time-window gate.
+  tomorrow_scanner tracks per-city state: which market date to watch, and whether
+  today's market has converged (triggering a roll-forward to the day after tomorrow).
+  On startup, state is derived from live Kalshi data (open positions + market prices).
 
 Usage:
   python scheduler.py                   # live, dynamic interval
@@ -22,12 +28,14 @@ import os
 import json
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import trader
 import hight_decision_engine as decision_engine
+import tomorrow_scanner
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 # ---------------------------------------------------------------------------
@@ -59,21 +67,19 @@ def dynamic_interval(city_filter: str = None) -> int:
     Returns poll interval in seconds based on the most active city phase.
     Takes the minimum (most frequent) interval across all active cities.
 
-    Overnight (midnight–9am): 10 min — bracket elimination from obs temps
-    9am–11am:  5 min  — approaching peak, forecasts updating
-    11am–1pm:  3 min  — peak — NWS model runs, market reprices fastest
-    1pm–3pm:   5 min  — post-peak, convergence settling
-    3pm–11pm: 10 min  — exit monitoring, slow convergence
+    Default 5 min everywhere — the next-market may converge at any time of
+    day, so we keep a consistent cadence. Peak window tightens to 3 min.
+
+    Overnight/shoulder (midnight–11am, 1pm–midnight): 5 min
+    Peak (11am–1pm):                                  3 min
     """
     cities       = _filter_cities(city_filter)
-    min_interval = 10 * 60   # default: 10 min
+    min_interval = 5 * 60    # default: 5 min
 
     for tz in cities.values():
         h = local_hour(tz)
         if 11 <= h < 13:
             min_interval = min(min_interval, 3 * 60)    # peak — 3 min
-        elif h in (9, 10, 13, 14):
-            min_interval = min(min_interval, 5 * 60)    # shoulder — 5 min
 
     return min_interval
 
@@ -128,6 +134,14 @@ def run_scheduler(
         print(f"  City filter   : {city_filter}")
     print(f"{'='*65}\n")
 
+    # ── Initialise next-market scanner from live state ────────────────────
+    print("  Initialising next-market scanner...")
+    try:
+        tomorrow_scanner.initialise(client=client, city_filter=city_filter)
+    except Exception as e:
+        print(f"  Scanner init error (non-fatal): {e}")
+    print()
+
     poll_count = 0
 
     while True:
@@ -144,15 +158,35 @@ def run_scheduler(
               f"(interval: {interval_secs // 60} min)")
         print(f"{'-'*55}")
 
-        # ── Run decision engine + execute signals ────────────────────────
-        try:
+        # ── Run pipeline + next-market scan in parallel ──────────────────
+        # Both tasks are I/O-bound with no shared mutable state.
+        # The scan runs every poll — convergence gating is handled inside
+        # tomorrow_scanner, not here.
+        def _run_pipeline():
             trader.run_pipeline(
                 client      = client,
                 city_filter = city_filter,
                 paper       = paper,
             )
-        except Exception as e:
-            print(f"  Pipeline error: {e}")
+
+        def _run_scan():
+            tomorrow_scanner.run_scan(
+                client      = client,
+                city_filter = city_filter,
+                paper       = paper,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {
+                pool.submit(_run_pipeline): "pipeline",
+                pool.submit(_run_scan):     "next_market_scan",
+            }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"  {name} error: {e}")
 
         # ── Check exits — reuse positions already fetched by run_pipeline ──
         try:

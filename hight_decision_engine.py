@@ -16,11 +16,14 @@ Gates (applied in order — any failure skips to next bracket):
   3. Boundary    — bias-corrected forecast is ≥ dynamic_buffer°F from both bracket edges
                    (dynamic_buffer scales with city's tmax_stddev from city_profiles.json)
 
-Signal scoring (0–3):
+Signal scoring (−1 to +5):
   +1 obs_eliminates_bracket  — observed high ≥ bracket cap (bracket physically impossible)
   +1 obs_below_floor         — observed high < bracket floor − buffer (bracket not yet in play)
+  −1 obs_inside_bracket      — observed high already within [floor, cap) (bracket may be resolving YES)
   +1 forecast_well_clear     — corrected forecast ≥ FORECAST_WELL_CLEAR°F from nearest edge
-  +1 momentum_flat_or_down   — no upward price momentum in recent candles
+  +1 momentum_flat_or_down   — no upward price momentum in recent candles (market signal)
+  +1 yes_price_quality       — YES ≤ YES_HIGH_CONFIDENCE (12¢) — market strongly agrees (market signal)
+  Minimum score to trade: ≥ 1
 
 Usage:
   python hight_decision_engine.py                 # run full analysis, all cities
@@ -84,7 +87,7 @@ MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for HIGH markets
                                # spring/summer: temps trending up → asymmetric risk upward
                                # data: 29% WR, -$6.52 across 7 trades
-MAX_CONTRACTS       = 3        # hard cap on contracts per position
+MAX_CONTRACTS       = 10       # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
 # Momentum detection
@@ -99,6 +102,20 @@ FORECAST_BIAS_CORRECTION = -1.0   # °F — subtract from NWS forecast high
 # Bracket must be this far from the corrected forecast to score the forecast point
 # (higher bar than boundary buffer gate — gate≈3°F, score=6°F)
 FORECAST_WELL_CLEAR = 6.0
+
+# Market-derived confidence bonus
+# YES price at or below this threshold earns an extra score point — the market
+# is pricing in very high NO probability, which is a stronger signal than any
+# single temperature reading. Complements momentum_flat_or_down (which only
+# checks direction, not level).
+YES_HIGH_CONFIDENCE = 0.12   # YES ≤ 12¢ → market strongly agrees with our thesis
+
+# Temperature penalty threshold
+# If observed high is already inside the bracket range [floor, cap), the
+# market may be in the process of resolving YES. This deducts one score point
+# to require stronger market confirmation before entering. It does NOT block
+# the trade outright — a YES price of 0.10 with flat momentum is still valid
+# even if obs is marginally inside the range.
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +428,10 @@ def evaluate_bracket(
         return signal
 
     # --- Signal scoring ---
+    # Score range: −1 to +5.
+    # Temperature signals — derived from NWS obs, subject to bias uncertainty.
+    # Market signals — derived from live Kalshi prices, weighted more heavily
+    # since they aggregate all available information continuously.
     score   = 0
     details = []
 
@@ -421,6 +442,12 @@ def evaluate_bracket(
         elif floor is not None and observed_high < floor - dynamic_buffer:
             score += 1
             details.append("obs_below_floor")
+        elif floor is not None and cap is not None and floor <= observed_high < cap:
+            # Observed high is inside the bracket range — bracket may be resolving YES.
+            # Penalise rather than block: market price still determines whether
+            # we enter, but we require stronger market confirmation.
+            score -= 1
+            details.append("obs_inside_bracket")
 
     if distances and min(distances) >= FORECAST_WELL_CLEAR:
         score += 1
@@ -431,12 +458,18 @@ def evaluate_bracket(
         score += 1
         details.append("momentum_flat_or_down")
 
+    # yes_ask computed early for scoring — reused in trade decision below.
+    yes_ask = bracket.get("ob_yes_ask")
+    if yes_ask is not None and 0 < yes_ask <= YES_HIGH_CONFIDENCE:
+        score += 1
+        details.append("yes_price_quality")
+
     signal["score"]        = score
     signal["score_detail"] = details
 
     # --- Trade type decision ---
-    yes_ask = bracket.get("ob_yes_ask")
-    no_ask  = bracket.get("ob_no_ask")
+    # yes_ask already computed above.
+    no_ask = bracket.get("ob_no_ask")
 
     if (
         no_ask is not None
@@ -445,10 +478,13 @@ def evaluate_bracket(
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
     ):
-        if no_ask < 0.75 and score < 3:
+        # Score range is −1 to +5. Require score ≥ 1 to trade.
+        # obs_inside_bracket penalty means a position with obs in range
+        # needs at least two positive signals to remain actionable.
+        if score < 1:
             signal["skip_reason"] = (
-                f"Entry ${no_ask:.2f} < 0.75 requires score 3/3 "
-                f"(got {score}/3)"
+                f"Score {score} below minimum (1 required) — "
+                f"details: {details}"
             )
         else:
             signal["trade_type"]    = "NO"
@@ -578,7 +614,12 @@ def evaluate_city(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(city_filter: str = None, paper: bool = False) -> list[dict]:
+def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]:
+    """
+    Run the HIGH decision engine for all cities.
+    Returns (evaluations, nws_snapshot) — the snapshot is passed to the LOWT
+    engine to avoid a redundant full NWS fetch each poll cycle.
+    """
     profiles = load_profiles()
 
     print("Fetching NWS live data...")
@@ -602,7 +643,7 @@ def run(city_filter: str = None, paper: bool = False) -> list[dict]:
     cascade_evals = cascade_engine.run(kalshi_results, city_filter)
     evaluations.extend(cascade_evals)
 
-    return evaluations
+    return evaluations, nws_results
 
 
 # ---------------------------------------------------------------------------
@@ -621,13 +662,17 @@ def display(evaluations: list[dict]):
     any_signal = False
 
     for ev in evaluations:
+        # Cascade evals have their own display — skip them here
+        if ev.get("cascade"):
+            continue
+
         city = ev["city"]
 
         if ev.get("error"):
             print(f"\n{city}: ERROR — {ev['error']}")
             continue
 
-        snap        = ev["nws_snapshot"]
+        snap        = ev.get("nws_snapshot", {})
         trade_start = _trade_start_for(city)
         trade_end   = _trade_end_for(city)
         bias        = ev.get("city_bias", FORECAST_BIAS_CORRECTION)
@@ -674,7 +719,7 @@ def display(evaluations: list[dict]):
                 f"  {bracket_str:<22} "
                 f"{s['trade_type']:>5} "
                 f"${s['entry_price']:.2f}  "
-                f"{s['score']}/3    "
+                f"{s['score']}/5    "
                 f"{detail_str}"
             )
 
@@ -696,7 +741,7 @@ if __name__ == "__main__":
     parser.add_argument("--paper", action="store_true",    help="Paper trade mode (log only, no orders)")
     args = parser.parse_args()
 
-    evaluations = run(city_filter=args.city, paper=args.paper)
+    evaluations, _ = run(city_filter=args.city, paper=args.paper)
     display(evaluations)
 
     if args.paper:

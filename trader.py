@@ -69,7 +69,7 @@ BASE_CONTRACTS = 1
 
 # Score-based position sizing multiplier
 # Kept flat at 1x — with a small account, size consistency matters more than scaling
-SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
+SCORE_SIZING = {1: 1.0, 2: 3.0, 3: 5.0}
 
 # Exit monitor poll interval (seconds)
 MONITOR_INTERVAL = 30
@@ -659,9 +659,11 @@ FORECAST_ANCHOR_BUFFER = 1.5   # °F — was 3.0. Tightened after audit: 10 WHW 
 ANCHOR_MIN_HOUR = 14           # local hour — anchor cannot fire before this.
                                 # Before 14:00, the daily high hasn't been established
                                 # and a small gap is normal morning temperature climbing.
-                                # A 1°F gap at 12:25 with 3h of peak heating ahead is
-                                # very different from a 1°F gap at 15:30.
-                                # After 14:00 local, the gap is genuinely informative.
+
+ANCHOR_MIN_YES  = 0.30          # YES price must be at or above this for anchor to fire.
+                                # If YES < 0.30, the market is already confident —
+                                # temperature noise at that point adds no information.
+                                # Only fire when BOTH temperature AND market show uncertainty.
 
 # NO position: settlement hold override
 # If the observed value is this many °F clear of the dangerous bracket boundary
@@ -669,6 +671,17 @@ ANCHOR_MIN_HOUR = 14           # local hour — anchor cannot fire before this.
 # taking an early exit — the position will resolve correctly.
 SETTLEMENT_CLEAR_BUFFER = 5.0   # °F
 SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the observation
+
+# NO position: time-threshold hold
+# Before HOLD_UNTIL_HOUR local, all exit checks (price stop, yes ceiling, anchor)
+# are suppressed for positions entered at or above HOLD_MIN_ENTRY.
+# Rationale: intraday price dips before the daily high is established (typically
+# 14:00–17:00 local) are almost always noise.
+# Data (Apr17): 4/5 exits were wrong — all entered >= 0.79. The one correct exit
+# (DC B81.5, entry $0.44) was below the HOLD_MIN_ENTRY threshold, so it is still
+# caught by normal exit logic even before the time threshold.
+HOLD_UNTIL_HOUR  = 16    # local hour — suppress exits before 16:00 local
+HOLD_MIN_ENTRY   = 0.75  # minimum entry No price to qualify for the hold
 
 
 # ---------------------------------------------------------------------------
@@ -684,30 +697,40 @@ def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
     """
     Extract (floor, ceiling) from a bracket ticker suffix.
 
-    HIGH brackets:
-      B88   → (88.0, 90.0)   between bracket, 2°F Kalshi spacing
-      T90   → (90.0, None)   above threshold — no ceiling
+    Kalshi bracket structure — the NUMBER in the ticker is the CAP:
 
-    LOWT brackets:
-      B52   → (52.0, 54.0)   between bracket
-      T31   → (None, 31.0)   below threshold — no floor
+      HIGH B brackets (e.g. B80.5 = "79 to 80°F"):
+        cap   = 80.5  (the number)
+        floor = 78.5  (cap - 2.0)
+        Settles YES if 78.5 ≤ high < 80.5
 
-    Returns (None, None) if the bracket suffix cannot be parsed.
+      HIGH bottom T bracket (e.g. T79 = "78 or below"):
+        floor = None  (no lower bound)
+        cap   = 78.5  (val - 0.5)
+        Settles YES if high < 78.5
+
+      LOWT B brackets: same formula — cap = number, floor = cap - 2.0
+      LOWT T brackets (e.g. T31 = "below 31°F low"):
+        floor = None, cap = val
+
+    Returns (None, None) if the suffix cannot be parsed.
     """
     try:
         bracket = ticker.split("-")[-1]
         is_lowt = "LOWT" in ticker
 
         if bracket.startswith("B"):
-            floor = float(bracket[1:])
-            return floor, round(floor + 2.0, 1)
+            cap = float(bracket[1:])
+            return round(cap - 2.0, 1), cap
 
         elif bracket.startswith("T"):
             val = float(bracket[1:])
             if is_lowt:
-                return None, val    # below-threshold bracket — ceiling is T value
+                return None, val
             else:
-                return val, None    # above-threshold bracket — floor is T value
+                # HIGH T brackets are always bottom T ("below X°F") in our positions
+                # since top T ("above X°F") NO trades are banned.
+                return None, round(val - 0.5, 1)
 
     except (ValueError, IndexError):
         pass
@@ -864,21 +887,38 @@ def check_exits(
             # still run normally regardless of the hour.
             if local_hour >= SETTLEMENT_HOLD_HOUR and obs_val is not None:
                 if not is_lowt and floor is not None:
-                    # HIGH: safe if observed high is well below bracket floor
+                    # HIGH B bracket: safe if obs_high well below bracket floor
                     if (floor - obs_val) >= SETTLEMENT_CLEAR_BUFFER:
                         print(f"  HOLD TO SETTLEMENT: {ticker}  "
                               f"obs_high={obs_val}°F is "
                               f"{floor - obs_val:.1f}°F below bracket floor {floor}°F  "
                               f"(local={local_hour}h)")
                         continue
+                elif not is_lowt and floor is None and ceiling is not None:
+                    # HIGH bottom T: safe if obs_high well above ceiling
+                    # (temp already exceeded the "below X" threshold → bracket dead)
+                    if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
+                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                              f"obs_high={obs_val}°F is "
+                              f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
+                              f"(local={local_hour}h)")
+                        continue
                 elif is_lowt and ceiling is not None:
-                    # LOWT: safe if observed low is well above bracket ceiling
+                    # LOWT: safe if obs_low well above bracket ceiling
                     if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
                         print(f"  HOLD TO SETTLEMENT: {ticker}  "
                               f"obs_low={obs_val}°F is "
                               f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
                               f"(local={local_hour}h)")
                         continue
+
+            # ── Time-threshold hold ────────────────────────────────────────
+            # Before HOLD_UNTIL_HOUR local, suppress all exit checks for
+            # high-conviction NO positions (entry >= HOLD_MIN_ENTRY).
+            # Low-conviction entries (< HOLD_MIN_ENTRY) are not protected —
+            # they may reflect genuine uncertainty worth exiting early.
+            if local_hour < HOLD_UNTIL_HOUR and avg_cost >= HOLD_MIN_ENTRY:
+                continue
 
             # ── Probability ceiling ────────────────────────────────────────
             # Runs at any hour — if YES crosses 50¢ the thesis is dead
@@ -901,7 +941,8 @@ def check_exits(
             # eliminated — the day's high can't un-happen. Firing the anchor in
             # that case causes false exits on winning positions (Denver bug).
             # When obs >= cap, the settlement hold or normal expiry handles it.
-            if exit_reason is None and obs_val is not None and local_hour >= ANCHOR_MIN_HOUR:
+            if exit_reason is None and obs_val is not None and local_hour >= ANCHOR_MIN_HOUR \
+                    and yes_price >= ANCHOR_MIN_YES:
                 anchor_triggered = False
                 if not is_lowt and floor is not None:
                     # HIGH: dangerous if observed high approaching bracket floor,
@@ -1052,20 +1093,31 @@ def _city_local_date(city: str):
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
     # ── HIGH markets ─────────────────────────────────────────────────────────
-    evaluations = decision_engine.run(city_filter=city_filter)
+    # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
+    # to avoid a second full NWS sweep (60 API calls) each poll cycle.
+    evaluations, nws_snapshot = decision_engine.run(city_filter=city_filter)
     decision_engine.display(evaluations)
 
     # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
-        lowt_evals = lowt_decision_engine.run(city_filter=city_filter, paper=paper)
+        lowt_evals = lowt_decision_engine.run(
+            city_filter  = city_filter,
+            paper        = paper,
+            nws_snapshot = nws_snapshot,
+        )
         lowt_decision_engine.display(lowt_evals)
         evaluations = evaluations + lowt_evals
     except Exception as e:
         print(f"  LOWT pipeline error (non-fatal): {e}")
 
-    balance    = get_balance(client)
-    deployable = round(balance * 0.70, 2)
-    print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
+    try:
+        balance    = get_balance(client)
+        deployable = round(balance * 0.70, 2)
+        print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
+    except Exception as e:
+        print(f"  Balance fetch failed: {e} — using $0 deployable cap")
+        balance    = 0.0
+        deployable = 0.0
 
     try:
         live_positions = sync_from_kalshi(client)
@@ -1100,12 +1152,14 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 print(f"  Skipping {ticker} — exited this session (cooldown)")
                 continue
 
-            # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets
-            max_per_city = signal.get("max_contracts", 2)
-            city_held    = held_per_city.get(city, 0)
-            if city_held >= max_per_city:
+            # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets.
+            # Uses decision_engine.MAX_NO_PER_CITY (positions per city) — NOT
+            # signal["max_contracts"] which is contracts per position.
+            city_held = held_per_city.get(city, 0)
+            if city_held >= decision_engine.MAX_NO_PER_CITY:
                 print(f"  Skipping {ticker} — {city} already holds "
-                      f"{city_held}/{max_per_city} positions today")
+                      f"{city_held}/{decision_engine.MAX_NO_PER_CITY} positions today "
+                      f"(MAX_NO_PER_CITY)")
                 continue
             contracts = contracts_for_signal(signal)
             side      = signal["trade_type"].lower()

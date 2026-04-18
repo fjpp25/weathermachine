@@ -139,6 +139,48 @@ def fetch_brackets(series: str) -> list[dict]:
         return []
 
 
+def fetch_tomorrows_brackets(series: str) -> list[dict]:
+    """
+    Fetch tomorrow's open brackets for a given series from Kalshi.
+    Called when today's market has converged — tomorrow's market has
+    been running since ~10am ET and already has meaningful price discovery.
+    """
+    from datetime import timedelta
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%y%b%d").upper()
+    try:
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"series_ticker": series, "status": "open"},
+            timeout=10,
+        )
+        markets = resp.json().get("markets", [])
+        return [m for m in markets if tomorrow in m.get("ticker", "").upper()]
+    except Exception as e:
+        print(f"  Kalshi error (tomorrow) for {series}: {e}")
+        return []
+
+
+# Convergence threshold — same value as kalshi_scanner.CONVERGENCE_THRESHOLD.
+# When all brackets have max(yes_bid, no_bid) >= this, today's market is
+# effectively settled and tomorrow's market is worth observing.
+CONVERGENCE_THRESHOLD = 0.97
+
+
+def _is_converged(brackets: list[dict]) -> bool:
+    """
+    Return True if every bracket has either YES or NO at >= CONVERGENCE_THRESHOLD.
+    Requires at least 4 brackets to guard against incomplete data.
+    """
+    if len(brackets) < 4:
+        return False
+    for m in brackets:
+        yes = float(m.get("yes_bid_dollars") or 0)
+        no  = float(m.get("no_bid_dollars")  or 0)
+        if max(yes, no) < CONVERGENCE_THRESHOLD:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Observation recorder
 # ---------------------------------------------------------------------------
@@ -252,6 +294,47 @@ def poll_once(observations: list[dict]) -> int:
                     "open_interest":      open_interest,
                 })
                 rows_added += 1
+
+            # When today's HIGH market is fully converged, also record tomorrow's
+            # brackets. This captures early price discovery on the next day's market
+            # — the data needed to validate the two-stage T bracket strategy.
+            # NWS fields are null (no same-day observations for tomorrow yet).
+            if market_type == "high" and _is_converged(brackets):
+                tomorrow_brackets = fetch_tomorrows_brackets(series)
+                if tomorrow_brackets:
+                    print(f"  [{city}] today converged — recording {len(tomorrow_brackets)} "
+                          f"tomorrow brackets")
+                    for m in tomorrow_brackets:
+                        ticker        = m.get("ticker", "")
+                        yes_price     = float(m.get("yes_bid_dollars") or 0)
+                        no_price      = float(m.get("no_bid_dollars")  or 0)
+                        volume        = float(m.get("volume_fp") or 0)
+                        open_interest = float(m.get("open_interest_fp") or 0)
+                        bracket       = ticker.split("-")[-1] if "-" in ticker else ticker
+                        yes_ask       = round(1.0 - no_price, 4) if no_price > 0 else None
+                        spread        = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
+
+                        observations.append({
+                            "poll_time_utc":      poll_time,
+                            "city":               city,
+                            "market_type":        "high_tomorrow",
+                            "local_time":         local_time,
+                            "local_hour":         local_hour,
+                            "observed_high_f":    None,
+                            "forecast_high_f":    None,
+                            "observed_low_f":     None,
+                            "forecast_low_f":     None,
+                            "forecast_issued_at": None,
+                            "hazards":            [],
+                            "ticker":             ticker,
+                            "bracket":            bracket,
+                            "yes_price":          yes_price,
+                            "no_price":           no_price,
+                            "spread":             spread,
+                            "volume":             volume,
+                            "open_interest":      open_interest,
+                        })
+                        rows_added += 1
 
         # Summary line per city
         high_brackets = fetch_brackets(cfg.get("high_series") or cfg.get("high", ""))

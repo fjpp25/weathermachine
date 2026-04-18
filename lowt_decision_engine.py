@@ -388,14 +388,22 @@ def evaluate_city_lowt(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(city_filter: str = None, paper: bool = False) -> list[dict]:
+def run(city_filter: str = None, paper: bool = False,
+        nws_snapshot: dict = None) -> list[dict]:
     """
     Run the LOWT decision engine for all pilot cities (or one if city_filter set).
     Returns evaluations list. Signals with trade_type="NO" are placed as orders
     unless paper=True.
+
+    Pass nws_snapshot if already fetched by the HIGH engine this poll cycle —
+    avoids a redundant full NWS sweep (20 cities × 3 HTTP calls each).
     """
-    print("Fetching NWS live data (LOWT)...")
-    nws_results = nws_feed.snapshot(city_filter)
+    if nws_snapshot is None:
+        print("Fetching NWS live data (LOWT)...")
+        nws_results = nws_feed.snapshot(city_filter)
+    else:
+        print("Reusing NWS snapshot from HIGH engine (no redundant fetch).")
+        nws_results = nws_snapshot
 
     print("Scanning Kalshi LOWT markets...")
     kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="low")
@@ -438,7 +446,7 @@ def display(evaluations: list[dict]):
             print(f"\n{city}: SKIP — {ev['error']}")
             continue
 
-        snap      = ev["nws_snapshot"]
+        snap      = ev.get("nws_snapshot", {})
         trade_end = _trade_end_for_lowt(city)
         fmt       = lambda v: f"{v:.1f}" if v is not None else "N/A"
 

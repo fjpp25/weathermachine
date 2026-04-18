@@ -23,7 +23,7 @@ Usage:
 import json
 import time
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from decimal import Decimal
@@ -156,6 +156,54 @@ def get_todays_markets(series_ticker: str) -> list[dict]:
     return today_markets if today_markets else markets
 
 
+def get_tomorrows_markets(series_ticker: str) -> list[dict]:
+    """
+    Fetch open markets for a series filtered to tomorrow's date only.
+    Called when today's market has fully converged — tomorrow's market
+    opens at ~10am ET so by evening it has hours of price discovery.
+    """
+    data = get(
+        f"{API_BASE}/markets",
+        params={"series_ticker": series_ticker, "status": "open"}
+    )
+    markets = data.get("markets", [])
+
+    tomorrow    = datetime.now(timezone.utc) + timedelta(days=1)
+    date_suffix = tomorrow.strftime("%y%b%d").upper()
+
+    return [m for m in markets if date_suffix in m.get("event_ticker", "")]
+
+
+# Convergence threshold: all brackets must have max(yes_price, no_price) >= this
+# to be considered settled. 0.97 chosen as safe floor — a bracket at $0.97 is
+# effectively dead from a trading perspective, even if not at the technical max.
+CONVERGENCE_THRESHOLD = 0.97
+
+
+def _is_converged(brackets: list[dict]) -> bool:
+    """
+    Return True if today's market has fully converged — every bracket
+    has either YES or NO at >= CONVERGENCE_THRESHOLD.
+
+    At this point the market outcome is effectively determined and
+    tomorrow's market is worth scanning for new entry opportunities.
+    Requires at least 4 brackets to guard against incomplete data.
+    """
+    if len(brackets) < 4:
+        return False
+    for b in brackets:
+        yes = b.get("ob_yes_ask") or b.get("yes_ask") or 0.0
+        # no_ask from orderbook if available; otherwise derive from yes_bid
+        # (no_ask ≈ 1.0 - yes_bid at near-settled prices, safe approximation)
+        _yes_bid    = b.get("yes_bid")
+        no_fallback = round(1.0 - float(_yes_bid), 2) if _yes_bid else 0.0
+        no          = b.get("ob_no_ask") or no_fallback
+        # Winner bracket: YES≈1.0; loser brackets: NO≈1.0 — max() catches both
+        if max(float(yes), float(no)) < CONVERGENCE_THRESHOLD:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Step 2: Fetch orderbook for a market (gives us yes/no prices + depth)
 # ---------------------------------------------------------------------------
@@ -267,53 +315,38 @@ def safe_decimal(val) -> float | None:
 # Step 4: Assemble full market snapshot for one city
 # ---------------------------------------------------------------------------
 
-def scan_city(city: str, market_type: str = "high") -> dict:
+def _scan_brackets(markets: list[dict], series_ticker: str,
+                   skip_orderbook: bool = False,
+                   skip_candles: bool = False) -> list[dict]:
     """
-    Full scan for one city and market type ("high" or "low").
-    Returns a structured dict with all brackets and their data.
+    Enrich a list of raw Kalshi market dicts with orderbook, candles and
+    price history. Extracted from scan_city so it can be reused for both
+    today's and tomorrow's brackets.
+
+    Args:
+        markets:        raw market dicts from Kalshi API
+        series_ticker:  used for candle fetching
+        skip_orderbook: True for converged brackets — no signal value
+        skip_candles:   True for tomorrow's brackets — too little history
     """
-    series_ticker = CITY_SERIES.get(city, {}).get(market_type)
-    if not series_ticker:
-        return {"city": city, "type": market_type, "error": "No series ticker configured"}
+    brackets = []
+    for market in markets:
+        ticker = market["ticker"]
 
-    result = {
-        "city":           city,
-        "type":           market_type,
-        "series_ticker":  series_ticker,
-        "scanned_at_utc": datetime.now(timezone.utc).isoformat(),
-        "brackets":       [],
-        "error":          None,
-    }
+        bracket = {
+            "ticker":        ticker,
+            "title":         market.get("title", ""),
+            "status":        market.get("status", "active"),
+            "floor":         market.get("floor_strike"),
+            "cap":           market.get("cap_strike"),
+            "volume":        safe_decimal(market.get("volume_fp")),
+            "open_interest": safe_decimal(market.get("open_interest_fp")),
+            "yes_bid":       safe_decimal(market.get("yes_bid_dollars")),
+            "yes_ask":       safe_decimal(market.get("yes_ask_dollars")),
+            "close_time":    market.get("close_time"),
+        }
 
-    try:
-        markets = get_todays_markets(series_ticker)
-
-        if not markets:
-            result["error"] = "No open markets found for today"
-            return result
-
-        result["event_ticker"] = markets[0].get("event_ticker")
-        result["close_time"]   = markets[0].get("close_time")   # relevant for LOW markets
-
-        for market in markets:
-            ticker = market["ticker"]
-            title  = market.get("title", "")
-
-            # Parse bracket range from market fields
-            bracket = {
-                "ticker":       ticker,
-                "title":        title,
-                "status":       market.get("status", "active"),
-                "floor":        market.get("floor_strike"),
-                "cap":          market.get("cap_strike"),
-                "volume":       safe_decimal(market.get("volume_fp")),
-                "open_interest":safe_decimal(market.get("open_interest_fp")),
-                "yes_bid":      safe_decimal(market.get("yes_bid_dollars")),
-                "yes_ask":      safe_decimal(market.get("yes_ask_dollars")),
-                "close_time":   market.get("close_time"),
-            }
-
-            # Orderbook depth
+        if not skip_orderbook:
             try:
                 ob = get_orderbook(ticker)
                 bracket.update({
@@ -328,38 +361,93 @@ def scan_city(city: str, market_type: str = "high") -> dict:
             except Exception as e:
                 bracket["ob_error"] = str(e)
 
-            # Record YES price into in-memory history for sentiment tracking.
-            # Uses ob_yes_ask (what we'd pay for YES) as the cleaner price signal;
-            # falls back to yes_bid from the market snapshot if orderbook failed.
-            _yes_for_history = (
-                bracket.get("ob_yes_ask")
-                or bracket.get("yes_ask")
-                or bracket.get("yes_bid")
-            )
-            if _yes_for_history is not None:
-                record_price(ticker, float(_yes_for_history),
-                             ts=result["scanned_at_utc"])
+        _yes_for_history = (
+            bracket.get("ob_yes_ask")
+            or bracket.get("yes_ask")
+            or bracket.get("yes_bid")
+        )
+        if _yes_for_history is not None:
+            record_price(ticker, float(_yes_for_history))
 
-            # Candlestick history
+        if not skip_candles:
             try:
                 candles = get_candles(series_ticker, ticker)
-                bracket["candles"] = candles
+                bracket["candles"]      = candles
                 bracket["candle_count"] = len(candles)
             except Exception as e:
                 bracket["candles"]      = []
                 bracket["candle_count"] = 0
                 bracket["candle_error"] = str(e)
+        else:
+            bracket["candles"]      = []
+            bracket["candle_count"] = 0
 
-            # Attach in-memory price history and computed trend.
-            # The engine uses yes_trend_direction to gate early overnight entries.
-            bracket["yes_price_history"]   = get_price_history(ticker)
-            bracket["yes_trend_direction"] = yes_trend(ticker)
+        bracket["yes_price_history"]   = get_price_history(ticker)
+        bracket["yes_trend_direction"] = yes_trend(ticker)
 
-            result["brackets"].append(bracket)
-            time.sleep(0.15)   # gentle on the API
+        brackets.append(bracket)
+        time.sleep(0.15)
 
-        # Sort brackets by floor price (ascending) for display
-        result["brackets"].sort(key=lambda b: b.get("floor") or 0)
+    brackets.sort(key=lambda b: b.get("floor") or 0)
+    return brackets
+
+
+def scan_city(city: str, market_type: str = "high") -> dict:
+    """
+    Full scan for one city and market type ("high" or "low").
+    Returns a structured dict with all brackets and their data.
+
+    When today's market has fully converged (all brackets at or above
+    CONVERGENCE_THRESHOLD), also scans tomorrow's market. Orderbook and
+    candle fetches are skipped for converged today brackets (no signal
+    value) and candles skipped for tomorrow brackets (too little history).
+    """
+    series_ticker = CITY_SERIES.get(city, {}).get(market_type)
+    if not series_ticker:
+        return {"city": city, "type": market_type, "error": "No series ticker configured"}
+
+    result = {
+        "city":              city,
+        "type":              market_type,
+        "series_ticker":     series_ticker,
+        "scanned_at_utc":    datetime.now(timezone.utc).isoformat(),
+        "brackets":          [],
+        "today_converged":   False,
+        "tomorrow_brackets": [],
+        "error":             None,
+    }
+
+    try:
+        markets = get_todays_markets(series_ticker)
+
+        if not markets:
+            result["error"] = "No open markets found for today"
+            return result
+
+        result["event_ticker"] = markets[0].get("event_ticker")
+        result["close_time"]   = markets[0].get("close_time")
+
+        # Scan today's brackets with full orderbook + candles
+        result["brackets"] = _scan_brackets(
+            markets, series_ticker,
+            skip_orderbook=False,
+            skip_candles=False,
+        )
+
+        # If today's market is fully converged, scan tomorrow's
+        if _is_converged(result["brackets"]):
+            result["today_converged"] = True
+            try:
+                tomorrow_markets = get_tomorrows_markets(series_ticker)
+                if tomorrow_markets:
+                    result["tomorrow_brackets"] = _scan_brackets(
+                        tomorrow_markets, series_ticker,
+                        skip_orderbook=False,  # need prices for cascade signal
+                        skip_candles=True,     # too little history to be useful
+                    )
+                    print(f"    ↳ converged — scanned tomorrow ({len(result['tomorrow_brackets'])} brackets)")
+            except Exception as e:
+                result["tomorrow_error"] = str(e)
 
     except Exception as e:
         result["error"] = str(e)
