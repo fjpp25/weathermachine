@@ -1,69 +1,140 @@
-# WeatherMachine
+# The Weather Machine
 
-Algorithmic trading system for Kalshi's daily temperature markets.
+A live trading system for Kalshi daily temperature markets. Monitors HIGH and LOWT temperature markets across 20 US cities, enters No positions on brackets the forecast and market structure make unlikely to resolve Yes, and manages exits automatically.
+
+---
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Continuous polling loop (5 min default, 3 min peak hours)     │
+│                                                                 │
+│  1. NWS fetch       →  live forecasts + observed highs         │
+│  2. Kalshi scan     →  bracket prices, order book depth        │
+│  3. Decision engine →  score signals, size positions           │
+│  4. Cascade engine  →  market structure convergence signals    │
+│  5. Exit check      →  forecast anchor + Yes ceiling           │
+│  6. Portfolio sync  →  update session state                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Strategy
 
-WeatherMachine trades **NO** contracts on Kalshi HIGH temperature brackets. When the NWS morning forecast places the day's high well outside a bracket's range, that bracket's NO contract trades at a discount to its true probability. The system buys NO, collects premium, and exits when the market converges or at settlement.
+### Core thesis
+Temperature markets follow a roughly normal distribution centred on the NWS forecast. Brackets far from the forecast mean (in the tails) have a high probability of settling No. The system bets No on those brackets.
 
-Key constraints calibrated from live data:
-- Entry window: **$0.75–$0.92** per NO contract (86.5% win rate across 37+ trades)
-- Max **2 contracts** per position
-- Max **2 NO positions** per city per day
-- Never trade NO on "above X°F" brackets in spring/summer (29% WR historically → banned)
-- Forecast bracket itself is never traded
+### Main engine (`hight_decision_engine.py`)
+Scores each bracket 0–5 across five components:
 
----
+| Component | Signal |
+|---|---|
+| `obs_below_floor` | Observed high already below bracket floor |
+| `forecast_well_clear` | Corrected forecast > 2°F below bracket floor |
+| `momentum_flat_or_down` | Observed high not rising toward bracket |
+| `spread_ok` | Bid-ask spread within acceptable range |
+| `depth_ok` | Sufficient order book depth on No side |
 
-## Architecture
+Minimum score for entry: **2/5**. Position sizing by score:
+
+| Score | Contracts |
+|---|---|
+| 2 | 2 |
+| 3 | 4 |
+| 4 | 5 |
+| 5 | 6 |
+
+Entry gate: No price must be in **[0.75, 0.92]**.
+
+### Forecast bias correction
+NWS morning forecasts have a measurable per-city bias. The system applies a correction to the raw forecast before scoring:
 
 ```
-nws_feed.py          ← Live NWS observations + forecasts (api.weather.gov)
-kalshi_scanner.py    ← Kalshi market prices + orderbook
-        │
-        ▼
-decision_engine.py   ← Signal generation (NO trades only)
-        │
-        ▼
-trader.py            ← Order execution + exit monitoring (Kalshi API)
-        │
-        ▼
-app.py               ← PyQt6 desktop UI
-scheduler.py         ← CLI alternative to app.py
+corrected_forecast = nws_forecast + city_bias
 ```
 
+Bias values are computed by `bias_calculator.py` from historical observation data and stored in `data/forecast_bias.json`. Refreshed periodically as more data accumulates.
+
+### Cascade engine (`cascade_engine.py`)
+A separate signal path based purely on market structure — no NWS data required.
+
+**Mechanism:** Temperature markets converge from the bottom up during the day as the observed high climbs. When any B bracket crosses No ≥ 0.97, the bracket immediately above it becomes the target. The first trigger locks the direction (bottom-up) for that city-day.
+
+**Entry conditions:**
+- No price in **[0.60, 0.90]**
+- Skip the forecast bracket (most contested by definition)
+- No new cascade starts after 15:00 local
+- Max 1 entry if trigger fires after 13:00 local
+- Max 2 entries default; 3 if top-T confirms before 13:00
+
+**Contract sizing (by conviction):**
+
+| No price range | Contracts |
+|---|---|
+| 0.60 – 0.70 | 2 |
+| 0.71 – 0.80 | 4 |
+| 0.81 – 0.90 | 6 |
+
+**Backtest (Apr 6–23, 18 days):** 108 signals, 86.1% win rate, 1 bad day.
+
+### Exit logic
+Single rule: **Yes ≥ 0.60 after 15:00 local + forecast anchor.**
+
+- **Yes ceiling:** If Yes crosses 0.60 after 15:00 local, exit — *unless* the corrected forecast is more than 2°F above the bracket floor (spike is noise, hold).
+- **Forecast anchor:** If the observed high is within 1°F of the bracket floor and the corrected forecast is ambiguous, exit regardless of hour.
+
+No stop-loss. Data showed holding almost always beats exiting on price alone.
+
 ---
 
-## Modules
+## Capital management
 
-| File | Purpose |
-|---|---|
-| `app.py` | PyQt6 desktop UI — Home, Session, Performance, Log tabs |
-| `trader.py` | Kalshi RSA-PSS auth client, order placement, exit monitor, trade log |
-| `decision_engine.py` | Signal engine — gates, scoring, NO trade decisions |
-| `kalshi_scanner.py` | Fetches brackets, orderbook depth, candlestick history from Kalshi |
-| `nws_feed.py` | Fetches observed high/low and forecast high/low from api.weather.gov |
-| `cities.py` | Single source of truth for all city metadata (station, ICAO, timezone, LST offset, per-city trade start hours) |
-| `city_profiles.py` | Fetches and caches 30-year NOAA climate normals per station |
-| `bias_calculator.py` | Computes per-city NWS forecast bias from observation history |
-| `scheduler.py` | CLI trading loop with dynamic polling interval (alternative to app.py) |
-| `lowt_observer.py` | Passive observer — records bracket prices + NWS data every 15 min |
-| `lowt_analyzer.py` | Analyzes lowt_observations.json for trade signal review |
-| `reconcile.py` | CLI diagnostic — prints recent Kalshi settlement history |
+Day-open snapshot system — budget is fixed once per calendar day, not recalculated each poll:
+
+```python
+CASCADE_RESERVE  = 30.00   # always kept for cascade engine
+MAIN_BUDGET_PCT  = 0.70    # fraction of day-open balance for main engine
+```
+
+- Main engine: `deployable = day_open × 0.70 - already_deployed`
+- Cascade engine: may draw from balance down to `CASCADE_RESERVE` floor
+- Prevents the main engine from exhausting capital before cascade entries fire
 
 ---
 
-## Data files
+## Cities monitored
 
-| Path | Contents |
-|---|---|
-| `data/config.json` | API key ID, PEM path, live/demo mode (written by app.py settings dialog) |
-| `data/city_profiles.json` | Cached NOAA monthly normals (tmax, tmin, stddev) per city |
-| `data/forecast_bias.json` | Per-city NWS forecast bias in °F — `{"New York": 1.89, ...}` |
-| `data/trade_log.json` | Every placed order with ticker, score, entry price, timestamp |
-| `data/nws_grid_cache.json` | NWS gridpoint URLs per city (fetched once, cached permanently) |
-| `data/lowt_observations.json` | Rolling observation history (forecast_f, observed_f, bracket prices) |
-| `data/entry_snapshots.csv` | CSV entry log for external analysis |
+20 US cities with timezone-aware scheduling:
+
+Atlanta · Austin · Boston · Chicago · Dallas · Denver · Houston · Las Vegas · Los Angeles · Miami · Minneapolis · New Orleans · New York · Oklahoma City · Philadelphia · Phoenix · San Antonio · San Francisco · Seattle · Washington DC
+
+---
+
+## Application (`app.py`)
+
+PyQt6 desktop application with five tabs:
+
+### Home
+Live city status grid — local time, observed high, forecast high/low, observed low for all 20 cities. Updates on every poll.
+
+### Session
+Entries and exits for the current session. Stat cards: total entries, open positions, stopped out, avg score, unrealised PnL. Full position table with timestamp, market, side, qty, entry price, score, unrealised PnL, status.
+
+### Performance
+Settlement history fetched from Kalshi. Win rate, net PnL, fee totals. Tabs for All / HIGH / LOWT markets. Early exit tracking: would-have-won vs would-have-lost.
+
+### City History
+Per-city dashboard. Select any of the 20 cities to see:
+- Rolling 7-day win rate chart
+- Cumulative PnL chart
+- Average PnL by local entry hour (bar chart)
+- Summary stats: win rate, total PnL, positions, avg convergence hour, forecast bias, latest observed high
+- Full position history table (Date, Bracket, Engine, Side, Entry, Exit, PnL, Contracts, Outcome)
+
+### Log
+Timestamped UTC log of every poll cycle, NWS snapshot (full 20-city table), entries, exits, and errors.
 
 ---
 
@@ -75,153 +146,103 @@ scheduler.py         ← CLI alternative to app.py
 pip install -r requirements.txt
 ```
 
-### 2. Get Kalshi API credentials
+### 2. API keys
 
-Generate an RSA key pair in your [Kalshi dashboard](https://kalshi.com/account/keys).
-You need the **Key ID** and the **private key PEM file**.
+Create a `config.json` file in the project root:
 
-### 3. Build city profiles
-
-Fetches 30-year NOAA climate normals for each trading station. Cached to `data/city_profiles.json` — only needs to run once.
-
-```bash
-python city_profiles.py
+```json
+{
+  "kalshi_api_key_id": "your_key_id",
+  "kalshi_api_private_key_path": "path/to/private_key.pem",
+  "environment": "production"
+}
 ```
 
-### 4. Compute forecast bias
-
-Requires at least a few days of `lowt_observations.json` data (run `lowt_observer.py` to collect it). Computes per-city NWS warm/cool bias using a trimmed mean.
-
-```bash
-python lowt_observer.py     # collect observations (run daily)
-python bias_calculator.py   # compute bias → data/forecast_bias.json
-```
-
-### 5. Launch
+### 3. Run
 
 ```bash
 python app.py
 ```
 
-On first launch, a setup dialog will prompt for your Key ID and PEM file path. Credentials are saved to `data/config.json`.
-
 ---
 
-## App tabs
+## Project structure
 
-**Home** — Start/stop the scheduler, monitor city status cards, open positions table (with unrealised PnL), balance and portfolio value.
-
-**Session** — Live view of trades placed in the current run. Shows entry time, market, side, quantity, entry price, signal score, unrealised PnL, and status. Refresh button re-syncs statuses (Won/Lost/Settled) against Kalshi.
-
-**Performance** — Settlement history from Kalshi. By Day table with equity curve, All Settlements table with score column (joined from `trade_log.json`).
-
-**Log** — Raw scheduler output.
-
----
-
-## Tunable parameters
-
-### `decision_engine.py`
-
-| Parameter | Default | Description |
-|---|---|---|
-| `TRADE_WINDOW_START` | 0 | Trading window open (local hour) — currently 24/7, timing handled by scheduler |
-| `TRADE_WINDOW_END` | 24 | Trading window close — currently disabled |
-| `MAX_SPREAD` | $0.05 | Max acceptable bid-ask spread |
-| `MIN_DEPTH` | 500 | Min orderbook depth on the side being bought |
-| `BOUNDARY_BUFFER_STDDEV_FACTOR` | 0.6 | Scales boundary buffer with city's monthly tmax stddev |
-| `BOUNDARY_BUFFER_MIN` | 2.0°F | Floor on dynamic boundary buffer |
-| `BOUNDARY_BUFFER_MAX` | 5.0°F | Ceiling on dynamic boundary buffer |
-| `BOUNDARY_BUFFER_FALLBACK` | 3.0°F | Used when city profile stddev is unavailable |
-| `FORECAST_BIAS_CORRECTION` | -1.0°F | Global fallback bias — overridden per city by `data/forecast_bias.json` |
-| `FORECAST_WELL_CLEAR` | 6.0°F | Bracket must be this far from corrected forecast to score the forecast point |
-| `NO_MIN_YES_PRICE` | $0.02 | Skip if YES is essentially zero (bracket already dead) |
-| `NO_MAX_YES_PRICE` | $0.25 | Skip if YES is above this — too close to uncertain territory |
-| `NO_MIN_ENTRY_PRICE` | $0.75 | Never pay less than this for NO — below here the market prices in real uncertainty |
-| `NO_MAX_ENTRY_PRICE` | $0.92 | Never pay more than this for NO — 0.75–0.92 gives 86.5% WR |
-| `MAX_NO_PER_CITY` | 2 | Max NO positions per city per day |
-| `NO_BAN_ABOVE_BRACKETS` | True | Never trade NO on "above X°F" brackets — asymmetric upside risk |
-| `MAX_CONTRACTS` | 2 | Hard cap on contracts per position |
-| `NO_EXIT_TARGET` | 0.15 | Take profit when NO price rises 15% |
-
-### `trader.py`
-
-| Parameter | Default | Description |
-|---|---|---|
-| `BASE_CONTRACTS` | 1 | Base contracts per signal |
-| `MAX_CONTRACTS_PER_ORDER` | 10 | Hard safety cap on single order size |
-| `NO_STOP_LOSS_RISE` | 0.15 | Exit NO if YES rises more than this above entry YES price |
-| `MONITOR_INTERVAL` | 60s | Exit monitor poll interval |
-
----
-
-## Workflow
-
-### Daily (automated via app.py or scheduler.py)
-
-The scheduler polls on a dynamic interval that tightens around peak temperature hours:
-
-| Local time | Interval | Reason |
-|---|---|---|
-| Midnight–9am | 10 min | Bracket elimination from overnight observations |
-| 9am–11am | 5 min | Morning forecast stabilising |
-| 11am–1pm | 3 min | Peak — NWS model runs, market reprices fastest |
-| 1pm–3pm | 5 min | Post-peak convergence |
-| 3pm–midnight | 10 min | Exit monitoring |
-
-### Periodic maintenance
-
-```bash
-# Refresh forecast bias (weekly or after 5+ new observation days)
-python bias_calculator.py
-
-# Refresh city profiles (annually or after NOAA normal updates)
-python city_profiles.py --refresh
-
-# Quick settlement check from terminal
-python reconcile.py
+```
+weathermachine/
+│
+├── app.py                      # PyQt6 desktop application
+├── trader.py                   # Order execution, exit logic, capital management
+├── hight_decision_engine.py    # Main signal scoring engine
+├── cascade_engine.py           # Market structure convergence engine
+├── kalshi_scanner.py           # Kalshi market data fetcher
+├── nws_fetcher.py              # NWS forecast and observation fetcher
+├── bias_calculator.py          # Per-city forecast bias computation
+├── cities.py                   # City registry with timezones
+│
+├── data/
+│   ├── forecast_bias.json      # Per-city NWS bias corrections
+│   ├── trade_log.json          # Entry log (one record per order)
+│   └── lowt_observations.csv   # Historical market observations
+│
+├── requirements.txt
+├── config.json                 # API keys (not in git)
+└── README.md
 ```
 
 ---
 
-## Forecast bias
+## Key files
 
-`bias_calculator.py` reads `data/lowt_observations.json`, extracts the morning NWS forecast (local hours 9–11) and the late-afternoon observed high (15:00+) for each city-day, and computes a **trimmed mean** error (dropping the single highest and lowest per city when n ≥ 5).
-
-The resulting `data/forecast_bias.json` is loaded by `decision_engine.py` at startup. Cities with no bias data fall back to `FORECAST_BIAS_CORRECTION = -1.0°F`.
-
-Current bias direction (from ~5–6 days of data per city):
-- **Positive** (NWS runs warm): New York +1.89°F, Denver +1.87°F, Dallas +1.42°F
-- **Near zero**: Atlanta -0.06°F, San Francisco 0.00°F  
-- **Negative** (NWS runs cool): Austin -1.83°F, San Antonio -1.84°F
-
----
-
-## Score tracking
-
-Every placed order is logged to `data/trade_log.json` with:
-
-```json
-{
-  "ticker": "KXHIGHNY-26APR13-T72",
-  "city": "New York",
-  "side": "no",
-  "score": 3,
-  "score_detail": ["obs_eliminates_bracket", "forecast_well_clear", "momentum_flat_or_down"],
-  "entry_price": 0.83,
-  "contracts": 2,
-  "placed_at": "2026-04-13T14:32:11+00:00",
-  "paper": false
-}
-```
-
-The Performance tab joins this against Kalshi settlements by ticker to show per-trade scores. Once enough data accumulates (~20 settled trades per score level), the win-rate breakdown by score will inform whether position sizing should scale with signal strength.
+| File | Purpose |
+|---|---|
+| `trader.py` | Places orders, checks exits, manages capital snapshot |
+| `hight_decision_engine.py` | Scores brackets, gates entries by price + score |
+| `cascade_engine.py` | Bottom-up convergence scanner, directional signals |
+| `bias_calculator.py` | Computes per-city forecast bias from observation history |
+| `kalshi_scanner.py` | Fetches live bracket prices and order book depth |
+| `nws_fetcher.py` | Fetches NWS forecasts and observed highs for all cities |
 
 ---
 
-## Safety
+## Parameters reference
 
-- `KALSHI_DEMO` defaults to `true` — the app operates in demo mode unless live mode is explicitly enabled in Settings
-- The 70% deployable cap (`balance × 0.70`) limits total exposure
-- `MAX_CONTRACTS = 2` is a hard cap regardless of signal score
-- Paper mode (`--paper` flag or app.py paper toggle) logs trades without placing real orders
+### Main engine (`hight_decision_engine.py`)
+
+| Parameter | Value | Description |
+|---|---|---|
+| `NO_MIN_ENTRY_PRICE` | 0.75 | Minimum No price for entry |
+| `NO_MAX_ENTRY_PRICE` | 0.92 | Maximum No price for entry |
+| `MIN_SCORE` | 2 | Minimum signal score to enter |
+| `MAX_CONTRACTS` | 6 | Hard cap per signal |
+
+### Cascade engine (`cascade_engine.py`)
+
+| Parameter | Value | Description |
+|---|---|---|
+| `CONV_THRESHOLD` | 0.97 | No price at which bracket is considered confirmed |
+| `NO_MIN_ENTRY` | 0.60 | Minimum No price for cascade entry |
+| `NO_MAX_ENTRY` | 0.90 | Maximum No price (fees kill upside above this) |
+| `START_HOUR_CAP` | 15 | No new cascades at or after this local hour |
+| `LATE_HOUR` | 13 | Max 1 entry if trigger fires at or after this hour |
+
+### Exit (`trader.py`)
+
+| Parameter | Value | Description |
+|---|---|---|
+| `YES_CEILING` | 0.60 | Yes price threshold for exit check |
+| `EXIT_HOUR_MIN` | 15 | Exit rule only applies after this local hour |
+| `FORECAST_FLOOR_GAP_MAX` | 2.0°F | Suppress exit if forecast is this far above floor |
+
+### Capital management (`trader.py`)
+
+| Parameter | Value | Description |
+|---|---|---|
+| `CASCADE_RESERVE` | $30.00 | Cash floor always kept for cascade engine |
+| `MAIN_BUDGET_PCT` | 0.70 | Fraction of day-open balance for main engine |
+
+---
+
+## Disclaimer
+
+This project is for personal research and live trading purposes. Prediction markets involve risk. Past win rates do not guarantee future performance.

@@ -1045,13 +1045,21 @@ class CityDetailDialog(QDialog):
                 bracket = ticker.split("-")[-1] if "-" in ticker else ticker
                 mtype   = "HIGH" if "HIGH" in ticker else "LOW"
 
+                avg_entry = round(cost / contracts, 4) if contracts else 0.0
+                early_exits = early_exits or {}
+                is_exit = ticker in early_exits
                 enriched.append({
-                    "date":    date,
-                    "bracket": f"{mtype} {_fmt_bracket(bracket, mtype)}",
-                    "side":    our_side.upper(),
-                    "won":     won,
-                    "net_pnl": net_pnl,
-                    "mtype":   mtype,
+                    "ticker":     ticker,
+                    "date":       date,
+                    "bracket":    f"{mtype} {_fmt_bracket(bracket, mtype)}",
+                    "side":       our_side.upper(),
+                    "won":        won,
+                    "net_pnl":    net_pnl,
+                    "mtype":      mtype,
+                    "contracts":  contracts,
+                    "cost":       cost,
+                    "avg_entry":  avg_entry,
+                    "result":     "EARLY EXIT" if is_exit else ("WIN" if won else "LOSS"),
                 })
 
             QMetaObject.invokeMethod(
@@ -2934,92 +2942,121 @@ class CityHistoryTab(QWidget):
     # ── Render ────────────────────────────────────────────────────────────────
 
     def _render(self, city: str):
-        trades = [t for t in self._trades if t.get("city") == city]
-        trades.sort(key=lambda t: t.get("placed_at", "") or "")
+        """Render all city history widgets for the selected city."""
 
-        # Use enriched data from PnLTab (has actual PnL, outcomes, fill data)
-        enriched_map = {}
+        # ── Get enriched settlements from PnLTab ─────────────────────────
+        raw_enriched = []
         if self._pnl_tab is not None:
-            for e in getattr(self._pnl_tab, '_enriched', []):
-                enriched_map[e.get("ticker","")] = e
+            raw_enriched = getattr(self._pnl_tab, "_enriched", [])
+            if not raw_enriched and getattr(self._pnl_tab, "_client", None):
+                try:
+                    self._pnl_tab.load_data()
+                    raw_enriched = getattr(self._pnl_tab, "_enriched", [])
+                except Exception:
+                    pass
 
-        # Cross-reference trade_log with enriched settlements
-        def get_enriched(t):
-            return enriched_map.get(t.get("ticker",""), {})
+        # Filter by city using _city_from_ticker
+        enriched_city = [
+            e for e in raw_enriched
+            if _city_from_ticker(e.get("ticker",""), bare=True) == city
+        ]
 
-        def outcome(t):
-            e = get_enriched(t)
-            if not e:
-                return "open"
-            r = e.get("result","")
-            if e.get("won"):      return "win"
-            if r == "EARLY EXIT": return "exit"
-            return "loss"
+        # Add avg_entry to each enriched record
+        for e in enriched_city:
+            if "avg_entry" not in e:
+                c = e.get("contracts",1) or 1
+                e["avg_entry"] = round(e.get("cost",0) / c, 4)
+            e["_source"] = "enriched"
 
-        def pnl(t):
-            e = get_enriched(t)
-            return float(e.get("net_pnl", 0) or 0) if e else 0.0
-
-        def exit_price(t):
-            e = get_enriched(t)
-            if not e: return "—"
-            r = e.get("result","")
-            if r == "EARLY EXIT":
-                ep = e.get("avg_sell")
-                return f"${ep:.2f}" if ep else "—"
-            if e.get("won"): return "$1.00"
-            return "$0.00"
-
-        def engine(t):
-            tier = (t.get("entry_tier","") or "").lower()
-            sd   = t.get("score_detail", []) or []
-            if "cascade" in tier or "post_exit" in str(sd):
-                return "CASCADE"
-            return "MAIN"
-
-        settled   = [t for t in trades if outcome(t) in ("win","loss","exit")]
-        wins      = [t for t in settled if outcome(t) == "win"]
-        wr_pct    = len(wins)/len(settled)*100 if settled else 0
-        total_pnl = sum(pnl(t) for t in trades)
-
-        # Avg convergence hour from observations CSV
-        conv_hours = []
-        for t in trades:
+        # Open positions from trade_log (not yet settled)
+        enriched_tickers = {e["ticker"] for e in enriched_city}
+        seen = {}
+        for t in sorted(self._trades, key=lambda x: x.get("placed_at","") or ""):
+            if t.get("city") != city: continue
             tk = t.get("ticker","")
-            ch = self._conv_hour.get(tk)
-            if ch is not None:
-                conv_hours.append(ch)
+            if tk not in enriched_tickers and tk not in seen:
+                seen[tk] = dict(t)
+        open_trades = list(seen.values())
+        for t in open_trades:
+            t["_source"] = "open"
+
+        # All items sorted newest first
+        def _sort_key(item):
+            if item["_source"] == "open":
+                return item.get("placed_at","") or ""
+            return item.get("date","") or ""
+
+        all_items = sorted(enriched_city + open_trades, key=_sort_key, reverse=True)
+
+        # ── Helper functions ──────────────────────────────────────────────
+        def outcome(item):
+            if item["_source"] == "open": return "open"
+            r = item.get("result","")
+            if r == "EARLY EXIT": return "exit"
+            return "win" if item.get("won") else "loss"
+
+        def pnl(item):
+            if item["_source"] == "open": return 0.0
+            return float(item.get("net_pnl", 0) or 0)
+
+        def exit_price(item):
+            if item["_source"] == "open": return "—"
+            r = item.get("result","")
+            if r == "EARLY EXIT":
+                ep  = item.get("avg_entry", 0) or 0
+                c   = item.get("contracts", 1) or 1
+                pv  = float(item.get("net_pnl", 0) or 0)
+                xp  = round(ep + pv / c, 4)
+                return f"${xp:.2f}"
+            return "$1.00" if item.get("won") else "$0.00"
+
+        def engine(item):
+            tk   = item.get("ticker","")
+            tlog = next((t for t in self._trades if t.get("ticker")==tk), {})
+            tier = (tlog.get("entry_tier","") or "").lower()
+            return "CASCADE" if "cascade" in tier else "MAIN"
+
+        # ── Stats ─────────────────────────────────────────────────────────
+        settled   = [i for i in all_items if outcome(i) in ("win","loss","exit")]
+        wins      = [i for i in settled if outcome(i) == "win"]
+        wr_pct    = len(wins)/len(settled)*100 if settled else 0
+        total_pnl = sum(pnl(i) for i in all_items)
+
+        conv_hours = [
+            self._conv_hour[i.get("ticker","")]
+            for i in all_items
+            if i.get("ticker","") in self._conv_hour
+        ]
         avg_conv = f"{sum(conv_hours)/len(conv_hours):.1f}h local" if conv_hours else "—"
 
-        bias_data = self._bias.get(city, {})
-        bias_val  = bias_data.get("bias") if bias_data else None
-        bias_str  = f"{bias_val:+.2f}°F" if bias_val is not None else "—"
+        bias_val = (self._bias.get(city) or {}).get("bias")
+        bias_str = f"{bias_val:+.2f}°F" if bias_val is not None else "—"
+        obs_hi   = self._obs.get(city)
+        obs_str  = f"{obs_hi:.1f}°F" if obs_hi is not None else "—"
 
-        latest_obs = self._obs.get(city)
-        obs_str    = f"{latest_obs:.1f}°F" if latest_obs is not None else "—"
-
-        # Stats bar
         self._stat_labels["Win Rate"].setText(f"{wr_pct:.1f}%")
         self._stat_labels["Win Rate"].setStyleSheet(
-            f"color:{'#00d4a0' if wr_pct>=90 else '#EF9F27' if wr_pct>=75 else '#E24B4A'}; font-size:20px; font-weight:500;")
+            f"color:{'#00d4a0' if wr_pct>=90 else '#EF9F27' if wr_pct>=75 else '#E24B4A'};"
+            f"font-size:20px; font-weight:500;")
         self._stat_labels["Total PnL"].setText(f"${total_pnl:+.2f}")
         self._stat_labels["Total PnL"].setStyleSheet(
             f"color:{'#00d4a0' if total_pnl>=0 else '#E24B4A'}; font-size:20px; font-weight:500;")
-        self._stat_labels["Positions"].setText(str(len(trades)))
+        self._stat_labels["Positions"].setText(str(len(all_items)))
         self._stat_labels["Avg Conv Hour"].setText(avg_conv)
         self._stat_labels["Forecast Bias"].setText(bias_str)
         self._stat_labels["Latest Obs Hi"].setText(obs_str)
 
-        # Charts — always attempt, Agg backend works without Qt binding
+        # ── Charts ────────────────────────────────────────────────────────
         try:
-            self._draw_rolling_wr(trades, settled, wins)
-            self._draw_cumulative_pnl(trades, pnl)
-            self._draw_intraday(trades, pnl)
+            self._draw_rolling_wr(all_items, settled, wins)
+            self._draw_cumulative_pnl(all_items, pnl)
+            self._draw_intraday(all_items, pnl)
         except Exception as e:
             self._lbl_wr.setText(f"Chart error: {e}")
 
-        # Table
-        self._fill_table(trades, outcome, pnl, engine, exit_price)
+        # ── Table ─────────────────────────────────────────────────────────
+        self._fill_table(all_items, outcome, pnl, engine, exit_price)
+
 
     def _fig_to_pixmap(self, fig):
         """Render a matplotlib Figure to a QPixmap via Agg backend."""
@@ -3154,28 +3191,64 @@ class CityHistoryTab(QWidget):
         fig.tight_layout(pad=0.5)
         self._lbl_hr.setPixmap(self._fig_to_pixmap(fig))
 
-    def _fill_table(self, trades, outcome_fn, pnl_fn, engine_fn, exit_price_fn):
+    def _fill_table(self, items, outcome_fn, pnl_fn, engine_fn, exit_price_fn):
+        """Populate position history table. Each item is an enriched or open-trade dict."""
         self._table.setRowCount(0)
         WIN_COLOR  = QColor("#00d4a0")
         LOSS_COLOR = QColor("#E24B4A")
         WARN_COLOR = QColor("#EF9F27")
         DIM_COLOR  = QColor(TEXT_SEC)
 
-        for t in reversed(trades):
+        # Build trade_log index for engine lookup
+        tlog_idx = {}
+        for t in self._trades:
+            tk = t.get("ticker","")
+            if tk not in tlog_idx:
+                tlog_idx[tk] = t
+
+        for item in items:
             row = self._table.rowCount()
             self._table.insertRow(row)
 
-            date_str = (t.get("placed_at","") or "")[:10]
-            bracket  = t.get("ticker","").split("-")[-1] if t.get("ticker") else "—"
-            eng      = engine_fn(t)
-            side     = (t.get("side","NO") or "NO").upper()
-            entry    = f"${float(t.get('entry_price',0) or 0):.2f}"
-            out      = outcome_fn(t)
-            p        = pnl_fn(t)
-            pnl_str  = f"${p:+.2f}"
-            contr    = str(t.get("contracts","1") or "1")
-            exit_str = exit_price_fn(t)
+            src = item.get("_source", "enriched")
 
+            # Date
+            if src == "open":
+                date_str = (item.get("placed_at","") or "")[:10]
+            else:
+                date_str = item.get("date","")
+
+            # Bracket — last segment of ticker
+            tk      = item.get("ticker","") or ""
+            bracket = tk.split("-")[-1] if "-" in tk else tk or "—"
+
+            # Engine — check trade_log entry_tier
+            tlog    = tlog_idx.get(tk, {})
+            tier    = (tlog.get("entry_tier","") or "").lower()
+            eng     = "CASCADE" if "cascade" in tier else "MAIN"
+
+            # Side
+            side = (item.get("side","NO") or "NO").upper()
+
+            # Entry price
+            if src == "open":
+                entry = f"${float(item.get('entry_price',0) or 0):.2f}"
+            else:
+                ep = item.get("avg_entry") or 0.0
+                entry = f"${ep:.2f}"
+
+            # Exit price
+            exit_str = exit_price_fn(item)
+
+            # PnL
+            p       = pnl_fn(item)
+            pnl_str = f"${p:+.2f}"
+
+            # Contracts
+            contr = str(item.get("contracts","1") or "1")
+
+            # Outcome
+            out = outcome_fn(item)
             outcome_map = {
                 "win":  ("SETTLED WIN",  WIN_COLOR),
                 "loss": ("SETTLED LOSS", LOSS_COLOR),
@@ -3187,15 +3260,15 @@ class CityHistoryTab(QWidget):
             pnl_color = WIN_COLOR if p > 0 else (LOSS_COLOR if p < 0 else DIM_COLOR)
             eng_color = QColor("#378ADD") if eng == "CASCADE" else QColor(ACCENT)
 
-            cells = [date_str, bracket, eng, side, entry, exit_str, pnl_str, contr, out_text]
+            cells  = [date_str, bracket, eng, side, entry, exit_str, pnl_str, contr, out_text]
             colors = [None, None, eng_color, None, None, None, pnl_color, None, out_color]
 
             for col, (val, color) in enumerate(zip(cells, colors)):
-                item = QTableWidgetItem(str(val))
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell = QTableWidgetItem(str(val))
+                cell.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if color:
-                    item.setForeground(color)
-                self._table.setItem(row, col, item)
+                    cell.setForeground(color)
+                self._table.setItem(row, col, cell)
 
 class MainWindow(QMainWindow):
     def __init__(self, config: dict):
