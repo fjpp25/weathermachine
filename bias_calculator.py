@@ -43,7 +43,7 @@ from cities import CITIES
 # Config
 # ---------------------------------------------------------------------------
 
-OBS_FILE  = Path("data/lowt_observations.json")
+OBS_FILE  = Path("data/lowt_observations.csv")
 OUT_FILE  = Path("data/forecast_bias.json")
 
 # Local hours considered "morning" for sampling the day's forecast
@@ -67,13 +67,50 @@ TRIM_MIN_SAMPLE = 5
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _to_float(val):
+    try:
+        return float(val) if val not in (None, "", "nan") else None
+    except (ValueError, TypeError):
+        return None
+
+
 def load_observations() -> list[dict]:
     if not OBS_FILE.exists():
         raise FileNotFoundError(
             f"No observations file at {OBS_FILE}.\n"
             "Run lowt_observer.py first to collect data."
         )
-    return json.loads(OBS_FILE.read_text())
+
+    suffix = OBS_FILE.suffix.lower()
+
+    if suffix == ".json":
+        return json.loads(OBS_FILE.read_text())
+
+    if suffix == ".csv":
+        import csv
+        rows = []
+        with open(OBS_FILE, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                try:
+                    r["local_hour"] = int(r["local_hour"]) if r.get("local_hour") else None
+                except (ValueError, KeyError):
+                    continue
+
+                # Normalise _high_f / _low_f fields to internal observed_f / forecast_f
+                mtype = r.get("market_type", "")
+                if "observed_high_f" in r or "forecast_high_f" in r:
+                    if mtype == "high":
+                        r["observed_f"] = _to_float(r.get("observed_high_f"))
+                        r["forecast_f"] = _to_float(r.get("forecast_high_f"))
+                    else:
+                        r["observed_f"] = _to_float(r.get("observed_low_f"))
+                        r["forecast_f"] = _to_float(r.get("forecast_low_f"))
+                # Old schema already has observed_f / forecast_f
+
+                rows.append(r)
+        return rows
+
+    raise ValueError(f"Unsupported observations file format: {suffix}")
 
 
 def local_date_for(poll_time_utc: str, tz_name: str) -> str:

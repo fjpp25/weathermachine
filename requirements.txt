@@ -3,3 +3,5 @@ tzdata>=2024.1
 cryptography>=42.0.0
 PyQt6>=6.6.0
 pyqtgraph>=0.13.0
+matplotlib>=3.8.0
+matplotlib>=3.8.0

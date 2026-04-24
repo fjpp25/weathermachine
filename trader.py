@@ -54,6 +54,9 @@ except ImportError:
 import hight_decision_engine as decision_engine
 import lowt_decision_engine
 
+from log_setup import get_logger
+log = get_logger(__name__)
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -69,7 +72,7 @@ BASE_CONTRACTS = 1
 
 # Score-based position sizing multiplier
 # Kept flat at 1x — with a small account, size consistency matters more than scaling
-SCORE_SIZING = {1: 1.0, 2: 3.0, 3: 5.0}
+SCORE_SIZING = {1: 1.0, 2: 1.0, 3: 1.0}
 
 # Exit monitor poll interval (seconds)
 MONITOR_INTERVAL = 30
@@ -127,7 +130,7 @@ class KalshiClient:
             )
 
         env = "DEMO" if demo else "PRODUCTION"
-        print(f"  KalshiClient ready [{env}]  key_id={key_id[:8]}...")
+        log.info("KalshiClient ready [%s]  key_id=%s...", env, key_id[:8])
 
     def _sign(self, timestamp: str, method: str, path: str) -> str:
         """Create RSA-PSS SHA256 signature for a request."""
@@ -179,7 +182,7 @@ class KalshiClient:
                 if resp.status_code == 429 or resp.status_code >= 500:
                     if attempt < MAX_RETRIES - 1:
                         delay = BASE_DELAY * (2 ** attempt)
-                        print(f"  [{resp.status_code}] Retrying in {delay}s "
+                        log.warning("[%d] retrying in %ds" +  # 
                               f"(attempt {attempt + 1}/{MAX_RETRIES})...")
                         time.sleep(delay)
                         continue
@@ -189,7 +192,7 @@ class KalshiClient:
             except requests.exceptions.Timeout:
                 if attempt < MAX_RETRIES - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    print(f"  [timeout] Retrying in {delay}s "
+                    log.warning("[timeout] retrying in %ds" +  # 
                           f"(attempt {attempt + 1}/{MAX_RETRIES})...")
                     time.sleep(delay)
                 else:
@@ -198,7 +201,7 @@ class KalshiClient:
             except requests.exceptions.ConnectionError:
                 if attempt < MAX_RETRIES - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    print(f"  [connection error] Retrying in {delay}s "
+                    log.warning("[connection error] retrying in %ds" +  # 
                           f"(attempt {attempt + 1}/{MAX_RETRIES})...")
                     time.sleep(delay)
                 else:
@@ -359,7 +362,7 @@ def _market_price(ticker: str) -> dict:
         ).json()
         return _normalise_prices(resp.get("market", {}))
     except Exception as e:
-        print(f"  [sync] Individual market fetch failed for {ticker}: {e}")
+        log.debug("sync: individual fetch failed %s: %s", ticker, e)
         return zero
 
 
@@ -397,7 +400,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
         for m in resp.get("markets", []):
             prices[m["ticker"]] = _normalise_prices(m)
     except Exception as e:
-        print(f"  [sync] Batch price fetch failed: {e}")
+        log.error("sync: batch price fetch failed: %s", e)
 
     # ── Individual fallback for tickers with no price data ───────────────────
     # The batch endpoint strips result/last_price from finalized markets.
@@ -417,7 +420,7 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
             if t in tickers:
                 fills_by_ticker.setdefault(t, []).append(f)
     except Exception as e:
-        print(f"  [sync] Fills fetch failed: {e} — avg_cost will use total_traded fallback")
+        log.warning("sync: fills fetch failed: %s", e)
 
     # ── Enrich each position ──────────────────────────────────────────────────
     for pos in temp_positions:
@@ -525,7 +528,7 @@ def place_order(
     }
 
     if paper:
-        print(f"    [PAPER] Would {action.upper()}: {side.upper()} {contracts}x {ticker} @ ${price_dollars:.2f}")
+        log.info("[PAPER] %s %s %dx %s @ $%.2f", action.upper(), side.upper(), contracts, ticker, price_dollars)
         return {"paper": True, "order": order}
 
     try:
@@ -549,7 +552,7 @@ def test_order(client: KalshiClient):
 
     Proves: auth works, order body is valid, cancel works.
     """
-    print("\n  Finding an open climate market...")
+    log.info("test: finding open market...")
 
     data = requests.get(
         "https://api.elections.kalshi.com/trade-api/v2/markets",
@@ -559,7 +562,7 @@ def test_order(client: KalshiClient):
     markets = data.get("markets", [])
 
     if not markets:
-        print("  No open KXHIGHNY markets found — trying KXHIGHMIA...")
+        log.info("test: KXHIGHNY not found, trying KXHIGHMIA...")
         data    = requests.get(
             "https://api.elections.kalshi.com/trade-api/v2/markets",
             params={"series_ticker": "KXHIGHMIA", "status": "open"},
@@ -568,13 +571,13 @@ def test_order(client: KalshiClient):
         markets = data.get("markets", [])
 
     if not markets:
-        print("  Could not find any open market to test against.")
+        log.error("test: no open market found")
         return
 
     ticker = markets[len(markets) // 2]["ticker"]
-    print(f"  Test market: {ticker}")
+    log.info("test market: %s", ticker)
 
-    print("\n  Step 1 — placing YES limit order @ $0.01 (1 contract)...")
+    log.info("test step 1: placing YES limit @ $0.01...")
     order_body = {
         "ticker":          ticker,
         "action":          "buy",
@@ -591,33 +594,33 @@ def test_order(client: KalshiClient):
         order_id = order.get("order_id") or order.get("id")
 
         if not order_id:
-            print(f"  Unexpected response — no order_id found:")
-            print(f"  {json.dumps(result, indent=2)}")
+            log.error("test: unexpected response — no order_id")
+            log.debug("test response: %s", json.dumps(result, indent=2))
             return
 
-        print(f"  Order accepted — order_id: {order_id}")
-        print(f"  Status: {order.get('status', '?')}")
+        log.info("test: order accepted  order_id=%s", order_id)
+        log.info('test: status=%s', order.get('status','?'))
 
     except requests.exceptions.HTTPError as e:
-        print(f"  Order placement FAILED: {e}")
+        log.error("test: order placement failed: %s", e)
         try:
-            print(f"  Response body: {e.response.json()}")
+            log.error("test: response body: %s", e.response.json())
         except Exception:
-            print(f"  Response text: {e.response.text}")
+            log.error("test: response text: %s", e.response.text)
         return
     except Exception as e:
-        print(f"  Order placement FAILED: {e}")
+        log.error("test: order placement failed: %s", e)
         return
 
-    print(f"\n  Step 2 — cancelling order {order_id}...")
+    log.info("test step 2: cancelling order %s...", order_id)
     try:
         cancel_result = client.delete(f"portfolio/orders/{order_id}")
         cancelled     = cancel_result.get("order", {})
-        print(f"  Cancelled — status: {cancelled.get('status', '?')}")
-        print(f"\n  Test PASSED — full round trip (place → cancel) works correctly.")
+        log.info('test: cancelled  status=%s', cancelled.get('status','?'))
+        log.info("test PASSED — full round trip OK")
     except Exception as e:
-        print(f"  Cancel FAILED: {e}")
-        print(f"  WARNING: Order {order_id} may still be resting. "
+        log.error("test: cancel failed: %s", e)
+        log.warning("WARNING: order %s may still be resting —" +  # 
               f"Cancel manually at kalshi.com/portfolio.")
 
 
@@ -639,19 +642,23 @@ YES_STOP_LOSS = 0.30   # stop loss if YES falls 30% from entry
 # NO position: time-weighted stop loss thresholds (fraction drop from entry NO price)
 # Tightens as the day progresses — early illiquidity should not trigger an exit,
 # but a late-day move against us is real information.
-NO_STOP_LOSS_MORNING   = 0.60   # before 11am local — hold unless catastrophic
-NO_STOP_LOSS_PEAK      = 0.40   # 11am–1pm — peak forecast uncertainty window
-NO_STOP_LOSS_AFTERNOON = 0.30   # after 1pm — was 0.25. Raised after audit: 4 WHW exits
+# Stop loss removed — data shows holding always beats exiting on price alone.
+# All exits now routed through YES ceiling + forecast filter only.
+NO_STOP_LOSS_MORNING   = 0.0    # disabled
+NO_STOP_LOSS_PEAK      = 0.0    # disabled
+NO_STOP_LOSS_AFTERNOON = 0.0    # disabled
                                 # triggered by 21–23% intraday drops that fully recovered.
 
 # NO position: probability ceiling
 # Exit if YES crosses this regardless of our entry price — thesis is dead.
-NO_YES_CEILING = 0.50
+NO_YES_CEILING      = 0.60   # Yes must reach 0.60 before we consider exiting
+NO_YES_CEILING_HOUR = 15     # Yes ceiling only fires at/after this local hour
 
 # NO position: forecast anchor
 # For HIGH: exit if observed high is within this many °F of the bracket floor.
 # For LOWT: exit if observed low is within this many °F of the bracket ceiling.
-FORECAST_ANCHOR_BUFFER = 1.5   # °F — was 3.0. Tightened after audit: 10 WHW exits were
+FORECAST_ANCHOR_BUFFER  = 1.5   # °F — used by YES ceiling filter
+FORECAST_FLOOR_GAP_MAX  = 2.0   # °F — if forecast > floor + this, Yes spike is noise   # °F — was 3.0. Tightened after audit: 10 WHW exits were
                                 # triggered by the anchor firing 2–3°F below the bracket
                                 # floor, but the high peaked below the floor or blasted
                                 # above the ceiling (both NO wins).
@@ -672,17 +679,6 @@ ANCHOR_MIN_YES  = 0.30          # YES price must be at or above this for anchor 
 SETTLEMENT_CLEAR_BUFFER = 5.0   # °F
 SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the observation
 
-# NO position: time-threshold hold
-# Before HOLD_UNTIL_HOUR local, all exit checks (price stop, yes ceiling, anchor)
-# are suppressed for positions entered at or above HOLD_MIN_ENTRY.
-# Rationale: intraday price dips before the daily high is established (typically
-# 14:00–17:00 local) are almost always noise.
-# Data (Apr17): 4/5 exits were wrong — all entered >= 0.79. The one correct exit
-# (DC B81.5, entry $0.44) was below the HOLD_MIN_ENTRY threshold, so it is still
-# caught by normal exit logic even before the time threshold.
-HOLD_UNTIL_HOUR  = 16    # local hour — suppress exits before 16:00 local
-HOLD_MIN_ENTRY   = 0.75  # minimum entry No price to qualify for the hold
-
 
 # ---------------------------------------------------------------------------
 # Session-scoped ticker blacklist
@@ -691,6 +687,44 @@ HOLD_MIN_ENTRY   = 0.75  # minimum entry No price to qualify for the hold
 # ---------------------------------------------------------------------------
 
 _exited_this_session: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Daily capital snapshot
+# Taken once at the first poll of each day. Used to compute a fixed main-
+# engine budget and a hard cascade reserve that survive repeated polling.
+# ---------------------------------------------------------------------------
+from datetime import date as _date
+
+_day_open_balance: float      = 0.0
+_day_open_date:    _date|None = None
+CASCADE_RESERVE:   float      = 30.00   # $ always kept for cascade engine
+MAIN_BUDGET_PCT:   float      = 0.70    # fraction of day-open balance for main engine
+
+
+def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
+    """
+    Refresh the daily snapshot if the date has changed.
+    Returns (main_deployable, cascade_reserve) based on day-open balance.
+
+    main_deployable = how much of the main budget hasn't been deployed yet
+                    = day_open * MAIN_BUDGET_PCT - already_deployed
+    already_deployed = day_open_balance - current_balance
+                     (crude proxy: assumes only exits return cash intraday)
+    """
+    global _day_open_balance, _day_open_date
+    today = _date.today()
+    if _day_open_date != today or _day_open_balance == 0.0:
+        _day_open_balance = current_balance
+        _day_open_date    = today
+        log.info("day snapshot: $%.2f  (main_budget=$%.2f  cascade_reserve=$%.2f)",
+                 current_balance,
+                 round(current_balance * MAIN_BUDGET_PCT, 2),
+                 CASCADE_RESERVE)
+
+    main_budget      = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
+    already_deployed = max(0.0, _day_open_balance - current_balance)
+    main_deployable  = max(0.0, round(main_budget - already_deployed, 2))
+    return main_deployable, CASCADE_RESERVE
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -763,6 +797,146 @@ def _city_local_hour(city: str) -> int:
     return 12
 
 
+def _post_exit_scan(
+    client:         KalshiClient,
+    exited_ticker:  str,
+    live_positions: list,
+    paper:          bool = False,
+) -> None:
+    """
+    Called immediately after any No position is exited.
+
+    Scans all remaining open brackets for the same market and enters No
+    on any that are:
+      - Still live (0.03 ≤ No ≤ NO_MAX_ENTRY_PRICE)
+      - Not already at MAX_CONTRACTS
+      - Not in _exited_this_session
+
+    This covers two cases:
+      1. Top-up: we already hold the bracket but have headroom for more contracts
+      2. New entry: a bracket we don't yet hold that has become more certain
+         now that a lower bracket has been exited (converging from below)
+
+    The "exactly 2 live" restriction is removed — after any exit, all
+    remaining eligible brackets in the market are candidates.
+    """
+    try:
+        parts = exited_ticker.split("-")
+        if len(parts) < 3:
+            return
+        series = parts[0]
+        mdate  = parts[1]
+
+        # Fetch all open brackets for this series
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"series_ticker": series, "status": "open"},
+            timeout=10,
+        ).json()
+        markets = resp.get("markets", [])
+
+        # Filter to today's date
+        today_markets = [
+            m for m in markets
+            if mdate.upper() in m.get("ticker", "").upper()
+        ]
+        if not today_markets:
+            log.debug("post_exit_scan: no open brackets for %s-%s", series, mdate)
+            return
+
+        # Current contracts held per ticker
+        held = {p["ticker"]: p.get("contracts", 0) for p in live_positions}
+
+        # Max contracts from decision engine
+        try:
+            import hight_decision_engine as _de
+            max_c = _de.MAX_CONTRACTS
+        except Exception:
+            max_c = 6
+
+        candidates = []
+        for m in today_markets:
+            t = m.get("ticker", "")
+            if t == exited_ticker:
+                continue   # skip the one we just exited
+            if t in _exited_this_session:
+                continue
+
+            yes_p = float(m.get("yes_bid_dollars") or 0)
+            no_p  = float(m.get("no_bid_dollars")  or 0)
+            if yes_p == 0 and no_p > 0:
+                yes_p = round(1.0 - no_p, 4)
+            elif no_p == 0 and yes_p > 0:
+                no_p = round(1.0 - yes_p, 4)
+
+            # Must be live and in our entry range
+            if not (0.75 <= no_p <= NO_MAX_ENTRY_PRICE):
+                continue
+            if yes_p > 0.25:
+                continue
+
+            # Check headroom
+            currently_held = held.get(t, 0)
+            headroom = max_c - currently_held
+            if headroom <= 0:
+                continue
+
+            candidates.append({
+                "ticker":   t,
+                "no_price": no_p,
+                "yes_price": yes_p,
+                "headroom": headroom,
+                "held":     currently_held,
+            })
+
+        if not candidates:
+            log.debug("post_exit_scan: no eligible brackets after exit of %s", exited_ticker)
+            return
+
+        # Sort by No price descending — highest conviction first
+        candidates.sort(key=lambda x: x["no_price"], reverse=True)
+
+        log.info("post_exit_scan: %d eligible bracket(s) after exit of %s",
+                 len(candidates), exited_ticker)
+
+        for c in candidates:
+            contracts = min(BASE_CONTRACTS, c["headroom"])
+            action    = "top-up" if c["held"] > 0 else "new"
+            log.info("post_exit_scan: %s No on %s @ $%.2f  (%s, held=%d headroom=%d)%s",
+                     action, c["ticker"], c["no_price"],
+                     action, c["held"], c["headroom"],
+                     "  [PAPER]" if paper else "")
+
+            if not paper:
+                try:
+                    place_order(
+                        client        = client,
+                        ticker        = c["ticker"],
+                        side          = "no",
+                        action        = "buy",
+                        price_dollars = c["no_price"],
+                        contracts     = contracts,
+                        paper         = False,
+                    )
+                    _append_trade_log({
+                        "ticker":       c["ticker"],
+                        "city":         series,
+                        "side":         "no",
+                        "market_type":  "high",
+                        "score":        0,
+                        "score_detail": ["post_exit_scan"],
+                        "entry_price":  c["no_price"],
+                        "contracts":    contracts,
+                        "placed_at":    datetime.now(timezone.utc).isoformat(),
+                        "paper":        False,
+                    })
+                except Exception as e:
+                    log.error("post_exit_scan order failed for %s: %s", c["ticker"], e)
+
+    except Exception as e:
+        log.error("post_exit_scan error for %s: %s", exited_ticker, e)
+
+
 def check_exits(
     client:         KalshiClient,
     paper:          bool  = False,
@@ -798,7 +972,7 @@ def check_exits(
         try:
             live_positions = sync_from_kalshi(client)
         except Exception as e:
-            print(f"  Could not fetch live positions for exit check: {e}")
+            log.error("could not fetch live positions: %s", e)
             return exited
 
     if not live_positions:
@@ -810,7 +984,7 @@ def check_exits(
             import nws_feed
             nws_snapshot = nws_feed.snapshot()
         except Exception as e:
-            print(f"  NWS snapshot failed (forecast anchor disabled): {e}")
+            log.warning("NWS snapshot failed (anchor disabled): %s", e)
             nws_snapshot = {}
 
     tickers = [p["ticker"] for p in live_positions]
@@ -834,7 +1008,7 @@ def check_exits(
                 "status":  m.get("status", "active"),
             }
     except Exception as e:
-        print(f"  Batch price fetch failed: {e} — skipping exit check")
+        log.error("batch price fetch failed: %s — skipping exit check", e)
         return exited
 
     from cities import SERIES_TO_CITY as _SERIES_TO_CITY
@@ -844,7 +1018,7 @@ def check_exits(
 
         # Safety guard — only manage temperature market positions
         if "HIGH" not in ticker and "LOWT" not in ticker:
-            print(f"  Skipping {ticker} — not a temperature market (exit monitor ignores it)")
+            log.debug("skip %s — not a temperature market", ticker)
             continue
 
         side      = pos["side"]
@@ -889,7 +1063,7 @@ def check_exits(
                 if not is_lowt and floor is not None:
                     # HIGH B bracket: safe if obs_high well below bracket floor
                     if (floor - obs_val) >= SETTLEMENT_CLEAR_BUFFER:
-                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                        log.debug("HOLD_SETTLE  %s  " +
                               f"obs_high={obs_val}°F is "
                               f"{floor - obs_val:.1f}°F below bracket floor {floor}°F  "
                               f"(local={local_hour}h)")
@@ -898,7 +1072,7 @@ def check_exits(
                     # HIGH bottom T: safe if obs_high well above ceiling
                     # (temp already exceeded the "below X" threshold → bracket dead)
                     if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
-                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                        log.debug("HOLD_SETTLE  %s  " +
                               f"obs_high={obs_val}°F is "
                               f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
                               f"(local={local_hour}h)")
@@ -906,29 +1080,41 @@ def check_exits(
                 elif is_lowt and ceiling is not None:
                     # LOWT: safe if obs_low well above bracket ceiling
                     if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
-                        print(f"  HOLD TO SETTLEMENT: {ticker}  "
+                        log.debug("HOLD_SETTLE  %s  " +
                               f"obs_low={obs_val}°F is "
                               f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
                               f"(local={local_hour}h)")
                         continue
 
-            # ── Time-threshold hold ────────────────────────────────────────
-            # Before HOLD_UNTIL_HOUR local, suppress all exit checks for
-            # high-conviction NO positions (entry >= HOLD_MIN_ENTRY).
-            # Low-conviction entries (< HOLD_MIN_ENTRY) are not protected —
-            # they may reflect genuine uncertainty worth exiting early.
-            if local_hour < HOLD_UNTIL_HOUR and avg_cost >= HOLD_MIN_ENTRY:
-                continue
+            # ── Probability ceiling (time-gated + forecast filter) ─────────
+            # Only fires after NO_YES_CEILING_HOUR local time.
+            # Additionally requires forecast to be within FORECAST_FLOOR_GAP_MAX
+            # of the bracket floor — if forecast is well clear, the Yes spike
+            # is almost certainly intraday noise that will revert by settlement.
+            if local_hour >= NO_YES_CEILING_HOUR and yes_price >= NO_YES_CEILING:
+                # Check forecast filter for B brackets
+                ceiling_bypass = False
+                if floor is not None:
+                    corrected_fcst = nws.get("forecast_high_f")
+                    if corrected_fcst is not None:
+                        try:
+                            from hight_decision_engine import _city_bias as _get_bias
+                            corrected_fcst = corrected_fcst + _get_bias(city)
+                        except Exception:
+                            pass
+                        fcst_floor_gap = corrected_fcst - floor
+                        if fcst_floor_gap > FORECAST_FLOOR_GAP_MAX:
+                            ceiling_bypass = True
+                            log.debug("YES_CEILING_BYPASS  %s  "
+                                      f"forecast {corrected_fcst:.1f}°F is {fcst_floor_gap:.1f}°F "
+                                      f"above floor {floor}°F — Yes spike is noise, holding")
 
-            # ── Probability ceiling ────────────────────────────────────────
-            # Runs at any hour — if YES crosses 50¢ the thesis is dead
-            # regardless of time of day or obs clearance.
-            if yes_price >= NO_YES_CEILING:
-                exit_reason = "yes_ceiling"
-                exit_price  = no_price
-                print(f"  YES CEILING: {ticker}  YES={yes_price:.2f} ≥ {NO_YES_CEILING:.2f}  "
-                      f"(entry NO=${avg_cost:.2f}  current NO=${no_price:.2f})  "
-                      f"thesis dead — market says coin flip")
+                if not ceiling_bypass:
+                    exit_reason = "yes_ceiling"
+                    exit_price  = no_price
+                    log.info("YES_CEILING  %s  YES=%.2f >= %.2f  hour=%d  "
+                             f"(entry NO=${avg_cost:.2f}  current NO=${no_price:.2f})",
+                             ticker, yes_price, NO_YES_CEILING, local_hour)
 
             # ── Forecast anchor ────────────────────────────────────────────
             # Only fires at or after ANCHOR_MIN_HOUR local time.
@@ -978,20 +1164,20 @@ def check_exits(
 
                                 if below_floor or above_cap:
                                     reason = "below floor" if below_floor else "above cap"
-                                    print(f"  ANCHOR BYPASS: {ticker}  "
+                                    log.debug("ANCHOR_BYPASS  %s  " +
                                           f"obs_high={obs_val}°F near floor {floor}°F BUT "
                                           f"corrected_fcst={corrected_fcst:.1f}°F is {reason} "
                                           f"— outcome already implied, holding")
                                 else:
                                     anchor_triggered = True
-                                    print(f"  FORECAST ANCHOR: {ticker}  "
+                                    log.info("FORECAST_ANCHOR  %s  " +
                                           f"obs_high={obs_val}°F within {gap:.1f}°F of "
                                           f"bracket floor {floor}°F  "
                                           f"corrected_fcst={corrected_fcst:.1f}°F is ambiguous")
                             else:
                                 # No forecast available — fire conservatively
                                 anchor_triggered = True
-                                print(f"  FORECAST ANCHOR: {ticker}  "
+                                log.info("FORECAST_ANCHOR  %s  " +
                                       f"obs_high={obs_val}°F within {gap:.1f}°F of "
                                       f"bracket floor {floor}°F (no forecast available)")
                 elif is_lowt and ceiling is not None:
@@ -1000,24 +1186,17 @@ def check_exits(
                     gap = obs_val - ceiling
                     if gap <= FORECAST_ANCHOR_BUFFER:
                         anchor_triggered = True
-                        print(f"  FORECAST ANCHOR: {ticker}  "
+                        log.info("FORECAST_ANCHOR  %s  " +
                               f"obs_low={obs_val}°F within {gap:.1f}°F of bracket ceiling {ceiling}°F")
 
                 if anchor_triggered:
                     exit_reason = "forecast_anchor"
                     exit_price  = no_price
 
-            # ── Time-weighted price stop loss ──────────────────────────────
-            if exit_reason is None:
-                stop_pct       = _no_stop_threshold(local_hour)
-                stop_threshold = round(avg_cost * (1 - stop_pct), 2)
-                if no_price <= stop_threshold:
-                    exit_reason = "no_stop_loss"
-                    exit_price  = no_price
-                    print(f"  NO STOP LOSS: {ticker}  "
-                          f"NO fell to ${no_price:.2f}  "
-                          f"(entry=${avg_cost:.2f}  threshold=${stop_threshold:.2f}  "
-                          f"local={local_hour}h  stop_pct={stop_pct:.0%})")
+            # ── Price stop loss — DISABLED ─────────────────────────────────
+            # Removed: data shows holding always beats exiting on price alone
+            # at every streak length and threshold (analysis Apr 22 2026).
+            # Only exit mechanism is YES ceiling + forecast filter above.
 
         else:
             # ── YES position: stop loss only, ride to resolution ───────────
@@ -1026,7 +1205,7 @@ def check_exits(
             if yes_price <= stop_loss:
                 exit_reason = "stop_loss"
                 exit_price  = yes_price
-                print(f"  STOP LOSS: {ticker} YES ${avg_cost:.2f} → ${yes_price:.2f}")
+                log.warning("STOP LOSS  %s  YES $%.2f → $%.2f", ticker, avg_cost, yes_price)
 
         if exit_reason:
             if not paper:
@@ -1042,16 +1221,22 @@ def check_exits(
                     )
                     exited[ticker] = "Stopped Out"
                     _exited_this_session.add(ticker)
-                    print(f"  Exit order placed: {ticker} SELL {side.upper()} "
-                          f"@ ${exit_price:.2f}  reason={exit_reason}")
+                    log.info("EXIT  %s  SELL %s @ $%.2f  reason=%s", ticker, side.upper(), exit_price, exit_reason)
+
+                    # Scan remaining brackets for new/top-up entries
+                    if side == "no":
+                        _post_exit_scan(client, ticker, live_positions, paper=False)
                 except Exception as e:
-                    print(f"  Exit order failed for {ticker}: {e}")
+                    log.error("exit order failed  %s: %s", ticker, e)
                     continue
             else:
                 exited[ticker] = "Stopped Out"
                 _exited_this_session.add(ticker)
-                print(f"    [PAPER] Would exit {ticker} SELL {side.upper()} "
-                      f"@ ${exit_price:.2f}  reason={exit_reason}")
+                log.info("[PAPER] EXIT  %s  SELL %s @ $%.2f  reason=%s", ticker, side.upper(), exit_price, exit_reason)
+
+                # Scan remaining brackets for new/top-up entries (paper)
+                if side == "no":
+                    _post_exit_scan(client, ticker, live_positions, paper=True)
 
         time.sleep(0.1)
 
@@ -1108,16 +1293,18 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
         lowt_decision_engine.display(lowt_evals)
         evaluations = evaluations + lowt_evals
     except Exception as e:
-        print(f"  LOWT pipeline error (non-fatal): {e}")
+        log.warning("LOWT pipeline error (non-fatal): %s", e)
 
     try:
-        balance    = get_balance(client)
-        deployable = round(balance * 0.70, 2)
-        print(f"\n  Account balance: ${balance:.2f}  |  Deployable (70%): ${deployable:.2f}")
+        balance                      = get_balance(client)
+        deployable, cascade_reserve  = _update_day_snapshot(balance)
+        log.info("balance: $%.2f  |  deployable: $%.2f  |  cascade_reserve: $%.2f",
+                 balance, deployable, cascade_reserve)
     except Exception as e:
-        print(f"  Balance fetch failed: {e} — using $0 deployable cap")
-        balance    = 0.0
-        deployable = 0.0
+        log.warning("balance fetch failed: %s — using $0 cap", e)
+        balance          = 0.0
+        deployable       = 0.0
+        cascade_reserve  = 0.0
 
     try:
         live_positions = sync_from_kalshi(client)
@@ -1149,7 +1336,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             # Same-ticker cooldown: never re-enter a ticker exited this session
             if ticker in _exited_this_session:
-                print(f"  Skipping {ticker} — exited this session (cooldown)")
+                log.debug("skip %s — cooldown", ticker)
                 continue
 
             # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets.
@@ -1157,9 +1344,8 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             # signal["max_contracts"] which is contracts per position.
             city_held = held_per_city.get(city, 0)
             if city_held >= decision_engine.MAX_NO_PER_CITY:
-                print(f"  Skipping {ticker} — {city} already holds "
-                      f"{city_held}/{decision_engine.MAX_NO_PER_CITY} positions today "
-                      f"(MAX_NO_PER_CITY)")
+                log.debug("skip %s — %s already at MAX_NO_PER_CITY (%d/%d)",
+                          ticker, city, city_held, decision_engine.MAX_NO_PER_CITY)
                 continue
             contracts = contracts_for_signal(signal)
             side      = signal["trade_type"].lower()
@@ -1170,7 +1356,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             max_contr = signal.get("max_contracts", 2)
             headroom  = max_contr - held
             if headroom <= 0:
-                print(f"  Skipping {ticker} — already at max contracts ({held}/{max_contr})")
+                log.debug("skip %s — max contracts (%d/%d)", ticker, held, max_contr)
                 continue
             contracts = min(contracts, headroom)
 
@@ -1178,29 +1364,42 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
             ticker_dt   = _ticker_date(ticker)
             today_local = _city_local_date(city)
             if ticker_dt is None:
-                print(f"  Skipping {ticker} — could not parse date from ticker")
+                log.debug("skip %s — could not parse date", ticker)
                 continue
             if ticker_dt != today_local:
-                print(f"  Skipping {ticker} — market date {ticker_dt} is not today "
-                      f"(local: {today_local}, city: {city})")
+                log.debug("skip %s — market date %s is not today (local: %s, city: %s)",
+                          ticker, ticker_dt, today_local, city)
                 continue
 
             cost = price * contracts
-            if deployed + cost > deployable:
-                print(f"  Skipping {ticker} — would exceed 70% deployable cap "
-                      f"(deployed=${deployed:.2f} + cost=${cost:.2f} > ${deployable:.2f})")
-                continue
 
-            print(f"\n  Executing: {city} {ticker}")
+            # Cascade signals draw from the cascade reserve;
+            # main engine signals draw from the main deployable budget
+            is_cascade = signal.get("entry_tier", "").startswith("cascade")
+            if is_cascade:
+                if balance - cost < cascade_reserve:
+                    log.debug("skip %s — cascade reserve would be breached "
+                              "(balance=$%.2f  cost=$%.2f  reserve=$%.2f)",
+                              ticker, balance, cost, cascade_reserve)
+                    continue
+            else:
+                if deployed + cost > deployable:
+                    log.debug("skip %s — would exceed deployable cap "
+                              "(deployed=$%.2f + cost=$%.2f > $%.2f)",
+                              ticker, deployed, cost, deployable)
+                    continue
+
+            log.info("SIGNAL  %s  %s", city, ticker)
             tier = signal.get("entry_tier", "")
             if tier.startswith("cascade"):
-                tier_label = "CASCADE-MORNING" if "morning" in tier else "CASCADE-AFTERNOON"
-                print(f"    {side.upper()} {contracts}x @ ${price:.2f}  "
-                      f"[{tier_label}]  {signal.get('trigger_info', '')}")
+                detail = signal.get("trigger_info") or tier
             else:
-                print(f"    {side.upper()} {contracts}x @ ${price:.2f}  "
-                      f"score={signal['score']}/3"
-                      f"  [{', '.join(signal.get('score_detail', []))}]")
+                detail = ", ".join(signal.get("score_detail", [])) or "no_detail"
+
+            log.info("  %s %dx @ $%.2f  score=%s/5  [%s]",
+                     side.upper(), contracts, price,
+                     signal.get("score", "?"),
+                     detail)
 
             try:
                 place_order(
@@ -1229,9 +1428,9 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 })
 
             except Exception as e:
-                print(f"  Order failed for {ticker}: {e}")
+                log.error("order failed  %s: %s", ticker, e)
 
-    print(f"\n  {executed} order(s) placed.")
+    log.info("%d order(s) placed", executed)
     return evaluations
 
 
@@ -1262,12 +1461,12 @@ if __name__ == "__main__":
 
         if args.balance:
             bal = get_balance(client)
-            print(f"\n  Account balance: ${bal:.2f}")
+            log.info("balance: $%.2f", bal)
 
         if args.positions:
             positions = sync_from_kalshi(client)
             if not positions:
-                print("\n  No open positions.")
+                log.info("no open positions")
             else:
                 print(f"\n  {'Ticker':<28} {'Side':>5} {'Qty':>4} "
                       f"{'AvgCost':>8} {'Current':>8} {'UnrealPnL':>10}")
@@ -1286,9 +1485,9 @@ if __name__ == "__main__":
             run_pipeline(client, city_filter=args.city, paper=args.paper)
 
         if args.monitor:
-            print(f"\nExit monitor running — polling every {MONITOR_INTERVAL}s. Ctrl+C to stop.")
+            log.info("exit monitor running — polling every %ds", MONITOR_INTERVAL)
             while True:
-                print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M UTC')}] Checking exits...")
+                log.info('checking exits...')
                 check_exits(client, paper=args.paper)
                 time.sleep(MONITOR_INTERVAL)
 

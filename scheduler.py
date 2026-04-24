@@ -11,11 +11,10 @@ Interval schedule (per city local time):
   1pm–3pm                   →  5 min  (post-peak, convergence settling)
   3pm–midnight               →  5 min  (next-market may appear at any time)
 
-Next-market scan:
-  Runs every poll cycle in parallel with the main pipeline — no time-window gate.
-  tomorrow_scanner tracks per-city state: which market date to watch, and whether
-  today's market has converged (triggering a roll-forward to the day after tomorrow).
-  On startup, state is derived from live Kalshi data (open positions + market prices).
+Logging:
+  All output uses Python logging with UTC timestamps.
+  Set LOG_LEVEL=DEBUG for verbose per-city detail.
+  Set LOG_FILE=logs/scheduler.log to write a rotating file alongside stdout.
 
 Usage:
   python scheduler.py                   # live, dynamic interval
@@ -33,17 +32,22 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+from log_setup import get_logger
+
 import trader
 import hight_decision_engine as decision_engine
 import tomorrow_scanner
+import peak_scanner
 from cities import TRADING_CITIES as _CITY_REGISTRY
+
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-ACTIVITY_START_HOUR = 0    # local city time — poll from midnight
-ACTIVITY_END_HOUR   = 23   # local city time — poll all day
+ACTIVITY_START_HOUR = 0
+ACTIVITY_END_HOUR   = 23
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +55,6 @@ ACTIVITY_END_HOUR   = 23   # local city time — poll all day
 # ---------------------------------------------------------------------------
 
 def _filter_cities(city_filter: str = None) -> dict[str, str]:
-    """Return {city: tz_name} for active trading cities, optionally filtered."""
     cities = {name: meta["tz"] for name, meta in _CITY_REGISTRY.items()}
     if city_filter:
         return {k: v for k, v in cities.items() if k.lower() == city_filter.lower()}
@@ -63,32 +66,17 @@ def local_hour(tz_name: str) -> int:
 
 
 def dynamic_interval(city_filter: str = None) -> int:
-    """
-    Returns poll interval in seconds based on the most active city phase.
-    Takes the minimum (most frequent) interval across all active cities.
-
-    Default 5 min everywhere — the next-market may converge at any time of
-    day, so we keep a consistent cadence. Peak window tightens to 3 min.
-
-    Overnight/shoulder (midnight–11am, 1pm–midnight): 5 min
-    Peak (11am–1pm):                                  3 min
-    """
     cities       = _filter_cities(city_filter)
-    min_interval = 5 * 60    # default: 5 min
-
+    min_interval = 5 * 60
     for tz in cities.values():
-        h = local_hour(tz)
-        if 11 <= h < 13:
-            min_interval = min(min_interval, 3 * 60)    # peak — 3 min
-
+        if 11 <= local_hour(tz) < 13:
+            min_interval = min(min_interval, 3 * 60)
     return min_interval
 
 
-def fmt_now() -> str:
-    utc_now    = datetime.now(timezone.utc)
-    lisbon_now = utc_now.astimezone(ZoneInfo("Europe/Lisbon"))
-    return (f"{utc_now.strftime('%H:%M UTC')} "
-            f"/ {lisbon_now.strftime('%H:%M %Z')}")
+def fmt_local() -> str:
+    lisbon = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Lisbon"))
+    return lisbon.strftime("%H:%M %Z")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +88,7 @@ def run_scheduler(
     city_filter:       str  = None,
     interval_override: int  = None,
 ):
-    # Load credentials from config file if present, fall back to env vars
+    # ── Load credentials ──────────────────────────────────────────────────
     config_file = Path("data/config.json")
     if config_file.exists():
         try:
@@ -113,7 +101,6 @@ def run_scheduler(
         except Exception:
             pass
     else:
-        # Fall back to .env file for terminal use
         env_file = Path(".env")
         if env_file.exists():
             for line in env_file.read_text().splitlines():
@@ -124,29 +111,28 @@ def run_scheduler(
     client   = trader.make_client()
     mode_str = "PAPER" if paper else ("DEMO" if client.demo else "LIVE")
 
-    print(f"\n{'='*65}")
-    print(f"  Kalshi Weather Scheduler  [{mode_str}]")
-    print(f"  Interval      : {'dynamic' if not interval_override else f'{interval_override} min (override)'}")
-    print(f"  Trading window: {decision_engine.TRADE_WINDOW_START}:00–"
-          f"{decision_engine.TRADE_WINDOW_END}:00 local per city")
-    print(f"  Activity range: {ACTIVITY_START_HOUR}:00–{ACTIVITY_END_HOUR}:00 local per city")
+    log.info("=" * 60)
+    log.info("Kalshi Weather Scheduler  [%s]", mode_str)
+    log.info("interval       : %s",
+             "dynamic" if not interval_override else f"{interval_override} min (override)")
+    log.info("trading window : %d:00–%d:00 local",
+             decision_engine.TRADE_WINDOW_START, decision_engine.TRADE_WINDOW_END)
     if city_filter:
-        print(f"  City filter   : {city_filter}")
-    print(f"{'='*65}\n")
+        log.info("city filter    : %s", city_filter)
+    log.info("=" * 60)
 
-    # ── Initialise next-market scanner from live state ────────────────────
-    print("  Initialising next-market scanner...")
+    # ── Initialise scanners ───────────────────────────────────────────────
+    log.info("initialising next-market scanner...")
     try:
         tomorrow_scanner.initialise(client=client, city_filter=city_filter)
     except Exception as e:
-        print(f"  Scanner init error (non-fatal): {e}")
-    print()
+        log.warning("scanner init error (non-fatal): %s", e)
+
+    peak_scanner.log_config()
 
     poll_count = 0
 
     while True:
-        now_str = fmt_now()
-
         interval_secs = (
             interval_override * 60
             if interval_override
@@ -154,65 +140,76 @@ def run_scheduler(
         )
 
         poll_count += 1
-        print(f"\n[{now_str}] Poll #{poll_count}  "
-              f"(interval: {interval_secs // 60} min)")
-        print(f"{'-'*55}")
+        poll_start = time.monotonic()
 
-        # ── Run pipeline + next-market scan in parallel ──────────────────
-        # Both tasks are I/O-bound with no shared mutable state.
-        # The scan runs every poll — convergence gating is handled inside
-        # tomorrow_scanner, not here.
+        log.info("─" * 55)
+        log.info("poll #%d  |  interval=%dmin  |  local=%s",
+                 poll_count, interval_secs // 60, fmt_local())
+
+        # ── Parallel tasks ────────────────────────────────────────────────
         def _run_pipeline():
-            trader.run_pipeline(
-                client      = client,
-                city_filter = city_filter,
-                paper       = paper,
-            )
+            t0 = time.monotonic()
+            log.info("[pipeline] starting")
+            trader.run_pipeline(client=client, city_filter=city_filter, paper=paper)
+            log.info("[pipeline] done  (%.1fs)", time.monotonic() - t0)
 
         def _run_scan():
-            tomorrow_scanner.run_scan(
-                client      = client,
-                city_filter = city_filter,
-                paper       = paper,
-            )
+            t0 = time.monotonic()
+            log.debug("[next_market_scan] starting")
+            tomorrow_scanner.run_scan(client=client, city_filter=city_filter, paper=paper)
+            log.debug("[next_market_scan] done  (%.1fs)", time.monotonic() - t0)
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        def _run_peak():
+            t0 = time.monotonic()
+            log.debug("[peak_scan] starting")
+            peak_scanner.run_scan(client=client, city_filter=city_filter, paper=paper)
+            log.debug("[peak_scan] done  (%.1fs)", time.monotonic() - t0)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
             futures = {
                 pool.submit(_run_pipeline): "pipeline",
                 pool.submit(_run_scan):     "next_market_scan",
+                pool.submit(_run_peak):     "peak_scan",
             }
             for fut in as_completed(futures):
                 name = futures[fut]
                 try:
                     fut.result()
                 except Exception as e:
-                    print(f"  {name} error: {e}")
+                    log.error("[%s] unhandled error: %s", name, e, exc_info=True)
 
-        # ── Check exits — reuse positions already fetched by run_pipeline ──
+        # ── Exit check ────────────────────────────────────────────────────
         try:
+            t0             = time.monotonic()
             live_positions = trader.sync_from_kalshi(client)
-            exited = trader.check_exits(client, paper=paper, live_positions=live_positions)
+            exited         = trader.check_exits(
+                client, paper=paper, live_positions=live_positions
+            )
+            elapsed = time.monotonic() - t0
             if exited:
-                print(f"\n  Exited {len(exited)} position(s): {list(exited.values())}")
+                log.info("exits: %d closed  (%.1fs)  %s",
+                         len(exited), elapsed, list(exited.values()))
             else:
-                print(f"  No exits triggered.")
+                log.info("exits: none  (%.1fs)", elapsed)
         except Exception as e:
-            print(f"  Exit check error: {e}")
+            log.error("exit check failed: %s", e, exc_info=True)
 
-        # ── Balance summary ───────────────────────────────────────────────
+        # ── Balance ───────────────────────────────────────────────────────
         try:
             balance    = trader.get_balance(client)
             deployable = round(balance * 0.70, 2)
-            print(f"\n  Balance: ${balance:.2f}  |  Deployable: ${deployable:.2f}")
-        except Exception:
-            pass
+            log.info("balance: $%.2f  |  deployable: $%.2f", balance, deployable)
+        except Exception as e:
+            log.warning("balance fetch failed: %s", e)
 
-        # ── Sleep ────────────────────────────────────────────────────────
-        next_poll = datetime.now(timezone.utc) + timedelta(seconds=interval_secs)
-        print(f"  Next poll: {next_poll.strftime('%H:%M UTC')}")
+        # ── Poll summary + sleep ──────────────────────────────────────────
+        elapsed_total = time.monotonic() - poll_start
+        next_poll     = datetime.now(timezone.utc) + timedelta(seconds=interval_secs)
+        log.info("poll #%d done  (%.1fs)  |  next at %s",
+                 poll_count, elapsed_total,
+                 next_poll.strftime("%H:%M:%S UTC"))
+
         time.sleep(interval_secs)
-
-    print(f"\n[{fmt_now()}] Scheduler finished.")
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +218,9 @@ def run_scheduler(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Kalshi weather trading scheduler")
-    parser.add_argument("--paper",    action="store_true",
-                        help="Paper mode — no real orders")
-    parser.add_argument("--city",     type=str, default=None,
-                        help="Filter to one city (e.g. 'Miami')")
-    parser.add_argument("--interval", type=int, default=None, metavar="MINUTES",
-                        help="Override dynamic interval (minutes)")
+    parser.add_argument("--paper",    action="store_true")
+    parser.add_argument("--city",     type=str, default=None)
+    parser.add_argument("--interval", type=int, default=None, metavar="MINUTES")
     args = parser.parse_args()
 
     run_scheduler(

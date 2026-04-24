@@ -79,11 +79,11 @@ BOUNDARY_BUFFER_FALLBACK      = 3.0   # °F
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
-NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
+NO_MIN_ENTRY_PRICE  = 0.65     # never pay less than this for a NO contract
                                # data: below 0.75 market is pricing in real uncertainty
-NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract
+NO_MAX_ENTRY_PRICE  = 0.91     # never pay more than this for a NO contract
                                # data: 0.75–0.92 gives 86.5% WR across 37 trades
-MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
+MAX_NO_PER_CITY     = 10       # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = True   # never trade NO on "above X°" (T) brackets for HIGH markets
                                # spring/summer: temps trending up → asymmetric risk upward
                                # data: 29% WR, -$6.52 across 7 trades
@@ -101,7 +101,7 @@ FORECAST_BIAS_CORRECTION = -1.0   # °F — subtract from NWS forecast high
 # Forecast well-clear threshold for scoring
 # Bracket must be this far from the corrected forecast to score the forecast point
 # (higher bar than boundary buffer gate — gate≈3°F, score=6°F)
-FORECAST_WELL_CLEAR = 6.0
+FORECAST_WELL_CLEAR = 5.0
 
 # Market-derived confidence bonus
 # YES price at or below this threshold earns an extra score point — the market

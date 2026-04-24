@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QFrame, QScrollArea, QSizePolicy,
     QTextEdit, QSplitter, QMessageBox, QLineEdit,
     QFileDialog, QDialog, QDialogButtonBox, QCheckBox,
+    QComboBox,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QTimer, QObject, QMetaObject, Q_ARG, pyqtSlot
@@ -45,6 +46,35 @@ except ImportError:
 
 # Pre-import trading modules so they're ready before any button is clicked
 import trader as _trader_preload
+
+# Matplotlib for city history charts
+try:
+    import os as _os
+    _os.environ.setdefault("MPLBACKEND", "QtAgg")
+    import matplotlib
+    matplotlib.use("QtAgg")
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    import matplotlib.dates as mdates
+    import matplotlib.ticker
+    _MATPLOTLIB_OK = True
+except Exception:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        from matplotlib.figure import Figure
+        import matplotlib.dates as mdates
+        import matplotlib.ticker
+        # Wrap Agg canvas to work as a QWidget
+        from PyQt6.QtWidgets import QLabel
+        from PyQt6.QtGui import QPixmap, QImage
+        import io
+        _MATPLOTLIB_AGG_FALLBACK = True
+        _MATPLOTLIB_OK = True
+    except Exception:
+        _MATPLOTLIB_OK = False
+        _MATPLOTLIB_AGG_FALLBACK = False
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -537,13 +567,13 @@ class SchedulerWorker(QObject):
 
             def dynamic_interval():
                 # Mirrors scheduler.py logic — uses _ALL_CITIES from cities.py
-                min_secs = 10 * 60  # default 10 min overnight
+                min_secs = 5 * 60   # default 5 min
                 for meta in _ALL_CITIES.values():
                     tz = meta.get("tz")
                     if not tz:
                         continue
                     h = datetime.now(ZoneInfo(tz)).hour
-                    if 11 <= h < 13:
+                    if 11 <= h < 16:
                         min_secs = min(min_secs, 3 * 60)
                     elif h in (9, 10, 13, 14):
                         min_secs = min(min_secs, 5 * 60)
@@ -557,14 +587,18 @@ class SchedulerWorker(QObject):
                 poll_count += 1
                 self.poll_started.emit(poll_count)
 
-                now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
-                self.log_line.emit(f"\n[{now_str}] Poll #{poll_count}  ({interval_secs//60} min interval)")
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                self.log_line.emit(
+                    f"\n{chr(9472)*56}\n"
+                    f"[{now_str}] Poll #{poll_count}  "
+                    f"(next in {interval_secs//60}m{interval_secs%60:02d}s)"
+                )
 
                 # ── Single sync fetch shared across pipeline + exit check ──────
                 try:
                     live_pos = trader.sync_from_kalshi(client)
                 except Exception as e:
-                    self.log_line.emit(f"Sync error: {e}")
+                    self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Sync error: {e}")
                     live_pos = []
 
                 tickers_before = {
@@ -585,7 +619,7 @@ class SchedulerWorker(QObject):
                                 self._last_scores[t] = s
                     self.positions_updated.emit()
                 except Exception as e:
-                    self.log_line.emit(f"Pipeline error: {e}")
+                    self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Pipeline error: {e}")
 
                 if not self.is_running():
                     break
@@ -593,7 +627,8 @@ class SchedulerWorker(QObject):
                 # Check exits — pass pre-fetched positions to avoid redundant sync
                 try:
                     if live_pos:
-                        self.log_line.emit(f"Checking exits ({len(live_pos)} open)...")
+                        ts_exit = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                        self.log_line.emit(f"[{ts_exit}] Checking exits ({len(live_pos)} open)...")
                     exited = trader.check_exits(
                         client         = client,
                         paper          = self.paper,
@@ -606,24 +641,33 @@ class SchedulerWorker(QObject):
                             p["ticker"] for p in live_pos_after
                             if "HIGH" in p["ticker"] or "LOWT" in p["ticker"]
                         }
+                        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                         for pos in live_pos_after:
                             t = pos["ticker"]
                             if t not in tickers_before and ("HIGH" in t or "LOWT" in t):
-                                score = self._last_scores.get(t, "?")
+                                score = self._last_scores.get(t, 0)
                                 self.session_entry.emit({
                                     **pos,
                                     "entered_at": datetime.now(timezone.utc).strftime("%H:%M UTC"),
                                     "score": score,
                                 })
+                                self.log_line.emit(
+                                    f"[{ts}] ENTRY  {t}  "
+                                    f"{pos.get('contracts', '?')}c  "
+                                    f"score={score}/5"
+                                )
                         # Detect closed positions
                         for closed_ticker in tickers_before - tickers_after:
                             reason = exited.get(closed_ticker, "Settled")
                             self.session_exit.emit(closed_ticker, reason)
+                            self.log_line.emit(
+                                f"[{ts}] EXIT   {closed_ticker}  reason={reason}"
+                            )
                     except Exception as e:
-                        self.log_line.emit(f"Post-pipeline sync error: {e}")
+                        self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Post-pipeline sync error: {e}")
                     self.positions_updated.emit()
                 except Exception as e:
-                    self.log_line.emit(f"Exit check error: {e}")
+                    self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Exit check error: {e}")
 
                 # Update balance
                 try:
@@ -638,7 +682,7 @@ class SchedulerWorker(QObject):
                 self.sleep_interruptible(interval_secs)
 
         except Exception as e:
-            self.log_line.emit(f"Scheduler error: {e}")
+            self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Scheduler error: {e}")
         finally:
             self.stopped.emit()
 
@@ -1490,15 +1534,21 @@ class HomeTab(QWidget):
             self.log_line.emit(f"NWS fetch error: {results['_error']}")
             return
 
-        # Log a sample to confirm data is arriving
-        sample = next(iter(results.values()), {})
-        self.log_line.emit(
-            f"NWS data received — "
-            f"obs_hi={sample.get('observed_high_f')} "
-            f"obs_lo={sample.get('observed_low_f')} "
-            f"fcst_hi={sample.get('forecast_high_f')} "
-            f"fcst_lo={sample.get('forecast_low_f')}"
-        )
+        # Log full city snapshot
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines = [f"[{ts}] NWS SNAPSHOT"]
+        lines.append(f"  {'City':<16}  {'ObsHi':>6}  {'FcstHi':>7}  {'ObsLo':>6}  {'FcstLo':>7}")
+        lines.append(f"  {'-'*52}")
+        for city in sorted(results.keys()):
+            if city.startswith('_'):
+                continue
+            d = results[city]
+            oh  = f"{d.get('observed_high_f', '—'):>6}" if d.get('observed_high_f') is not None else f"{'—':>6}"
+            fh  = f"{d.get('forecast_high_f', '—'):>7}" if d.get('forecast_high_f') is not None else f"{'—':>7}"
+            ol  = f"{d.get('observed_low_f',  '—'):>6}" if d.get('observed_low_f')  is not None else f"{'—':>6}"
+            fl  = f"{d.get('forecast_low_f',  '—'):>7}" if d.get('forecast_low_f')  is not None else f"{'—':>7}"
+            lines.append(f"  {city:<16}  {oh}  {fh}  {ol}  {fl}")
+        self.log_line.emit("\n".join(lines))
 
         for city in _CITIES_ORDERED:
             card = self.city_cards.get(city)
@@ -1790,6 +1840,7 @@ class PnLTab(QWidget):
 
     def set_client(self, client):
         self._client = client
+        self._enriched = []   # populated by load_data() — read by CityHistoryTab
         self.status_label.setText("Kalshi connected — click Refresh to load")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
 
@@ -2074,6 +2125,9 @@ class PnLTab(QWidget):
         if not enriched:
             return
 
+        # Store for other tabs to read (e.g. CityHistoryTab)
+        self._enriched = enriched
+
         # ── Summary stats ─────────────────────────────────────────────
         total      = len(enriched)
         wins       = [e for e in enriched if e["won"]]
@@ -2275,7 +2329,7 @@ class SessionTab(QWidget):
         title.setStyleSheet(f"color: {TEXT_PRI}; font-size: 16px; font-weight: bold; letter-spacing: 1px;")
 
         self.refresh_btn = QPushButton("⟳  Refresh")
-        self.refresh_btn.setFixedWidth(100)
+        self.refresh_btn.setFixedWidth(130)
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setStyleSheet(f"""
             QPushButton {{
@@ -2350,7 +2404,7 @@ class SessionTab(QWidget):
         th.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         th.setMinimumSectionSize(1)
         # Time, Market, Side, Qty, Entry, Score, Unreal. PnL, Status
-        for col, pct in enumerate([10, 26, 7, 5, 9, 8, 12, 8]):
+        for col, pct in enumerate([16, 22, 7, 5, 9, 8, 12, 8]):
             th.resizeSection(col, pct)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2361,9 +2415,66 @@ class SessionTab(QWidget):
         layout.addWidget(self.table, stretch=1)
 
     def set_client(self, client):
-        """Store Kalshi client — enables the Refresh button."""
+        """Store Kalshi client — enables the Refresh button and loads existing positions."""
         self._client = client
         self.refresh_btn.setEnabled(True)
+        self._load_existing_positions()
+
+    def _load_existing_positions(self):
+        """
+        On startup, fetch all live Kalshi positions and pre-populate _entries.
+        Ensures positions entered before the app started appear in the Session tab.
+        Only loads positions not already tracked.
+        """
+        if not self._client:
+            return
+
+        def fetch():
+            import trader as _t
+            try:
+                live = _t.sync_from_kalshi(self._client)
+                return [p for p in live
+                        if "HIGH" in p.get("ticker","") or "LOWT" in p.get("ticker","")]
+            except Exception:
+                return []
+
+        def on_done(positions):
+            existing_tickers = {e["ticker"] for e in self._entries}
+            added = 0
+            for pos in positions:
+                if pos["ticker"] in existing_tickers:
+                    continue
+                # Try to recover score from trade log
+                score = 0
+                try:
+                    import json, pathlib
+                    log_path = pathlib.Path("data/trade_log.json")
+                    if log_path.exists():
+                        trades = json.loads(log_path.read_text())
+                        for t in reversed(trades):
+                            if t.get("ticker") == pos["ticker"]:
+                                score = t.get("score", 0)
+                                break
+                except Exception:
+                    pass
+
+                self._entries.append({
+                    **pos,
+                    "status":     "Open",
+                    "entered_at": "pre-session",
+                    "score":      score,
+                })
+                added += 1
+
+            if added:
+                self._rebuild()
+
+        def on_error(msg):
+            pass  # silent — session tab stays empty if fetch fails
+
+        self._load_thread, self._load_worker = run_in_background(
+            fetch, on_done, on_error
+        )
 
     def refresh_statuses(self):
         """
@@ -2439,6 +2550,7 @@ class SessionTab(QWidget):
         for entry in self._entries:
             if entry["ticker"] == ticker:
                 entry["status"] = status
+                entry["exited_at"] = datetime.now(timezone.utc).strftime("%H:%M UTC")
         self._rebuild()
 
     def clear(self):
@@ -2452,7 +2564,7 @@ class SessionTab(QWidget):
         open_count    = sum(1 for e in entries if e["status"] == "Open")
         stopped_count = sum(1 for e in entries if e["status"] == "Stopped Out")
         scores        = [e.get("score", 0) for e in entries if isinstance(e.get("score"), (int, float))]
-        avg_score     = f"{sum(scores)/len(scores):.1f}/3" if scores else "—"
+        avg_score     = f"{sum(scores)/len(scores):.1f}/5" if scores else "—"
 
         self.stat_labels["Entries"].setText(str(len(entries)))
         self.stat_labels["Open"].setText(str(open_count))
@@ -2498,13 +2610,20 @@ class SessionTab(QWidget):
             unreal_color = ACCENT if unreal > 0 else (RED if unreal < 0 else TEXT_SEC)
             unreal_str   = f"{unreal_sign}${unreal:.2f}" if status == "Open" else "—"
 
+            entered_at = e.get("entered_at", "—")
+            exited_at  = e.get("exited_at")
+            if exited_at and status not in ("Open",):
+                time_str = f"{entered_at} → {exited_at}"
+            else:
+                time_str = entered_at
+
             vals = [
-                (e.get("entered_at", "—"),                          TEXT_SEC),
+                (time_str,                                          TEXT_SEC),
                 (_city_from_ticker(e.get("ticker","")) or e.get("ticker",""), TEXT_PRI),
                 (side,                        ACCENT if side == "NO" else YELLOW),
                 (str(e.get("contracts", 1)), TEXT_PRI),
                 (f"${avg_cost:.2f}",          TEXT_PRI),
-                (f"{score}/3",                TEXT_PRI),
+                (f"{score}/5",                TEXT_PRI),
                 (unreal_str,                  unreal_color),
                 (status,                      status_color),
             ]
@@ -2570,6 +2689,513 @@ class LogTab(QWidget):
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# City History Tab
+# ──────────────────────────────────────────────────────────────────────────────
+
+class CityHistoryTab(QWidget):
+    """
+    Per-city dashboard showing:
+      - Rolling 7-day win rate chart
+      - Cumulative PnL chart
+      - Intraday PnL by hour bar chart
+      - Summary stats: WR, PnL, avg convergence hour, forecast bias, latest obs high
+      - Full position history table (main engine vs cascade)
+    """
+
+    CITIES = sorted([
+        'Atlanta','Austin','Boston','Chicago','Dallas','Denver',
+        'Houston','Las Vegas','Los Angeles','Miami','Minneapolis',
+        'New Orleans','New York','Oklahoma City','Philadelphia',
+        'Phoenix','San Antonio','San Francisco','Seattle','Washington DC',
+    ])
+
+    def __init__(self):
+        super().__init__()
+        self._city     = None
+        self._trades   = []   # raw trade_log.json entries
+        self._bias     = {}   # forecast_bias.json
+        self._obs      = {}   # latest obs_high per city from CSV
+        self._pnl_tab  = None # reference to PnLTab for enriched data
+        self._setup_ui()
+        self._load_static_data()
+
+    def set_pnl_tab(self, pnl_tab):
+        self._pnl_tab = pnl_tab
+
+    # ── UI ───────────────────────────────────────────────────────────────────
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        # City selector row
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        lbl = QLabel("City:")
+        lbl.setStyleSheet(f"color:{TEXT_SEC}; font-size:12px;")
+        self._combo = QComboBox()
+        self._combo.addItem("— select city —")
+        for c in self.CITIES:
+            self._combo.addItem(c)
+        self._combo.setFixedWidth(220)
+        self._combo.currentTextChanged.connect(self._on_city_changed)
+
+        self._refresh_btn = QPushButton("⟳  Refresh")
+        self._refresh_btn.setFixedWidth(110)
+        self._refresh_btn.clicked.connect(self._refresh)
+
+        top.addWidget(lbl)
+        top.addWidget(self._combo)
+        top.addWidget(self._refresh_btn)
+        top.addStretch()
+        layout.addLayout(top)
+
+        # Stats bar
+        self._stats_bar = QWidget()
+        self._stats_bar.setStyleSheet(f"background:{BG_PANEL}; border-radius:6px;")
+        stats_layout = QHBoxLayout(self._stats_bar)
+        stats_layout.setContentsMargins(16, 10, 16, 10)
+        stats_layout.setSpacing(0)
+        self._stat_labels = {}
+        for key in ["Win Rate", "Total PnL", "Positions", "Avg Conv Hour", "Forecast Bias", "Latest Obs Hi"]:
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            title = QLabel(key.upper())
+            title.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px; letter-spacing:1px;")
+            val = QLabel("—")
+            val.setStyleSheet(f"color:{TEXT_PRI}; font-size:20px; font-weight:500;")
+            col.addWidget(title)
+            col.addWidget(val)
+            self._stat_labels[key] = val
+            w = QWidget()
+            w.setLayout(col)
+            stats_layout.addWidget(w)
+            if key != "Latest Obs Hi":
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.VLine)
+                sep.setStyleSheet(f"color:{BG_ROW_ALT};")
+                stats_layout.addWidget(sep)
+        layout.addWidget(self._stats_bar)
+
+        # Charts row (3 charts side by side)
+        charts_row = QHBoxLayout()
+        charts_row.setSpacing(8)
+
+        # Chart labels — rendered as pixmaps via matplotlib Agg
+        self._lbl_wr  = QLabel(); self._lbl_wr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_pnl = QLabel(); self._lbl_pnl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_hr  = QLabel(); self._lbl_hr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        for lbl in (self._lbl_wr, self._lbl_pnl, self._lbl_hr):
+            lbl.setMinimumHeight(200)
+            lbl.setStyleSheet(f"background:{BG_PANEL}; border-radius:6px;")
+        charts_row.addWidget(self._lbl_wr)
+        charts_row.addWidget(self._lbl_pnl)
+        charts_row.addWidget(self._lbl_hr)
+
+        layout.addLayout(charts_row)
+
+        # Position history table
+        tbl_label = QLabel("POSITION HISTORY")
+        tbl_label.setStyleSheet(f"color:{TEXT_SEC}; font-size:10px; letter-spacing:1.5px; margin-top:4px;")
+        layout.addWidget(tbl_label)
+
+        self._table = QTableWidget()
+        self._table.setColumnCount(9)
+        self._table.setHorizontalHeaderLabels(
+            ["Date", "Bracket", "Engine", "Side", "Entry", "Exit/Unreal", "PnL", "Contracts", "Outcome"]
+        )
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setStyleSheet(f"""
+            QTableWidget {{
+                gridline-color: {BG_ROW_ALT};
+                font-size: 12px;
+                alternate-background-color: {BG_ROW_ALT};
+            }}
+            QHeaderView::section {{
+                background: {BG_PANEL}; color: {TEXT_SEC};
+                padding: 4px 8px; border: none; font-size: 10px;
+                letter-spacing: 1px;
+            }}
+        """)
+        layout.addWidget(self._table, stretch=1)
+
+    def _style_ax(self, ax, title: str):
+        bg = BG_PANEL
+        ax.set_facecolor(bg)
+        ax.tick_params(colors=TEXT_SEC, labelsize=8)
+        ax.set_title(title, color=TEXT_SEC, fontsize=9, pad=4)
+        ax.spines[:].set_color(BG_ROW_ALT)
+        for spine in ax.spines.values():
+            spine.set_linewidth(0.5)
+        ax.yaxis.label.set_color(TEXT_SEC)
+        ax.xaxis.label.set_color(TEXT_SEC)
+
+    # ── Data loading ─────────────────────────────────────────────────────────
+
+    def _load_static_data(self):
+        """Load trade log, forecast bias, and derive outcomes from observations."""
+        # Trade log
+        try:
+            p = Path("data/trade_log.json")
+            self._trades = json.loads(p.read_text()) if p.exists() else []
+        except Exception:
+            self._trades = []
+
+        # Forecast bias
+        try:
+            p = Path("data/forecast_bias.json")
+            self._bias = json.loads(p.read_text()) if p.exists() else {}
+        except Exception:
+            self._bias = {}
+
+        # Observations — derive settlement outcome and latest obs_high per city
+        self._obs          = {}   # city -> latest observed_high_f
+        self._settlement   = {}   # ticker -> ('no'|'yes'|'open', final_no_price, final_yes_price)
+        self._conv_hour    = {}   # ticker -> local hour when no_price first crossed 0.97
+
+        try:
+            import csv
+            p = Path("data/lowt_observations.csv")
+            if not p.exists():
+                return
+
+            # One pass — collect last row per ticker + convergence hour
+            rows_by_ticker: dict = {}
+            conv_by_ticker: dict = {}
+            with open(p, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    tk   = row.get("ticker", "")
+                    city = row.get("city", "")
+                    if not tk:
+                        continue
+                    rows_by_ticker[tk] = row   # last row wins
+
+                    # Track convergence hour (first time no_price >= 0.97)
+                    if tk not in conv_by_ticker:
+                        try:
+                            np_ = float(row.get("no_price") or 0)
+                            if np_ >= 0.97:
+                                lh = row.get("local_hour")
+                                if lh:
+                                    conv_by_ticker[tk] = int(float(lh))
+                        except (ValueError, TypeError):
+                            pass
+
+                    # Latest obs_high per city
+                    try:
+                        oh = row.get("observed_high_f")
+                        if oh and city:
+                            self._obs[city] = float(oh)
+                    except (ValueError, TypeError):
+                        pass
+
+            # Derive outcomes from last observation
+            for tk, row in rows_by_ticker.items():
+                try:
+                    np_ = float(row.get("no_price")  or 0)
+                    yp  = float(row.get("yes_price") or 0)
+                    if np_ >= 0.97:
+                        self._settlement[tk] = ("no",  np_, yp)
+                    elif yp >= 0.97:
+                        self._settlement[tk] = ("yes", np_, yp)
+                    else:
+                        self._settlement[tk] = ("open", np_, yp)
+                except (ValueError, TypeError):
+                    self._settlement[tk] = ("open", 0.0, 0.0)
+
+            self._conv_hour = conv_by_ticker
+
+        except Exception:
+            pass
+
+    def _refresh(self):
+        self._load_static_data()
+        if self._city:
+            self._render(self._city)
+
+    # ── City selection ────────────────────────────────────────────────────────
+
+    def _on_city_changed(self, city: str):
+        if city.startswith("—"):
+            return
+        self._city = city
+        self._render(city)
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    def _render(self, city: str):
+        trades = [t for t in self._trades if t.get("city") == city]
+        trades.sort(key=lambda t: t.get("placed_at", "") or "")
+
+        # Use enriched data from PnLTab (has actual PnL, outcomes, fill data)
+        enriched_map = {}
+        if self._pnl_tab is not None:
+            for e in getattr(self._pnl_tab, '_enriched', []):
+                enriched_map[e.get("ticker","")] = e
+
+        # Cross-reference trade_log with enriched settlements
+        def get_enriched(t):
+            return enriched_map.get(t.get("ticker",""), {})
+
+        def outcome(t):
+            e = get_enriched(t)
+            if not e:
+                return "open"
+            r = e.get("result","")
+            if e.get("won"):      return "win"
+            if r == "EARLY EXIT": return "exit"
+            return "loss"
+
+        def pnl(t):
+            e = get_enriched(t)
+            return float(e.get("net_pnl", 0) or 0) if e else 0.0
+
+        def exit_price(t):
+            e = get_enriched(t)
+            if not e: return "—"
+            r = e.get("result","")
+            if r == "EARLY EXIT":
+                ep = e.get("avg_sell")
+                return f"${ep:.2f}" if ep else "—"
+            if e.get("won"): return "$1.00"
+            return "$0.00"
+
+        def engine(t):
+            tier = (t.get("entry_tier","") or "").lower()
+            sd   = t.get("score_detail", []) or []
+            if "cascade" in tier or "post_exit" in str(sd):
+                return "CASCADE"
+            return "MAIN"
+
+        settled   = [t for t in trades if outcome(t) in ("win","loss","exit")]
+        wins      = [t for t in settled if outcome(t) == "win"]
+        wr_pct    = len(wins)/len(settled)*100 if settled else 0
+        total_pnl = sum(pnl(t) for t in trades)
+
+        # Avg convergence hour from observations CSV
+        conv_hours = []
+        for t in trades:
+            tk = t.get("ticker","")
+            ch = self._conv_hour.get(tk)
+            if ch is not None:
+                conv_hours.append(ch)
+        avg_conv = f"{sum(conv_hours)/len(conv_hours):.1f}h local" if conv_hours else "—"
+
+        bias_data = self._bias.get(city, {})
+        bias_val  = bias_data.get("bias") if bias_data else None
+        bias_str  = f"{bias_val:+.2f}°F" if bias_val is not None else "—"
+
+        latest_obs = self._obs.get(city)
+        obs_str    = f"{latest_obs:.1f}°F" if latest_obs is not None else "—"
+
+        # Stats bar
+        self._stat_labels["Win Rate"].setText(f"{wr_pct:.1f}%")
+        self._stat_labels["Win Rate"].setStyleSheet(
+            f"color:{'#00d4a0' if wr_pct>=90 else '#EF9F27' if wr_pct>=75 else '#E24B4A'}; font-size:20px; font-weight:500;")
+        self._stat_labels["Total PnL"].setText(f"${total_pnl:+.2f}")
+        self._stat_labels["Total PnL"].setStyleSheet(
+            f"color:{'#00d4a0' if total_pnl>=0 else '#E24B4A'}; font-size:20px; font-weight:500;")
+        self._stat_labels["Positions"].setText(str(len(trades)))
+        self._stat_labels["Avg Conv Hour"].setText(avg_conv)
+        self._stat_labels["Forecast Bias"].setText(bias_str)
+        self._stat_labels["Latest Obs Hi"].setText(obs_str)
+
+        # Charts — always attempt, Agg backend works without Qt binding
+        try:
+            self._draw_rolling_wr(trades, settled, wins)
+            self._draw_cumulative_pnl(trades, pnl)
+            self._draw_intraday(trades, pnl)
+        except Exception as e:
+            self._lbl_wr.setText(f"Chart error: {e}")
+
+        # Table
+        self._fill_table(trades, outcome, pnl, engine, exit_price)
+
+    def _fig_to_pixmap(self, fig):
+        """Render a matplotlib Figure to a QPixmap via Agg backend."""
+        import io
+        from PyQt6.QtGui import QPixmap, QImage
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
+                    facecolor=fig.get_facecolor())
+        buf.seek(0)
+        img = QImage.fromData(buf.read())
+        return QPixmap.fromImage(img)
+
+    def _draw_rolling_wr(self, trades, settled, wins):
+        from collections import defaultdict
+        import datetime as dt_mod
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        import matplotlib.dates as mdates
+
+        fig = Figure(figsize=(4, 2.2), facecolor=BG_PANEL)
+        ax  = fig.add_subplot(111)
+        self._style_ax(ax, "7-Day Rolling Win Rate")
+
+        by_date = defaultdict(lambda: {"wins":0,"total":0})
+        for t in settled:
+            try:
+                d = (t.get("placed_at","") or t.get("date",""))[:10]
+                if d:
+                    by_date[d]["total"] += 1
+                    if t in wins:
+                        by_date[d]["wins"] += 1
+            except: pass
+
+        dates = sorted(by_date.keys())
+        if len(dates) < 2:
+            self._lbl_wr.setText("Not enough data"); return
+
+        date_objs = [dt_mod.date.fromisoformat(d) for d in dates]
+        totals    = [by_date[d]["total"] for d in dates]
+        win_cts   = [by_date[d]["wins"]  for d in dates]
+        rolling_wr = []
+        for i in range(len(dates)):
+            w = sum(win_cts[max(0,i-6):i+1])
+            t = sum(totals[max(0,i-6):i+1])
+            rolling_wr.append(w/t*100 if t else None)
+
+        valid = [(d,v) for d,v in zip(date_objs, rolling_wr) if v is not None]
+        if not valid:
+            self._lbl_wr.setText("No data"); return
+        vd, vv = zip(*valid)
+
+        ax.plot(vd, vv, color=ACCENT, linewidth=1.5)
+        ax.axhline(90, color=TEXT_SEC, linewidth=0.5, linestyle="--", alpha=0.5)
+        ax.fill_between(vd, vv, alpha=0.15, color=ACCENT)
+        ax.set_ylim(0, 105)
+        import matplotlib.ticker as mticker
+        ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.0f%%"))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        fig.autofmt_xdate(rotation=30, ha="right")
+        fig.tight_layout(pad=0.5)
+        self._lbl_wr.setPixmap(self._fig_to_pixmap(fig))
+
+    def _draw_cumulative_pnl(self, trades, pnl_fn):
+        import datetime as dt_mod
+        import itertools
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+        import matplotlib.dates as mdates
+
+        fig = Figure(figsize=(4, 2.2), facecolor=BG_PANEL)
+        ax  = fig.add_subplot(111)
+        self._style_ax(ax, "Cumulative PnL ($)")
+
+        dated = []
+        for t in trades:
+            try:
+                d = (t.get("placed_at","") or "")[:10]
+                if d: dated.append((d, pnl_fn(t)))
+            except: pass
+        dated.sort(key=lambda x: x[0])
+        if not dated:
+            self._lbl_pnl.setText("No data"); return
+
+        dates   = [dt_mod.date.fromisoformat(d) for d,_ in dated]
+        cumvals = list(itertools.accumulate(v for _,v in dated))
+
+        ax.plot(dates, cumvals, color=ACCENT, linewidth=1.5)
+        ax.fill_between(dates, cumvals, where=[v>=0 for v in cumvals],
+                        alpha=0.15, color=ACCENT)
+        ax.fill_between(dates, cumvals, where=[v<0 for v in cumvals],
+                        alpha=0.15, color="#E24B4A")
+        ax.axhline(0, color=TEXT_SEC, linewidth=0.5)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+        fig.autofmt_xdate(rotation=30, ha="right")
+        fig.tight_layout(pad=0.5)
+        self._lbl_pnl.setPixmap(self._fig_to_pixmap(fig))
+
+    def _draw_intraday(self, trades, pnl_fn):
+        from collections import defaultdict
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(4, 2.2), facecolor=BG_PANEL)
+        ax  = fig.add_subplot(111)
+        self._style_ax(ax, "Avg PnL by Entry Hour (local)")
+
+        by_hour = defaultdict(list)
+        city    = self._city or ""
+        tz_name = _ALL_CITIES.get(city, {}).get("tz")
+        for t in trades:
+            try:
+                pa = t.get("placed_at","")
+                if pa:
+                    dt = datetime.fromisoformat(pa.replace("Z","+00:00"))
+                    if tz_name:
+                        dt = dt.astimezone(ZoneInfo(tz_name))
+                    by_hour[dt.hour].append(pnl_fn(t))
+            except: pass
+
+        if not by_hour:
+            self._lbl_hr.setText("No data"); return
+
+        hours      = sorted(by_hour.keys())
+        avgs       = [sum(by_hour[h])/len(by_hour[h]) for h in hours]
+        bar_colors = [ACCENT if a >= 0 else "#E24B4A" for a in avgs]
+        ax.bar(hours, avgs, color=bar_colors, alpha=0.8, width=0.7)
+        ax.axhline(0, color=TEXT_SEC, linewidth=0.5)
+        ax.set_xlabel("Local hour", fontsize=8, color=TEXT_SEC)
+        fig.tight_layout(pad=0.5)
+        self._lbl_hr.setPixmap(self._fig_to_pixmap(fig))
+
+    def _fill_table(self, trades, outcome_fn, pnl_fn, engine_fn, exit_price_fn):
+        self._table.setRowCount(0)
+        WIN_COLOR  = QColor("#00d4a0")
+        LOSS_COLOR = QColor("#E24B4A")
+        WARN_COLOR = QColor("#EF9F27")
+        DIM_COLOR  = QColor(TEXT_SEC)
+
+        for t in reversed(trades):
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+
+            date_str = (t.get("placed_at","") or "")[:10]
+            bracket  = t.get("ticker","").split("-")[-1] if t.get("ticker") else "—"
+            eng      = engine_fn(t)
+            side     = (t.get("side","NO") or "NO").upper()
+            entry    = f"${float(t.get('entry_price',0) or 0):.2f}"
+            out      = outcome_fn(t)
+            p        = pnl_fn(t)
+            pnl_str  = f"${p:+.2f}"
+            contr    = str(t.get("contracts","1") or "1")
+            exit_str = exit_price_fn(t)
+
+            outcome_map = {
+                "win":  ("SETTLED WIN",  WIN_COLOR),
+                "loss": ("SETTLED LOSS", LOSS_COLOR),
+                "exit": ("EARLY EXIT",   WARN_COLOR),
+                "open": ("OPEN",         DIM_COLOR),
+            }
+            out_text, out_color = outcome_map.get(out, (out.upper(), DIM_COLOR))
+
+            pnl_color = WIN_COLOR if p > 0 else (LOSS_COLOR if p < 0 else DIM_COLOR)
+            eng_color = QColor("#378ADD") if eng == "CASCADE" else QColor(ACCENT)
+
+            cells = [date_str, bracket, eng, side, entry, exit_str, pnl_str, contr, out_text]
+            colors = [None, None, eng_color, None, None, None, pnl_color, None, out_color]
+
+            for col, (val, color) in enumerate(zip(cells, colors)):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if color:
+                    item.setForeground(color)
+                self._table.setItem(row, col, item)
 
 class MainWindow(QMainWindow):
     def __init__(self, config: dict):
@@ -2660,10 +3286,14 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         tabs.setCornerWidget(settings_btn, Qt.Corner.TopRightCorner)
 
-        tabs.addTab(self.home_tab,    "  Home  ")
-        tabs.addTab(self.session_tab, "  Session  ")
-        tabs.addTab(self.pnl_tab,     "  Performance  ")
-        tabs.addTab(self.log_tab,     "  Log  ")
+        self.city_history_tab = CityHistoryTab()
+        # Wire PnL tab data into city history tab
+        self.city_history_tab.set_pnl_tab(self.pnl_tab)
+        tabs.addTab(self.home_tab,         "  Home  ")
+        tabs.addTab(self.session_tab,      "  Session  ")
+        tabs.addTab(self.pnl_tab,          "  Performance  ")
+        tabs.addTab(self.city_history_tab, "  City History  ")
+        tabs.addTab(self.log_tab,          "  Log  ")
         tabs.currentChanged.connect(self._on_tab_changed)
         main_layout.addWidget(tabs)
 
