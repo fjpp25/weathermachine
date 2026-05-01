@@ -53,6 +53,8 @@ from cities import CITIES as _CITY_REGISTRY
 CONV_THRESHOLD       = 0.97
 NO_MIN_ENTRY         = 0.60
 NO_MAX_ENTRY         = 0.90
+MAX_RANK_FROM_BOTTOM = 2     # only enter the 3 lowest B brackets (ranks 0,1,2)
+                              # prevents entries near the forecast zone in spring
 START_HOUR_CAP       = 15
 LATE_HOUR            = 13
 MAX_ENTRIES_DEFAULT  = 2
@@ -60,9 +62,19 @@ MAX_ENTRIES_EXTENDED = 3
 MAX_ENTRIES_LATE     = 1
 
 CONTRACT_TIERS = [
+    (0.60, 0.70, 2),   # low conviction
+    (0.71, 0.80, 4),   # mid conviction
+    (0.81, 0.90, 6),   # high conviction
+]
+
+# Top-down cascade — more conservative than bottom-up
+# Cold days have higher variance in landing temperature.
+# Backtest: max=0.85, 2/4c -> $14.26 total, 3 bad days, worst -$2.65
+NO_MAX_ENTRY_TOPDOWN   = 0.85
+MAX_RANK_FROM_TOP      = 2     # only enter the 3 highest B brackets
+CONTRACT_TIERS_TOPDOWN = [
     (0.60, 0.70, 2),
-    (0.71, 0.80, 4),
-    (0.81, 0.90, 6),
+    (0.71, 0.85, 4),
 ]
 
 # Afternoon tier parameters (retained)
@@ -80,6 +92,34 @@ _entries_made:        dict[tuple[str, str], int]  = {}
 _trigger_hour:        dict[tuple[str, str], int]  = {}
 _cascade_entered:     set[str]                    = set()
 _afternoon_triggered: dict[tuple[str, str, str], bool] = {}
+
+# Top-down session state
+_td_direction_locked: dict[tuple[str, str], str]  = {}
+_td_entries_made:     dict[tuple[str, str], int]  = {}
+_td_trigger_hour:     dict[tuple[str, str], int]  = {}
+_td_entered:          set[str]                    = set()
+
+# ---------------------------------------------------------------------------
+# LOWT session state — separate namespace from HIGH to avoid cross-market
+# direction locks. LOWT markets have inverted dynamics:
+#   - Bottom-up is primary (low temp already set, temp rises through brackets)
+#   - Top-down is secondary (unexpectedly cold days)
+# Excluded cities for LOWT cascade (poor historical performance):
+#   - Bottom-up: Philadelphia, San Francisco
+#   - Top-down:  Austin, Chicago
+# ---------------------------------------------------------------------------
+_LOWT_BU_EXCLUDED = {"Philadelphia", "San Francisco"}
+_LOWT_TD_EXCLUDED = {"Austin", "Chicago"}
+
+_lowt_bu_entered:   set[str]                   = set()
+_lowt_bu_made:      dict[tuple[str, str], int] = {}
+_lowt_bu_locked:    dict[tuple[str, str], str] = {}
+_lowt_bu_trigger:   dict[tuple[str, str], int] = {}
+
+_lowt_td_entered:   set[str]                   = set()
+_lowt_td_made:      dict[tuple[str, str], int] = {}
+_lowt_td_locked:    dict[tuple[str, str], str] = {}
+_lowt_td_trigger:   dict[tuple[str, str], int] = {}
 
 
 def _market_date(ticker: str) -> str:
@@ -100,8 +140,12 @@ def _local_hour(city: str) -> int:
     return datetime.now(timezone.utc).hour
 
 
-def _is_paused(city: str) -> bool:
-    return not _CITY_REGISTRY.get(city, {}).get("trading", True)
+def _is_paused(city: str, market_type: str = "high") -> bool:
+    """Check if trading is disabled for a city/market-type combination."""
+    meta = _CITY_REGISTRY.get(city, {})
+    if market_type == "lowt":
+        return not meta.get("trading_lowt", meta.get("trading_high", True))
+    return not meta.get("trading_high", meta.get("trading", True))
 
 
 def _no_price(bracket: dict) -> float:
@@ -131,7 +175,30 @@ def _contracts_for(no_price: float) -> int:
     return 2
 
 
+def _contracts_for_topdown(no_price: float) -> int:
+    for lo, hi, contracts in CONTRACT_TIERS_TOPDOWN:
+        if lo <= no_price <= hi:
+            return contracts
+    return 2
+
+
 def _corrected_forecast(city: str, nws_data: dict) -> float | None:
+    """
+    Return the best available forecast high for a city.
+    Priority: AccuWeather > NWS corrected (NWS + bias).
+    AccuWeather is more accurate (MAE 1.22°F vs 2.56°F for NWS).
+    """
+    # Try AccuWeather first
+    try:
+        import accuweather_feed as _aw
+        aw_data = _aw.snapshot(city_filter=city)
+        aw_high = (aw_data.get(city) or {}).get("forecast_high_f")
+        if aw_high is not None:
+            return float(aw_high)
+    except Exception:
+        pass
+
+    # Fall back to NWS corrected forecast
     fcst = nws_data.get("forecast_high_f")
     if fcst is None:
         return None
@@ -143,14 +210,23 @@ def _corrected_forecast(city: str, nws_data: dict) -> float | None:
 
 
 def _forecast_bracket_idx(corrected_fcst: float | None,
-                           b_sorted: list[dict]) -> int | None:
+                           b_sorted: list[dict],
+                           buffer: float = 1.0) -> int | None:
+    """
+    Find the forecast bracket index with a 1°F buffer below the floor.
+    Mirrors the get_forecast_bracket() logic in hight_decision_engine.
+    """
     if corrected_fcst is None:
         return None
     n = len(b_sorted)
     for i, b in enumerate(b_sorted):
         floor = b.get("floor", 0)
         cap   = b.get("cap", 999)
+        # Standard: forecast inside bracket
         if floor <= corrected_fcst <= cap:
+            return i
+        # Buffer: forecast within buffer°F below the floor
+        if (floor - buffer) <= corrected_fcst < floor:
             return i
     return n - 1 if corrected_fcst > (b_sorted[-1].get("cap") or 999) else 0
 
@@ -233,6 +309,20 @@ def _convergence_signals(city: str, brackets: list[dict],
     cf       = _corrected_forecast(city, nws_data)
     fcst_idx = _forecast_bracket_idx(cf, b_brackets)
 
+    # Market forecast bracket: highest Yes price = what the market predicts
+    try:
+        _mkt_fcst_idx = max(range(len(b_brackets)),
+                            key=lambda i: _yes_price(b_brackets[i]))
+    except Exception:
+        _mkt_fcst_idx = None
+
+    from log_setup import get_logger as _gl
+    _log = _gl("cascade_engine")
+    _log.debug("CASCADE BU %s: mkt_fcst_idx=%s yes_prices=%s",
+               city, _mkt_fcst_idx,
+               [(b.get("ticker","").split("-")[-1], _yes_price(b))
+                for b in b_brackets])
+
     signals = []
 
     for i, confirmed_b in enumerate(b_brackets):
@@ -247,6 +337,15 @@ def _convergence_signals(city: str, brackets: list[dict],
         if not ticker or ticker in _cascade_entered:
             continue
         if fcst_idx is not None and i + 1 == fcst_idx:
+            continue
+        # Market distance gate: skip if target is within 1 rank of
+        # the market's own forecast bracket (highest Yes price)
+        if _mkt_fcst_idx is not None and abs((i + 1) - _mkt_fcst_idx) < 2:
+            continue
+
+        # Rank restriction: only enter the N lowest brackets
+        # (i+1 is the rank of the target bracket from the bottom)
+        if i + 1 > MAX_RANK_FROM_BOTTOM:
             continue
 
         no_ask  = _no_price(target)
@@ -376,6 +475,342 @@ def _afternoon_signal(city: str, brackets: list[dict],
 # Per-city evaluator
 # ---------------------------------------------------------------------------
 
+def _topdown_signals(city: str, brackets: list[dict],
+                     nws_data: dict) -> list[dict]:
+    """
+    Top-down directional cascade scanner.
+
+    Mirror of _convergence_signals but scanning from the top down.
+    Fires on cold days when the highest B bracket crosses No >= CONV_THRESHOLD,
+    entering the bracket immediately below it.
+
+    More conservative than bottom-up:
+    - Max entry price: 0.85 (vs 0.90 for bottom-up)
+    - Max contracts: 4 (vs 6 for bottom-up)
+    - Only the 3 highest B brackets eligible (MAX_RANK_FROM_TOP = 2)
+
+    Direction lock: once top-down fires for a city-day, bottom-up is blocked
+    and vice versa (enforced by shared _direction_locked dict).
+    """
+    if not brackets or len(brackets) < 3:
+        return []
+
+    sample_ticker = next((b["ticker"] for b in brackets if b.get("ticker")), "")
+    market_date   = _market_date(sample_ticker)
+    city_key      = (city, market_date)
+    local_hour    = _local_hour(city)
+
+    # Check shared direction lock — don't fire top-down if bottom-up locked
+    locked_dir = _direction_locked.get(city_key)
+    if locked_dir == 'up':
+        return []
+
+    # Top-down specific state
+    td_locked  = _td_direction_locked.get(city_key)
+    td_entries = _td_entries_made.get(city_key, 0)
+    td_trigger = _td_trigger_hour.get(city_key)
+
+    # No new cascade starts at or after START_HOUR_CAP
+    if td_locked is None and local_hour >= START_HOUR_CAP:
+        return []
+
+    # Max entries
+    if td_trigger is not None and td_trigger >= LATE_HOUR:
+        max_e = MAX_ENTRIES_LATE
+    else:
+        max_e = MAX_ENTRIES_DEFAULT
+
+    if td_entries >= max_e:
+        return []
+
+    # Sort B brackets high→low for top-down scanning
+    b_brackets = sorted(
+        [b for b in brackets
+         if b.get("floor") is not None and b.get("cap") is not None],
+        key=lambda b: b["floor"],
+        reverse=True   # high to low
+    )
+    if len(b_brackets) < 2:
+        return []
+
+    cf       = _corrected_forecast(city, nws_data)
+    fcst_idx_asc = _forecast_bracket_idx(cf, list(reversed(b_brackets)))
+    # Convert to descending index
+    n = len(b_brackets)
+
+    # Market forecast bracket (ascending index for comparison)
+    try:
+        _b_asc = list(reversed(b_brackets))
+        _mkt_fcst_idx_td = max(range(len(_b_asc)),
+                               key=lambda i: _yes_price(_b_asc[i]))
+    except Exception:
+        _mkt_fcst_idx_td = None
+
+    signals = []
+
+    for i, confirmed_b in enumerate(b_brackets):
+        if _no_price(confirmed_b) < CONV_THRESHOLD:
+            continue
+        if i >= n - 1:
+            continue   # no bracket below in descending order
+
+        # Rank restriction: only top 3 brackets eligible as triggers
+        if i > MAX_RANK_FROM_TOP:
+            continue
+
+        target = b_brackets[i + 1]   # next bracket downward
+        ticker = target.get("ticker", "")
+
+        if not ticker or ticker in _td_entered:
+            continue
+
+        # Skip forecast bracket
+        target_rank_asc = n - 1 - (i + 1)
+        if fcst_idx_asc is not None and target_rank_asc == fcst_idx_asc:
+            continue
+        # Market distance gate (top-down)
+        if _mkt_fcst_idx_td is not None and abs(target_rank_asc - _mkt_fcst_idx_td) < 2:
+            continue
+
+        no_ask  = _no_price(target)
+        yes_ask = _yes_price(target)
+
+        if not (NO_MIN_ENTRY <= no_ask <= NO_MAX_ENTRY_TOPDOWN):
+            continue
+
+        # Lock direction
+        if td_locked is None:
+            _td_direction_locked[city_key] = 'down'
+            _direction_locked[city_key]    = 'down'  # block bottom-up
+            _td_trigger_hour[city_key]     = local_hour
+            td_trigger = local_hour
+
+        _td_entered.add(ticker)
+        _td_entries_made[city_key] = td_entries + 1
+        td_entries += 1
+
+        contracts    = _contracts_for_topdown(no_ask)
+        trigger_info = (
+            f"top-down: {confirmed_b['ticker'].split('-')[-1]} "
+            f"No={_no_price(confirmed_b):.2f} → "
+            f"{ticker.split('-')[-1]} No={no_ask:.2f} "
+            f"YES={yes_ask:.2f}  {contracts}c"
+        )
+
+        signals.append(_make_signal(target, "cascade_directional_down",
+                                    trigger_info, contracts))
+
+        if td_entries >= max_e:
+            break
+
+    return signals
+
+
+def _lowt_bu_signals(city: str, brackets: list[dict]) -> list[dict]:
+    """
+    LOWT bottom-up cascade scanner.
+
+    For LOWT markets the overnight low is set before dawn. As the day
+    progresses, temperature rises and bottom brackets (coldest lows) confirm
+    No first — a confirmed fact that the low did not land that low.
+
+    Backtest (Apr 6-24, 18 days):
+      143 signals  WR=97.2%  EV=+$0.155/signal  0 bad days
+      Scaled PnL (2/4/6c): +$80.19 over 18 days
+
+    Excluded: Philadelphia, San Francisco (poor WR).
+    """
+    if not brackets or len(brackets) < 3:
+        return []
+    if city in _LOWT_BU_EXCLUDED:
+        return []
+
+    sample_ticker = next((b["ticker"] for b in brackets if b.get("ticker")), "")
+    market_date   = _market_date(sample_ticker)
+    city_key      = (city, market_date)
+    local_hour    = _local_hour(city)
+
+    locked   = _lowt_bu_locked.get(city_key)
+    entries  = _lowt_bu_made.get(city_key, 0)
+    trig_h   = _lowt_bu_trigger.get(city_key)
+
+    if locked is None and local_hour >= START_HOUR_CAP:
+        return []
+
+    max_e = MAX_ENTRIES_LATE if (trig_h is not None and trig_h >= LATE_HOUR)             else MAX_ENTRIES_DEFAULT
+    if entries >= max_e:
+        return []
+
+    # Sort B brackets low→high
+    b_brackets = sorted(
+        [b for b in brackets if b.get("floor") is not None and b.get("cap") is not None],
+        key=lambda b: b["floor"]
+    )
+    if len(b_brackets) < 2:
+        return []
+
+    signals = []
+    for i, confirmed_b in enumerate(b_brackets):
+        if _no_price(confirmed_b) < CONV_THRESHOLD:
+            continue
+        if i >= len(b_brackets) - 1:
+            continue
+        if i + 1 > MAX_RANK_FROM_BOTTOM:
+            continue
+
+        target = b_brackets[i + 1]
+        ticker = target.get("ticker", "")
+        if not ticker or ticker in _lowt_bu_entered:
+            continue
+
+        no_ask  = _no_price(target)
+        yes_ask = _yes_price(target)
+        if not (NO_MIN_ENTRY <= no_ask <= NO_MAX_ENTRY):
+            continue
+
+        if locked is None:
+            _lowt_bu_locked[city_key]   = 'up'
+            _lowt_bu_trigger[city_key]  = local_hour
+            trig_h = local_hour
+
+        _lowt_bu_entered.add(ticker)
+        _lowt_bu_made[city_key] = entries + 1
+        entries += 1
+
+        contracts    = _contracts_for(no_ask)
+        trigger_info = (
+            f"LOWT bottom-up: {confirmed_b['ticker'].split('-')[-1]} "
+            f"No={_no_price(confirmed_b):.2f} → "
+            f"{ticker.split('-')[-1]} No={no_ask:.2f} "
+            f"YES={yes_ask:.2f}  {contracts}c"
+        )
+        signals.append(_make_signal(target, "cascade_lowt_bu", trigger_info, contracts))
+
+        if entries >= max_e:
+            break
+
+    return signals
+
+
+def _lowt_td_signals(city: str, brackets: list[dict]) -> list[dict]:
+    """
+    LOWT top-down cascade scanner.
+
+    Fires on cold nights when the top bracket (warmest low) confirms No first.
+    More conservative than bottom-up — cold nights are harder to predict.
+
+    Backtest (Apr 6-24, 18 days):
+      33 signals  WR=87.9%  EV=+$0.143/signal  3 bad days
+      Scaled PnL (2/4c): +$14.05 over 18 days
+
+    Excluded: Austin, Chicago (poor WR on top-down LOWT).
+    """
+    if not brackets or len(brackets) < 3:
+        return []
+    if city in _LOWT_TD_EXCLUDED:
+        return []
+
+    sample_ticker = next((b["ticker"] for b in brackets if b.get("ticker")), "")
+    market_date   = _market_date(sample_ticker)
+    city_key      = (city, market_date)
+    local_hour    = _local_hour(city)
+
+    locked   = _lowt_td_locked.get(city_key)
+    entries  = _lowt_td_made.get(city_key, 0)
+    trig_h   = _lowt_td_trigger.get(city_key)
+
+    # Block if bottom-up already locked for this city-day
+    if _lowt_bu_locked.get(city_key) == 'up':
+        return []
+    if locked is None and local_hour >= START_HOUR_CAP:
+        return []
+
+    max_e = MAX_ENTRIES_LATE if (trig_h is not None and trig_h >= LATE_HOUR)             else MAX_ENTRIES_DEFAULT
+    if entries >= max_e:
+        return []
+
+    # Sort B brackets high→low for top-down
+    b_brackets = sorted(
+        [b for b in brackets if b.get("floor") is not None and b.get("cap") is not None],
+        key=lambda b: b["floor"],
+        reverse=True
+    )
+    if len(b_brackets) < 2:
+        return []
+    n = len(b_brackets)
+
+    signals = []
+    for i, confirmed_b in enumerate(b_brackets):
+        if _no_price(confirmed_b) < CONV_THRESHOLD:
+            continue
+        if i >= n - 1:
+            continue
+        if i > MAX_RANK_FROM_TOP:
+            continue
+
+        target = b_brackets[i + 1]
+        ticker = target.get("ticker", "")
+        if not ticker or ticker in _lowt_td_entered:
+            continue
+
+        no_ask  = _no_price(target)
+        yes_ask = _yes_price(target)
+        if not (NO_MIN_ENTRY <= no_ask <= NO_MAX_ENTRY_TOPDOWN):
+            continue
+
+        if locked is None:
+            _lowt_td_locked[city_key]  = 'down'
+            _lowt_td_trigger[city_key] = local_hour
+            trig_h = local_hour
+
+        _lowt_td_entered.add(ticker)
+        _lowt_td_made[city_key] = entries + 1
+        entries += 1
+
+        contracts    = _contracts_for_topdown(no_ask)
+        trigger_info = (
+            f"LOWT top-down: {confirmed_b['ticker'].split('-')[-1]} "
+            f"No={_no_price(confirmed_b):.2f} → "
+            f"{ticker.split('-')[-1]} No={no_ask:.2f} "
+            f"YES={yes_ask:.2f}  {contracts}c"
+        )
+        signals.append(_make_signal(target, "cascade_lowt_td", trigger_info, contracts))
+
+        if entries >= max_e:
+            break
+
+    return signals
+
+
+def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
+    """Evaluate LOWT cascade signals for a single city."""
+    result = {
+        "city":         city,
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "signals":      [],
+        "error":        None,
+        "cascade":      True,
+        "market_type":  "lowt",
+    }
+
+    if _is_paused(city, market_type="lowt"):
+        result["error"] = "City paused for LOWT — cascade skipped"
+        return result
+
+    if scan_data.get("error"):
+        result["error"] = f"Kalshi error: {scan_data['error']}"
+        return result
+
+    brackets = scan_data.get("brackets", [])
+    if not brackets:
+        return result
+
+    result["signals"].extend(_lowt_bu_signals(city, brackets))
+    result["signals"].extend(_lowt_td_signals(city, brackets))
+
+    return result
+
+
 def evaluate_city_cascade(city: str, scan_data: dict) -> dict:
     result = {
         "city":         city,
@@ -397,8 +832,11 @@ def evaluate_city_cascade(city: str, scan_data: dict) -> dict:
     nws_data   = scan_data.get("nws_data", {})
     local_hour = _local_hour(city)
 
-    # Convergence scanner — today
+    # Convergence scanner — today (bottom-up)
     result["signals"].extend(_convergence_signals(city, brackets, nws_data))
+
+    # Top-down scanner — today (cold days)
+    result["signals"].extend(_topdown_signals(city, brackets, nws_data))
 
     # Convergence scanner — tomorrow (when today fully converged)
     tomorrow_brackets = scan_data.get("tomorrow_brackets", [])
@@ -419,7 +857,7 @@ def evaluate_city_cascade(city: str, scan_data: dict) -> dict:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def run(kalshi_results: dict, city_filter: str = None) -> list[dict]:
+def run(kalshi_results: dict, city_filter: str = None, nws_results: dict = None) -> list[dict]:
     evaluations = []
     for city, scan_data in kalshi_results.items():
         if city_filter and city.lower() != city_filter.lower():
@@ -431,6 +869,16 @@ def run(kalshi_results: dict, city_filter: str = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Display
 # ---------------------------------------------------------------------------
+
+def run_lowt(kalshi_lowt_results: dict, city_filter: str = None) -> list[dict]:
+    """Run LOWT cascade evaluation for all cities."""
+    evaluations = []
+    for city, scan_data in kalshi_lowt_results.items():
+        if city_filter and city.lower() != city_filter.lower():
+            continue
+        evaluations.append(evaluate_city_cascade_lowt(city, scan_data))
+    return evaluations
+
 
 def display(evaluations: list[dict]):
     cascade_evals = [e for e in evaluations if e.get("cascade")]
@@ -457,9 +905,12 @@ def display(evaluations: list[dict]):
             )
             tier = s.get("entry_tier", "")
             tier_label = (
-                "DIRECTIONAL-UP" if "directional_up" in tier else
-                "TOMORROW"       if "tomorrow"       in tier else
-                "AFTERNOON"      if "afternoon"      in tier else
+                "DIRECT-UP"   if "directional_up"   in tier else
+                "DIRECT-DOWN" if "directional_down"  in tier else
+                "LOWT-UP"     if "lowt_bu"           in tier else
+                "LOWT-DOWN"   if "lowt_td"           in tier else
+                "TOMORROW"    if "tomorrow"           in tier else
+                "AFTERNOON"   if "afternoon"          in tier else
                 tier.upper()
             )
             print(

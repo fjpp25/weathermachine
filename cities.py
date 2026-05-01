@@ -16,7 +16,9 @@ Each entry contains:
   station_id        — NOAA NCEI station ID for climate normals (city_profiles.py)
   high_series       — Kalshi series ticker for daily HIGH temperature market
   lowt_series       — Kalshi series ticker for daily LOW temperature market
-  trading           — True = actively trading HIGH markets right now
+  trading_high      — True = actively trading HIGH temperature markets
+  trading_lowt      — True = actively trading LOWT temperature markets
+                      (independent of trading_high — cities can trade one or both)
   observe           — True = passively observing (lowt_observer / paper mode)
   trade_start_high  — Earliest local hour for HIGH market NO entries (None = global default)
                       Based on entry_window_analysis.py — update as data accumulates.
@@ -55,7 +57,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00094728",
         "high_series":      "KXHIGHNY",
         "lowt_series":      "KXLOWTNYC",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@14:00, fcst unstable overnight
         "trade_end_high":    17,          # conv@15:00 median, no edge after
@@ -72,7 +75,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00014819",
         "high_series":      "KXHIGHCHI",
         "lowt_series":      "KXLOWTCHI",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 3 days: sharp fcst revision at 07:00–08:00 local
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -89,7 +93,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012839",
         "high_series":      "KXHIGHMIA",
         "lowt_series":      "KXLOWTMIA",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@13:00, no forecast instability
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -106,7 +111,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013904",
         "high_series":      "KXHIGHAUS",
         "lowt_series":      "KXLOWTAUS",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@17:00, overnight instability clears by 09:00
         "trade_end_high":    19,          # conv@17:00 median, no edge after
@@ -123,7 +129,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023174",
         "high_series":      "KXHIGHLAX",
         "lowt_series":      "KXLOWTLAX",
-        "trading":          True,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
+        "trading_high":  True ,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 4 days: conv@12:00, best signal quality in dataset
         "trade_end_high":    15,          # conv@13:00 median, no edge after
@@ -141,7 +148,8 @@ CITIES: dict[str, dict] = {
         # NOTE: Kalshi uses both KXHIGHTSFO and KXHIGHSFO — scanner handles both
         "high_series":      "KXHIGHTSFO",
         "lowt_series":      "KXLOWTSFO",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  False,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: non-convergence risk (marine layer), provisional
         "trade_end_high":    20,          # conv@18:00 median, no edge after
@@ -158,7 +166,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00003017",
         "high_series":      "KXHIGHDEN",
         "lowt_series":      "KXLOWTDEN",
-        "trading":          True,
+        "trading_high":  True ,
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@16:00, no significant instability
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -175,7 +184,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013739",
         "high_series":      "KXHIGHPHIL",
         "lowt_series":      "KXLOWTPHIL",
-        "trading":          True,        # RE-ENABLED: 100% conv rate, 4 days obs
+        "trading_high":  True ,        # RE-ENABLED: 100% conv rate, 4 days obs
+        "trading_lowt":  False,
         "observe":          True,
         "trade_start_high": 9,           # 4 days: conv@16:30, same pattern as New York
         "trade_end_high":    19,          # conv@17:00 median, no edge after
@@ -197,7 +207,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013874",
         "high_series":      "KXHIGHTATL",
         "lowt_series":      "KXLOWTATL",
-        "trading":          True,        # ENABLED: 100% conv, 2 days obs
+        "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 2 days: conv@17:00, stable NO from ~08:00
         "trade_end_high":    19,          # conv@17:00 median, no edge after
@@ -214,7 +225,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00014739",
         "high_series":      "KXHIGHTBOS",
         "lowt_series":      "KXLOWTBOS",
-        "trading":          True,        # ENABLED: 100% conv, 2 days obs
+        "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 2 days: conv@16:00, stable NO from ~08:00
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -231,7 +243,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013743",
         "high_series":      "KXHIGHTDC",
         "lowt_series":      "KXLOWTDC",
-        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -248,7 +261,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012918",
         "high_series":      "KXHIGHTHOU",
         "lowt_series":      "KXLOWTHOU",
-        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -265,7 +279,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023183",
         "high_series":      "KXHIGHTPHX",
         "lowt_series":      "KXLOWTPHX",
-        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: conv@14:00, non-conv risk
         "trade_end_high":    17,          # conv@15:00 median, no edge after
@@ -282,7 +297,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023169",
         "high_series":      "KXHIGHTLV",
         "lowt_series":      "KXLOWTLV",
-        "trading":          False,       # PAUSED: 0% convergence over 2 days
+        "trading_high":  True ,       # PAUSED: 0% convergence over 2 days
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": None,        # non-converging — keep paused
         "trade_end_high":    None,        # paused — no close needed
@@ -299,7 +315,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00003927",
         "high_series":      "KXHIGHTDAL",
         "lowt_series":      "KXLOWTDAL",
-        "trading":          True,        # ENABLED: 100% conv, 2 days obs
+        "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 2 days: conv@15:30, tight spreads
         "trade_end_high":    18,          # conv@16:00 median, no edge after
@@ -316,7 +333,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012921",
         "high_series":      "KXHIGHTSATX",
         "lowt_series":      "KXLOWTSATX",
-        "trading":          False,       # PAUSED: 50% conv, wider spreads
+        "trading_high":  False,       # PAUSED: 50% conv, wider spreads
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": None,        # insufficient data
         "trade_end_high":    None,        # paused — no close needed
@@ -333,7 +351,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00024233",
         "high_series":      "KXHIGHTSEA",
         "lowt_series":      "KXLOWTSEA",
-        "trading":          False,       # PAUSED: 0% convergence over 2 days
+        "trading_high":  True ,       # PAUSED: 0% convergence over 2 days
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": None,        # non-converging
         "trade_end_high":    None,        # paused — no close needed
@@ -350,7 +369,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012916",
         "high_series":      "KXHIGHTNOLA",
         "lowt_series":      "KXLOWTNOLA",
-        "trading":          True,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: conv@14:00, later start for safety
         "trade_end_high":    17,          # conv@15:00 median, no edge after
@@ -367,7 +387,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00014922",
         "high_series":      "KXHIGHTMIN",
         "lowt_series":      "KXLOWTMIN",
-        "trading":          True,        # ENABLED: 100% conv, 2 days obs
+        "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 2 days: conv@14:00, strong early NO quality
         "trade_end_high":    17,          # conv@15:00 median, no edge after
@@ -384,7 +405,8 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013967",
         "high_series":      "KXHIGHTOKC",
         "lowt_series":      "KXLOWTOKC",
-        "trading":          True,        # ENABLED: 100% conv, 3 days obs
+        "trading_high":  True ,        # ENABLED: 100% conv, 3 days obs
+        "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@17:00, 80% pct_80 at peak
         "trade_end_high":    19,          # conv@17:00 median, no edge after
@@ -398,9 +420,14 @@ CITIES: dict[str, dict] = {
 # Convenience views — import these instead of filtering manually
 # ---------------------------------------------------------------------------
 
-# Cities with active HIGH trading (trading=True)
+# Cities with active HIGH trading
 TRADING_CITIES: dict[str, dict] = {
-    k: v for k, v in CITIES.items() if v.get("trading")
+    k: v for k, v in CITIES.items() if v.get("trading_high")
+}
+
+# Cities with active LOWT trading
+TRADING_LOWT_CITIES: dict[str, dict] = {
+    k: v for k, v in CITIES.items() if v.get("trading_lowt")
 }
 
 # Cities being passively observed (observe=True) — superset of TRADING_CITIES
@@ -444,30 +471,31 @@ SERIES_TO_CITY: dict[str, str] = build_series_map()
 # ---------------------------------------------------------------------------
 
 CITIES_WEST_TO_EAST: list[str] = [
-    # UTC-8  Pacific
-    "Los Angeles",
-    "San Francisco",
-    "Las Vegas",
+    # col 0 — Pacific coast (N→S)
     "Seattle",
-    # UTC-7  Mountain
-    "Phoenix",
+    "Las Vegas",
+    "San Francisco",
+    "Los Angeles",
+    # col 1 — Mountain / South-Central
     "Denver",
-    # UTC-6  Central
-    "San Antonio",
-    "Austin",
-    "Dallas",
-    "Houston",
     "New Orleans",
     "Oklahoma City",
+    "Phoenix",
+    # col 2 — Texas
+    "Dallas",
+    "Austin",
+    "Houston",
+    "San Antonio",
+    # col 3 — Midwest / Southeast
     "Minneapolis",
     "Chicago",
-    # UTC-5  Eastern
-    "Miami",
     "Atlanta",
-    "Washington DC",
+    "Miami",
+    # col 4 — Northeast (N→S)
+    "Boston",
     "Philadelphia",
     "New York",
-    "Boston",
+    "Washington DC",
 ]
 
 
@@ -479,8 +507,8 @@ if __name__ == "__main__":
         start = str(m.get("trade_start_high")) if m.get("trade_start_high") is not None else "—"
         print(
             f"{city:<16} {m['icao']:<6} {m['tz']:<28} {m['lst_offset']:>4} "
-            f"{'YES' if m.get('trading') else 'no':>8}  "
+            f"{'YES' if m.get('trading_high') else 'no':>8}  "
             f"{start:>9}  "
             f"{m.get('high_series','—'):<14} {m.get('lowt_series','—')}"
         )
-    print(f"\n{len(TRADING_CITIES)} trading  |  {len(OBSERVE_CITIES)} observing  |  {len(CITIES)} total")
+    print(f"\n{len(TRADING_CITIES)} trading HIGH  |  {len(TRADING_LOWT_CITIES)} trading LOWT  |  {len(OBSERVE_CITIES)} observing  |  {len(CITIES)} total")

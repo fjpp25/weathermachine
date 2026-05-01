@@ -50,6 +50,12 @@ NO_TRIGGER            = 0.80   # T bracket No price that fires the signal
 NO_CONVERGE_THRESHOLD = 0.60   # opposing T must be BELOW this to confirm signal
 SETTLED_THRESHOLD     = 0.97   # max(yes, no) >= this → bracket is settled
 
+# Order sizing for tomorrow scanner signals.
+# Backtest: 100% WR on T bracket (n=56), 96.3% WR on adjacent B bracket.
+# Both brackets are entered on each signal.
+TOMORROW_CONTRACTS    = 3      # contracts per bracket (T and adj-B each get this)
+NO_MAX_ENTRY          = 0.92   # don't enter if No has already moved past this
+
 # ---------------------------------------------------------------------------
 # Per-city state
 # ---------------------------------------------------------------------------
@@ -339,13 +345,77 @@ def on_signal(
     paper:     bool = False,
 ) -> None:
     """
-    Called when the signal fires. Currently logs only.
-    Swap in trader.place_order() calls when ready to go live.
-    """
-    tag = "[PAPER] " if paper else ""
-    print(f"    → {tag}Would buy No on {trigger_t['ticker']} @ {trigger_t['no_price']:.2f}")
-    print(f"    → {tag}Would buy No on {adj_b['ticker']} @ {adj_b['no_price']:.2f}")
+    Called when the signal fires. Places No orders on:
+      - The trigger T bracket (strong directional confirmation)
+      - The adjacent B bracket (complementary range bet)
 
-    # TODO: wire in order execution, e.g.:
-    # trader.place_order(client, ticker=trigger_t["ticker"], side="no", ...)
-    # trader.place_order(client, ticker=adj_b["ticker"],     side="no", ...)
+    Capital is drawn from TOMORROW_RESERVE in trader.py. Positions are
+    held overnight and managed by check_exits() on their settlement date.
+    The date guard in check_exits() ensures today's NWS data does not
+    incorrectly trigger an exit on a future-dated position.
+    """
+    import trader as _trader
+    from log_setup import get_logger
+    _log = get_logger("tomorrow_scanner")
+
+    tag = "[PAPER] " if paper else ""
+
+    for bracket_dict, label in [(trigger_t, "T-trigger"), (adj_b, "adj-B")]:
+        ticker   = bracket_dict["ticker"]
+        no_price = bracket_dict.get("no_price", 0.0) or 0.0
+
+        if no_price <= 0.0 or no_price > NO_MAX_ENTRY:
+            _log.info("TOMORROW skip %s %s — No price %.2f out of range",
+                      city, ticker, no_price)
+            continue
+
+        # Capital check against tomorrow allocation
+        cost = round(no_price * TOMORROW_CONTRACTS, 4)
+        try:
+            from trader import EngineCapital as _EC, get_balance as _gb
+            _cap = _EC(balance=_gb(client))
+            if not _cap.can_deploy("tomorrow", cost):
+                _log.debug("TOMORROW skip %s %s — tomorrow budget exhausted", city, ticker)
+                continue
+        except Exception as e:
+            _log.warning("TOMORROW capital check failed: %s — skipping %s", e, ticker)
+            continue
+
+        _log.info("%sTOMORROW ENTRY  %s  %s  No=%.2f  %dc",
+                  tag, city, ticker, no_price, TOMORROW_CONTRACTS)
+
+        if not paper:
+            try:
+                _trader.place_order(
+                    client        = client,
+                    ticker        = ticker,
+                    side          = "no",
+                    price_dollars = no_price,
+                    contracts     = TOMORROW_CONTRACTS,
+                    paper         = False,
+                )
+                _trader._append_trade_log({
+                    "ticker":       ticker,
+                    "city":         city,
+                    "side":         "no",
+                    "market_type":  "high",
+                    "score":        5,
+                    "score_detail": ["tomorrow_scanner_T" if "T" in label else "tomorrow_scanner_B"],
+                    "entry_price":  no_price,
+                    "contracts":    TOMORROW_CONTRACTS,
+                    "placed_at":    __import__("datetime").datetime.now(
+                                        __import__("datetime").timezone.utc).isoformat(),
+                    "paper":        False,
+                    "entry_tier":   "tomorrow",
+                })
+            except Exception as e:
+                _log.error("TOMORROW order failed %s: %s", ticker, e)
+            else:
+                try:
+                    from trader import get_engine_capital as _gec
+                    _gec().record("tomorrow", cost)
+                except Exception:
+                    pass
+        else:
+            _log.info("  [PAPER] would place No %dc @ $%.2f on %s",
+                      TOMORROW_CONTRACTS, no_price, ticker)

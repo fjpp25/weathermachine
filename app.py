@@ -85,7 +85,7 @@ CONFIG_FILE = DATA_DIR / "config.json"
 def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
     """
     Convert raw bracket code to a readable label.
-    B50.5 → '50–52°'  (between, next bracket inferred from Kalshi 2° spacing)
+    B78.5 → '78–79°'  (the .5 is the midpoint; range is floor(x) to floor(x)+1)
     T55   → '>55°'    (above threshold for HIGH)
     T31   → '<31°'    (below threshold for LOWT)
     """
@@ -93,9 +93,10 @@ def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
         return bracket
     try:
         if bracket.startswith("B"):
-            floor = float(bracket[1:])
-            cap   = round(floor + 2, 1)
-            return f"{floor:.0f}–{cap:.0f}°"
+            mid   = float(bracket[1:])   # e.g. 78.5
+            lower = int(mid)             # 78
+            upper = lower + 1            # 79
+            return f"{lower}–{upper}°"
         elif bracket.startswith("T"):
             val = float(bracket[1:])
             if market_type == "LOW":
@@ -119,6 +120,64 @@ def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
         mtype = "HIGH" if "HIGH" in prefix else "LOW"
         return f"{city} ({mtype})"
     return None
+
+
+def _bracket_from_ticker(ticker: str) -> str:
+    """Extract and format the bracket label from a Kalshi temperature ticker.
+    e.g. 'HIGHNY-24APR25-B67' → '67–69°',  'HIGHNY-24APR25-T72' → '>72°'
+    """
+    parts = ticker.split("-")
+    if len(parts) >= 3:
+        raw = parts[-1]          # e.g. "T69", "B67"
+        prefix = parts[0]        # e.g. "HIGHNY", "LOWTCHI"
+        market_type = "LOW" if "LOWT" in prefix.upper() else "HIGH"
+        label = _fmt_bracket(raw, market_type)
+        return label if label else "—"
+    return "—"
+
+
+# ---------------------------------------------------------------------------
+# Trade log cache — read once per update, used by Home + Session engine labels
+# ---------------------------------------------------------------------------
+
+_tlog_cache:     list  = []
+_tlog_mtime:     float = 0.0
+
+def _load_trade_log() -> list:
+    """Load data/trade_log.json, using mtime to avoid re-reading on every call."""
+    global _tlog_cache, _tlog_mtime
+    try:
+        p = Path("data/trade_log.json")
+        if p.exists():
+            mtime = p.stat().st_mtime
+            if mtime != _tlog_mtime:
+                _tlog_cache  = json.loads(p.read_text())
+                _tlog_mtime  = mtime
+    except Exception:
+        pass
+    return _tlog_cache
+
+
+def _engine_from_ticker(ticker: str) -> str:
+    """Return 'CASCADE' or 'MAIN' for a ticker based on trade_log entry_tier."""
+    for entry in reversed(_load_trade_log()):
+        if entry.get("ticker") == ticker:
+            tier = (entry.get("entry_tier", "") or "").lower()
+            return "CASCADE" if "cascade" in tier else "MAIN"
+    return "MAIN"
+
+
+def _entry_tier_from_ticker(ticker: str) -> str:
+    """
+    Return the raw entry_tier string for a ticker from the trade log.
+    Empty string means main engine (the only engine that uses the 0–5 score rubric).
+    Any non-empty value means a non-main path (cascade, topup, post_exit_scan, etc.)
+    whose score field is always 0 and should be displayed as '—'.
+    """
+    for entry in reversed(_load_trade_log()):
+        if entry.get("ticker") == ticker:
+            return (entry.get("entry_tier", "") or "")
+    return ""
 
 
 BG_DARK     = "#0d0f14"
@@ -575,8 +634,6 @@ class SchedulerWorker(QObject):
                     h = datetime.now(ZoneInfo(tz)).hour
                     if 11 <= h < 16:
                         min_secs = min(min_secs, 3 * 60)
-                    elif h in (9, 10, 13, 14):
-                        min_secs = min(min_secs, 5 * 60)
                 return min_secs
 
             poll_count = 0
@@ -611,12 +668,35 @@ class SchedulerWorker(QObject):
                     evaluations = trader.run_pipeline(client=client, paper=self.paper)
                     # Reset scores each poll so stale entries never mask missing scores
                     self._last_scores = {}
+                    ts_sig = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                     for ev in (evaluations or []):
+                        city_name = ev.get("city", "?")
+                        is_cascade = ev.get("cascade", False)
                         for sig in ev.get("signals", []):
                             t = sig.get("ticker")
                             s = sig.get("score")
                             if t and s is not None:
                                 self._last_scores[t] = s
+                            # Log every signal — acted on or skipped
+                            trade_type  = sig.get("trade_type")
+                            skip_reason = sig.get("skip_reason")
+                            bracket     = (t or "").split("-")[-1] if t else "?"
+                            entry_price = sig.get("entry_price") or sig.get("no_ask")
+                            tier        = sig.get("entry_tier", "CASCADE" if is_cascade else "MAIN")
+                            if trade_type:
+                                is_cascade_sig = "cascade" in (sig.get("entry_tier","") or "").lower()
+                                score_part = f"tier={tier}" if is_cascade_sig else f"score={s}/5"
+                                self.log_line.emit(
+                                    f"[{ts_sig}] SIGNAL  {city_name}  {bracket}  "
+                                    f"NO  ${entry_price:.2f}  "
+                                    f"{score_part}"
+                                )
+                            else:
+                                reason = skip_reason or "no skip reason"
+                                self.log_line.emit(
+                                    f"[{ts_sig}] SKIP    {city_name}  {bracket}  "
+                                    f"{reason}"
+                                )
                     self.positions_updated.emit()
                 except Exception as e:
                     self.log_line.emit(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] ERROR  Pipeline error: {e}")
@@ -1046,7 +1126,10 @@ class CityDetailDialog(QDialog):
                 mtype   = "HIGH" if "HIGH" in ticker else "LOW"
 
                 avg_entry = round(cost / contracts, 4) if contracts else 0.0
-                early_exits = early_exits or {}
+                # Early exit detection is not available in the city detail view
+                # (the full detection logic lives in PnLTab._populate).
+                # Positions here are classified WIN/LOSS from settlement only.
+                early_exits = {}
                 is_exit = ticker in early_exits
                 enriched.append({
                     "ticker":     ticker,
@@ -1215,15 +1298,15 @@ class HomeTab(QWidget):
         pos_layout.addWidget(pos_hdr)
 
         self.pos_table = QTableWidget()
-        self.pos_table.setColumnCount(8)
+        self.pos_table.setColumnCount(10)
         self.pos_table.setHorizontalHeaderLabels(
-            ["Market", "Side", "Qty", "Avg Cost", "Current", "Unreal. PnL", "Opened", "Status"]
+            ["Market", "Bracket", "Engine", "Side", "Qty", "Entry", "Current", "Unreal. PnL", "Opened", "Status"]
         )
         hdr = self.pos_table.horizontalHeader()
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         hdr.setMinimumSectionSize(1)
-        # Market, Side, Qty, Avg Cost, Current, Unreal PnL, Opened, Status
-        for col, pct in enumerate([26, 7, 5, 10, 10, 12, 14, 7]):
+        # Market wide, Bracket, Engine, Side, Qty narrow, Entry narrow, Current, Unreal PnL, Opened, Status
+        for col, pct in enumerate([28, 10, 9, 6, 4, 7, 8, 11, 12, 5]):
             hdr.resizeSection(col, pct)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1452,6 +1535,9 @@ class HomeTab(QWidget):
 
             # Derive city name from ticker prefix
             city_display = _city_from_ticker(ticker) or ticker
+            bracket      = _bracket_from_ticker(ticker)
+            engine       = _engine_from_ticker(ticker)
+            eng_color    = "#378ADD" if engine == "CASCADE" else ACCENT
 
             pnl_color    = ACCENT if unreal >= 0 else RED
             sign         = "+" if unreal >= 0 else ""
@@ -1459,14 +1545,16 @@ class HomeTab(QWidget):
             status_color = ACCENT if is_live else YELLOW
 
             items = [
-                (city_display,          TEXT_PRI),
-                (side,                  ACCENT if side == "NO" else YELLOW),
-                (str(qty),              TEXT_PRI),
-                (f"${avg_cost:.2f}",    TEXT_PRI),
-                (f"${current:.2f}",     TEXT_PRI),
+                (city_display,           TEXT_PRI),
+                (bracket,                TEXT_SEC),
+                (engine,                 eng_color),
+                (side,                   ACCENT if side == "NO" else YELLOW),
+                (str(qty),               TEXT_PRI),
+                (f"${avg_cost:.2f}",     TEXT_PRI),
+                (f"${current:.2f}",      TEXT_PRI),
                 (f"{sign}${unreal:.2f}", pnl_color),
-                (updated,               TEXT_SEC),
-                (status_str,            status_color),
+                (updated,                TEXT_SEC),
+                (status_str,             status_color),
             ]
 
             for col, (val, color) in enumerate(items):
@@ -1598,8 +1686,8 @@ class DayDetailDialog(QDialog):
     def __init__(self, date: str, trades: list, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Trades  —  {date}")
-        self.setMinimumWidth(680)
-        self.setMinimumHeight(360)
+        self.setMinimumWidth(920)
+        self.setMinimumHeight(580)
         self.setStyleSheet(f"""
             QDialog   {{ background: {BG_DARK}; color: {TEXT_PRI}; }}
             QLabel    {{ color: {TEXT_PRI}; }}
@@ -1840,6 +1928,24 @@ class PnLTab(QWidget):
 
     def _make_table(self) -> QTableWidget:
         t = QTableWidget()
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        t.setStyleSheet(f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}")
+        return t
+
+    def _make_table(self) -> "QTableWidget":
+        """Create a styled position table."""
+        t = QTableWidget()
+        t.setColumnCount(9)
+        t.setHorizontalHeaderLabels(
+            ["Time", "Market", "Engine", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
+        )
+        th = t.horizontalHeader()
+        th.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        th.setMinimumSectionSize(1)
+        for col, pct in enumerate([14, 20, 9, 7, 5, 9, 7, 11, 8]):
+            th.resizeSection(col, pct)
         t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         t.setAlternatingRowColors(True)
@@ -2381,7 +2487,7 @@ class SessionTab(QWidget):
         # ── Summary bar ───────────────────────────────────────────────────
         summary_row = QHBoxLayout()
         self.stat_labels = {}
-        for key in ["Entries", "Open", "Stopped Out", "Avg Score", "Unrealised"]:
+        for key in ["Open", "Settled Today", "High", "Low", "Unrealised"]:
             frame = QFrame()
             frame.setStyleSheet(f"""
                 QFrame {{
@@ -2402,25 +2508,57 @@ class SessionTab(QWidget):
             summary_row.addWidget(frame)
         layout.addLayout(summary_row)
 
-        # ── Table ─────────────────────────────────────────────────────────
-        self.table = QTableWidget()
-        self.table.setColumnCount(8)
-        self.table.setHorizontalHeaderLabels(
-            ["Time", "Market", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
+        # ── Inner tabs: All / High / Low ─────────────────────────────────
+        self._inner_tabs = QTabWidget()
+        self._inner_tabs.setStyleSheet(f"""
+            QTabWidget::pane {{
+                border: 1px solid {BORDER};
+                border-radius: 4px;
+                background: {BG_DARK};
+            }}
+            QTabBar::tab {{
+                background: {BG_PANEL};
+                color: {TEXT_SEC};
+                border: 1px solid {BORDER};
+                padding: 5px 18px;
+                margin-right: 2px;
+                border-radius: 3px 3px 0 0;
+            }}
+            QTabBar::tab:selected {{
+                background: {BG_DARK};
+                color: {ACCENT};
+                border-bottom: 2px solid {ACCENT};
+            }}
+        """)
+        self.table_all  = self._make_table()
+        self.table_high = self._make_table()
+        self.table_low  = self._make_table()
+        self._inner_tabs.addTab(self.table_all,  "All")
+        self._inner_tabs.addTab(self.table_high, "High")
+        self._inner_tabs.addTab(self.table_low,  "Low")
+        layout.addWidget(self._inner_tabs, stretch=1)
+
+        # Keep self.table pointing to table_all for backward compat
+        self.table = self.table_all
+
+    def _make_table(self) -> "QTableWidget":
+        """Create a styled position table."""
+        t = QTableWidget()
+        t.setColumnCount(10)
+        t.setHorizontalHeaderLabels(
+            ["Time", "Market", "Bracket", "Engine", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
         )
-        th = self.table.horizontalHeader()
+        th = t.horizontalHeader()
         th.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         th.setMinimumSectionSize(1)
-        # Time, Market, Side, Qty, Entry, Score, Unreal. PnL, Status
-        for col, pct in enumerate([16, 22, 7, 5, 9, 8, 12, 8]):
+        # Time, Market wide, Bracket, Engine, Side, Qty narrow, Entry narrow, Score, Unreal PnL, Status
+        for col, pct in enumerate([12, 24, 10, 9, 6, 4, 6, 7, 10, 8]):
             th.resizeSection(col, pct)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet(
-            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
-        )
-        layout.addWidget(self.table, stretch=1)
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        t.setStyleSheet(f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}")
+        return t
 
     def set_client(self, client):
         """Store Kalshi client — enables the Refresh button and loads existing positions."""
@@ -2565,82 +2703,107 @@ class SessionTab(QWidget):
         self._entries.clear()
         self._rebuild()
 
-    def _rebuild(self):
-        entries = list(reversed(self._entries))  # newest first
-        self.table.setRowCount(len(entries))
-
-        open_count    = sum(1 for e in entries if e["status"] == "Open")
-        stopped_count = sum(1 for e in entries if e["status"] == "Stopped Out")
-        scores        = [e.get("score", 0) for e in entries if isinstance(e.get("score"), (int, float))]
-        avg_score     = f"{sum(scores)/len(scores):.1f}/5" if scores else "—"
-
-        self.stat_labels["Entries"].setText(str(len(entries)))
-        self.stat_labels["Open"].setText(str(open_count))
-        self.stat_labels["Open"].setStyleSheet(f"color: {ACCENT}; font-size: 18px; font-weight: bold;")
-        self.stat_labels["Stopped Out"].setText(str(stopped_count))
-        self.stat_labels["Stopped Out"].setStyleSheet(
-            f"color: {RED if stopped_count else TEXT_PRI}; font-size: 18px; font-weight: bold;"
-        )
-        self.stat_labels["Avg Score"].setText(avg_score)
-
-        total_unreal = sum(e.get("unrealised_pnl", 0) or 0
-                         for e in entries if e.get("status") == "Open")
-        unreal_sign  = "+" if total_unreal >= 0 else ""
-        unreal_color = ACCENT if total_unreal > 0 else (RED if total_unreal < 0 else TEXT_SEC)
-        unreal_lbl   = self.stat_labels.get("Unrealised")
-        if unreal_lbl:
-            unreal_lbl.setText(f"{unreal_sign}${total_unreal:.2f}")
-            unreal_lbl.setStyleSheet(
-                f"color: {unreal_color}; font-size: 18px; font-weight: bold;"
-            )
-
-        self.count_label.setText(
-            f"{len(entries)} entr{'y' if len(entries)==1 else 'ies'} this session"
-        )
-
+    def _populate_table(self, table: "QTableWidget", entries: list) -> None:
+        """Populate a single table widget with the given entries."""
+        table.setRowCount(len(entries))
         for row, e in enumerate(entries):
             status   = e.get("status", "Open")
             side     = e.get("side", "").upper()
             score    = e.get("score", "?")
             avg_cost = e.get("avg_cost", 0)
-
+            ticker   = e.get("ticker", "")
+            entry_tier = _entry_tier_from_ticker(ticker)
+            engine_str = "CASCADE" if "cascade" in entry_tier.lower() else (
+                entry_tier.upper() if entry_tier else "MAIN"
+            )
+            eng_color  = "#378ADD" if "cascade" in entry_tier.lower() else (
+                TEXT_SEC if entry_tier else ACCENT
+            )
+            score_str  = f"{score}/5" if not entry_tier else "—"
             if status == "Open":
                 status_color = ACCENT
             elif status in ("Stopped Out", "Lost"):
                 status_color = RED
             elif status in ("Take Profit", "Won"):
                 status_color = ACCENT
-            else:  # Settled
+            else:
                 status_color = TEXT_SEC
-
-            unreal     = e.get("unrealised_pnl", 0) or 0
+            unreal       = e.get("unrealised_pnl", 0) or 0
             unreal_sign  = "+" if unreal >= 0 else ""
             unreal_color = ACCENT if unreal > 0 else (RED if unreal < 0 else TEXT_SEC)
             unreal_str   = f"{unreal_sign}${unreal:.2f}" if status == "Open" else "—"
-
             entered_at = e.get("entered_at", "—")
             exited_at  = e.get("exited_at")
-            if exited_at and status not in ("Open",):
-                time_str = f"{entered_at} → {exited_at}"
-            else:
-                time_str = entered_at
-
+            time_str   = (f"{entered_at} → {exited_at}"
+                          if exited_at and status not in ("Open",) else entered_at)
             vals = [
-                (time_str,                                          TEXT_SEC),
-                (_city_from_ticker(e.get("ticker","")) or e.get("ticker",""), TEXT_PRI),
+                (time_str,                                                    TEXT_SEC),
+                (_city_from_ticker(ticker) or ticker,                         TEXT_PRI),
+                (_bracket_from_ticker(ticker),                                TEXT_SEC),
+                (engine_str,                                                  eng_color),
                 (side,                        ACCENT if side == "NO" else YELLOW),
                 (str(e.get("contracts", 1)), TEXT_PRI),
                 (f"${avg_cost:.2f}",          TEXT_PRI),
-                (f"{score}/5",                TEXT_PRI),
+                (score_str,                   TEXT_PRI),
                 (unreal_str,                  unreal_color),
                 (status,                      status_color),
             ]
-
             for col, (val, color) in enumerate(vals):
                 item = QTableWidgetItem(val)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setForeground(QColor(color))
-                self.table.setItem(row, col, item)
+                table.setItem(row, col, item)
+
+    def _rebuild(self):
+        all_entries = list(reversed(self._entries))  # newest first
+
+        # Live positions view — tables show only open positions
+        entries      = [e for e in all_entries if e.get("status") == "Open"]
+        entries_high = [e for e in entries if "HIGH" in e.get("ticker","").upper()
+                        and "LOWT" not in e.get("ticker","").upper()]
+        entries_low  = [e for e in entries if "LOWT" in e.get("ticker","").upper()]
+
+        # Stat cards
+        open_count    = len(entries)
+        settled_count = sum(1 for e in all_entries if e.get("status") != "Open")
+        high_count    = len(entries_high)
+        low_count     = len(entries_low)
+
+        self.stat_labels["Open"].setText(str(open_count))
+        self.stat_labels["Open"].setStyleSheet(
+            f"color: {ACCENT}; font-size: 18px; font-weight: bold;")
+        self.stat_labels["Settled Today"].setText(str(settled_count))
+        self.stat_labels["Settled Today"].setStyleSheet(
+            f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+        self.stat_labels["High"].setText(str(high_count))
+        self.stat_labels["High"].setStyleSheet(
+            f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+        self.stat_labels["Low"].setText(str(low_count))
+        self.stat_labels["Low"].setStyleSheet(
+            f"color: {TEXT_PRI}; font-size: 18px; font-weight: bold;")
+
+        total_unreal = sum(e.get("unrealised_pnl", 0) or 0 for e in entries)
+        unreal_sign  = "+" if total_unreal >= 0 else ""
+        unreal_color = ACCENT if total_unreal > 0 else (RED if total_unreal < 0 else TEXT_SEC)
+        unreal_lbl   = self.stat_labels.get("Unrealised")
+        if unreal_lbl:
+            unreal_lbl.setText(f"{unreal_sign}${total_unreal:.2f}")
+            unreal_lbl.setStyleSheet(
+                f"color: {unreal_color}; font-size: 18px; font-weight: bold;")
+
+        self.count_label.setText(
+            f"{open_count} open  |  {settled_count} settled this session"
+        )
+
+        # Populate tables with open positions only
+        self._populate_table(self.table_all,  entries)
+        self._populate_table(self.table_high, entries_high)
+        self._populate_table(self.table_low,  entries_low)
+
+        # Update inner tab labels with open counts
+        self._inner_tabs.setTabText(0, f"All ({open_count})")
+        self._inner_tabs.setTabText(1, f"High ({high_count})")
+        self._inner_tabs.setTabText(2, f"Low ({low_count})")
 
 
 # ---------------------------------------------------------------------------
@@ -2713,12 +2876,7 @@ class CityHistoryTab(QWidget):
       - Full position history table (main engine vs cascade)
     """
 
-    CITIES = sorted([
-        'Atlanta','Austin','Boston','Chicago','Dallas','Denver',
-        'Houston','Las Vegas','Los Angeles','Miami','Minneapolis',
-        'New Orleans','New York','Oklahoma City','Philadelphia',
-        'Phoenix','San Antonio','San Francisco','Seattle','Washington DC',
-    ])
+    CITIES = sorted(_ALL_CITIES.keys())
 
     def __init__(self):
         super().__init__()
@@ -2988,6 +3146,16 @@ class CityHistoryTab(QWidget):
 
         all_items = sorted(enriched_city + open_trades, key=_sort_key, reverse=True)
 
+        # Cross-reference settled items with trade_log to recover placed_at timestamps.
+        # Enriched items only carry `date` (entry date from fills); the trade_log entry
+        # has the exact placed_at time needed for the intraday-by-hour chart.
+        tlog_by_ticker = {t.get("ticker", ""): t for t in self._trades if t.get("city") == city}
+        for item in all_items:
+            if not item.get("placed_at"):
+                tlog = tlog_by_ticker.get(item.get("ticker", ""), {})
+                if tlog.get("placed_at"):
+                    item["placed_at"] = tlog["placed_at"]
+
         # ── Helper functions ──────────────────────────────────────────────
         def outcome(item):
             if item["_source"] == "open": return "open"
@@ -3135,7 +3303,7 @@ class CityHistoryTab(QWidget):
         dated = []
         for t in trades:
             try:
-                d = (t.get("placed_at","") or "")[:10]
+                d = (t.get("placed_at","") or t.get("date","") or "")[:10]
                 if d: dated.append((d, pnl_fn(t)))
             except: pass
         dated.sort(key=lambda x: x[0])
@@ -3171,12 +3339,17 @@ class CityHistoryTab(QWidget):
         tz_name = _ALL_CITIES.get(city, {}).get("tz")
         for t in trades:
             try:
-                pa = t.get("placed_at","")
-                if pa:
+                pa = t.get("placed_at","") or ""
+                if not pa:
+                    continue
+                # Full ISO timestamp → exact hour; bare date → use noon as proxy
+                if "T" in pa or len(pa) > 10:
                     dt = datetime.fromisoformat(pa.replace("Z","+00:00"))
-                    if tz_name:
-                        dt = dt.astimezone(ZoneInfo(tz_name))
-                    by_hour[dt.hour].append(pnl_fn(t))
+                else:
+                    dt = datetime.fromisoformat(pa + "T12:00:00+00:00")
+                if tz_name:
+                    dt = dt.astimezone(ZoneInfo(tz_name))
+                by_hour[dt.hour].append(pnl_fn(t))
             except: pass
 
         if not by_hour:

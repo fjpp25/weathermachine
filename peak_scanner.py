@@ -1,380 +1,242 @@
 """
 peak_scanner.py
 ---------------
-Watches the intraday temperature trajectory for each city and enters
-No positions on brackets that become physically unreachable once the
-daily high has been confirmed.
+Intraday bracket capture engine. Enters No on brackets where the current
+observed high is already AT the bracket floor, and the city's daily peak
+temperature is reliably in the afternoon — meaning the temperature will
+almost certainly continue rising past that floor before end of day.
 
-How peak confirmation works
----------------------------
-  observed_high_f (from NWS) is the cumulative daily maximum — it only
-  ever increases. When it stops moving AND current_temp_f has dropped
-  meaningfully below it, the day's high is almost certainly locked in.
-
-  Confirmation requires ALL of:
-    1. local hour ≥ PEAK_MIN_HOUR (don't call peaks before 1pm)
-    2. observed_high_f unchanged for ≥ PEAK_STABLE_POLLS consecutive polls
-    3. current_temp_f ≤ observed_high_f − PEAK_DROP_THRESHOLD
-
-  Once confirmed, any HIGH bracket whose floor > observed_high_f + BRACKET_BUFFER
-  is physically impossible — a valid No entry.
-
-State (in-memory, intentionally ephemeral)
-------------------------------------------
-  _obs_history  : per-city deque of (poll_time, obs_high_f, current_temp_f)
-  _peak_state   : per-city dict tracking confirmed peak and stability count
-  _fired_tickers: set of tickers already entered this session
-
-Architecture
+Signal logic
 ------------
-  Mirrors tomorrow_scanner — runs in parallel with run_pipeline() in the
-  scheduler. Has no shared mutable state with other modules. Calls
-  nws_feed.snapshot() independently (free API, no rate concern).
+For each poll:
+  1. Get current observed high for the city (from NWS snapshot)
+  2. Find any B bracket whose floor is within 0.5F below obs_high
+     (temperature is right at the floor — about to break through)
+  3. Check: local hour < city P90 peak hour (still before typical peak)
+  4. Check: No price >= NO_MIN_ENTRY (0.80)
+  5. Enter No
 
-  on_signal() is currently a stub — wire in trader.place_order() when ready.
+Backtest (Apr 7-27, 2026 — 10 clean cities):
+  179 signals  WR=92.2%  EV=+$0.039  Total=+$6.88  0 bad days
+
+Cities (low peak-hour variance, predictable afternoon peak):
+  Atlanta, Boston, Chicago, Denver, Houston,
+  Los Angeles, New Orleans, Phoenix, San Francisco, Seattle
+
+Excluded (high variance): Miami, Minneapolis, New York, Philadelphia,
+  Washington DC, Austin, Dallas, Las Vegas, Oklahoma City, San Antonio
 """
 
 from __future__ import annotations
-
-import logging
-from collections import deque
+import argparse
 from datetime import datetime, timezone
-from typing import Optional
 from zoneinfo import ZoneInfo
+from typing import Optional
+from log_setup import get_logger
 
-import nws_feed
-from cities import TRADING_CITIES as _CITY_REGISTRY
+log = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Logging — structured, timestamped, easy to grep
-# ---------------------------------------------------------------------------
+NO_MIN_ENTRY  = 0.80
+NO_MAX_ENTRY  = 0.92
+MAX_CONTRACTS = 3
+OBS_FLOOR_GAP = 0.5   # obs_high must be within this of bracket floor
 
-log = logging.getLogger("peak_scanner")
+PEAK_CITIES: dict[str, int] = {
+    "Atlanta":       17,
+    "Boston":        17,
+    "Chicago":       19,
+    "Denver":        18,
+    "Houston":       19,
+    "Los Angeles":   17,
+    "New Orleans":   15,
+    "Phoenix":       17,
+    "San Francisco": 17,
+    "Seattle":       17,
+}
 
-if not log.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter(
-        "%(asctime)s  [peak_scanner]  %(levelname)-8s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S UTC",
-    ))
-    _handler.formatter.converter = lambda *a: datetime.now(timezone.utc).timetuple()
-    log.addHandler(_handler)
-    log.setLevel(logging.DEBUG)
+_CITY_TZ: dict[str, str] = {
+    "Atlanta":       "America/New_York",
+    "Boston":        "America/New_York",
+    "Chicago":       "America/Chicago",
+    "Denver":        "America/Denver",
+    "Houston":       "America/Chicago",
+    "Los Angeles":   "America/Los_Angeles",
+    "New Orleans":   "America/Chicago",
+    "Phoenix":       "America/Phoenix",
+    "San Francisco": "America/Los_Angeles",
+    "Seattle":       "America/Los_Angeles",
+}
 
-
-# ---------------------------------------------------------------------------
-# Tunable parameters
-# ---------------------------------------------------------------------------
-
-PEAK_MIN_HOUR        = 13     # local hour — never confirm a peak before 1pm
-PEAK_STABLE_POLLS    = 3      # observed_high_f must be unchanged for this many polls
-PEAK_DROP_THRESHOLD  = 2.0    # current_temp must be this many °F below observed_high
-BRACKET_BUFFER       = 1.0    # bracket floor must be this far above observed_high
-HISTORY_MAXLEN       = 24     # keep last 24 readings per city (~2h at 5-min polling)
-
-# Minimum No price to enter — don't chase already-converged brackets
-MIN_NO_PRICE         = 0.75
-MAX_NO_PRICE         = 0.97   # skip if essentially already at 1.0
-
-
-# ---------------------------------------------------------------------------
-# Per-city state
-# ---------------------------------------------------------------------------
-
-# { city: deque[(poll_time_utc, obs_high_f, current_temp_f)] }
-_obs_history: dict[str, deque] = {}
-
-# { city: {"confirmed": bool, "peak_f": float, "confirmed_at": datetime,
-#           "stable_count": int, "last_obs_high": float} }
-_peak_state: dict[str, dict] = {}
-
-# Tickers already entered this session — never re-enter
-_fired_tickers: set[str] = set()
+_fired: set[tuple[str, str]] = set()
 
 
-def _init_city(city: str) -> None:
-    if city not in _obs_history:
-        _obs_history[city] = deque(maxlen=HISTORY_MAXLEN)
-    if city not in _peak_state:
-        _peak_state[city] = {
-            "confirmed":    False,
-            "peak_f":       None,
-            "confirmed_at": None,
-            "stable_count": 0,
-            "last_obs_high": None,
-        }
+def _local_hour(city: str) -> int:
+    return datetime.now(ZoneInfo(_CITY_TZ.get(city, "UTC"))).hour
 
 
-def _city_local_hour(tz_name: str) -> int:
-    return datetime.now(ZoneInfo(tz_name)).hour
+def _no_price(bracket: dict) -> float:
+    return float(
+        bracket.get("ob_no_ask") or bracket.get("ob_no_bid")
+        or bracket.get("no_price") or 0.0
+    )
 
 
-def _today_str(tz_name: str) -> str:
-    dt = datetime.now(ZoneInfo(tz_name))
-    return dt.strftime("%y") + dt.strftime("%b").upper() + dt.strftime("%d")
+def _bracket_floor(bracket: dict) -> Optional[float]:
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+    if floor is not None and cap is not None:
+        return float(floor)
+    return None
 
 
-def _high_series(meta: dict) -> Optional[str]:
-    return meta.get("high_series") or meta.get("high")
-
-
-# ---------------------------------------------------------------------------
-# Market fetching (today's HIGH brackets)
-# ---------------------------------------------------------------------------
-
-def _fetch_today_brackets(client, series: str, today: str) -> list[dict]:
-    """
-    Fetch all open HIGH brackets for today's market.
-    Returns list of {ticker, bracket, floor, cap, no_price, yes_price}.
-    """
-    try:
-        resp = client.get_markets(series_ticker=series, status="open")
-        markets_raw = resp.get("markets", []) if isinstance(resp, dict) else []
-        results = []
-        for m in markets_raw:
-            ticker = m.get("ticker", "")
-            if today.upper() not in ticker.upper():
-                continue
-            bracket = ticker.split("-")[-1] if "-" in ticker else ""
-            yes_p   = float(m.get("yes_bid_dollars") or m.get("yes_ask") or 0)
-            no_p    = float(m.get("no_bid_dollars")  or m.get("no_ask")  or 0)
-
-            # Parse floor/cap from bracket string
-            floor, cap = None, None
-            try:
-                if bracket.startswith("B"):
-                    cap   = float(bracket[1:])
-                    floor = round(cap - 2.0, 1)
-                elif bracket.startswith("T"):
-                    val = float(bracket[1:])
-                    cap = round(val - 0.5, 1)   # bottom T: "below X°F"
-            except ValueError:
-                pass
-
-            results.append({
-                "ticker":    ticker,
-                "bracket":   bracket,
-                "floor":     floor,
-                "cap":       cap,
-                "yes_price": yes_p,
-                "no_price":  no_p,
-            })
-        return results
-    except Exception as e:
-        log.warning("bracket fetch failed for %s: %s", series, e)
+def _check_city(city, obs_high, brackets, local_hour):
+    if local_hour >= PEAK_CITIES[city]:
         return []
-
-
-# ---------------------------------------------------------------------------
-# Peak detection
-# ---------------------------------------------------------------------------
-
-def _update_peak_state(
-    city: str,
-    poll_time: datetime,
-    obs_high: float,
-    current_temp: float,
-    local_hour: int,
-) -> bool:
-    """
-    Update temperature history and peak state for a city.
-    Returns True if peak just became confirmed this poll.
-    """
-    _init_city(city)
-    state   = _peak_state[city]
-    history = _obs_history[city]
-
-    history.append((poll_time, obs_high, current_temp))
-
-    # ── Track stability of observed_high_f ───────────────────────────────
-    last_obs = state["last_obs_high"]
-    if last_obs is None or obs_high > last_obs:
-        # New high — reset stability counter
-        if last_obs is not None and obs_high > last_obs:
-            log.debug("%-16s  new obs_high: %.1f°F (was %.1f°F)  "
-                      "hour=%d  resetting stability count",
-                      city, obs_high, last_obs, local_hour)
-        state["stable_count"]  = 1
-        state["last_obs_high"] = obs_high
-        state["confirmed"]     = False   # peak moved, re-evaluate
-    else:
-        state["stable_count"] += 1
-
-    # ── Log current status every poll ────────────────────────────────────
-    drop = obs_high - current_temp
-    log.debug("%-16s  obs_high=%.1f°F  current=%.1f°F  drop=%.1f°F  "
-              "stable=%d/%d  hour=%d  peak_confirmed=%s",
-              city, obs_high, current_temp, drop,
-              state["stable_count"], PEAK_STABLE_POLLS,
-              local_hour, state["confirmed"])
-
-    # ── Check confirmation conditions ─────────────────────────────────────
-    if state["confirmed"]:
-        return False   # already confirmed — nothing new
-
-    if local_hour < PEAK_MIN_HOUR:
-        return False   # too early
-
-    stable_enough = state["stable_count"] >= PEAK_STABLE_POLLS
-    drop_enough   = drop >= PEAK_DROP_THRESHOLD
-
-    if stable_enough and drop_enough:
-        state["confirmed"]    = True
-        state["peak_f"]       = obs_high
-        state["confirmed_at"] = poll_time
-        log.info("%-16s  PEAK CONFIRMED  %.1f°F  "
-                 "(stable %d polls, drop %.1f°F, hour %d)",
-                 city, obs_high, state["stable_count"], drop, local_hour)
-        return True
-
-    if not stable_enough:
-        log.debug("%-16s  waiting for stability: %d/%d polls",
-                  city, state["stable_count"], PEAK_STABLE_POLLS)
-    if not drop_enough:
-        log.debug("%-16s  waiting for drop: %.1f°F / %.1f°F required",
-                  city, drop, PEAK_DROP_THRESHOLD)
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Core scanner
-# ---------------------------------------------------------------------------
-
-def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
-    """
-    Called every poll cycle. For each city:
-      1. Fetch current NWS temps
-      2. Update peak state
-      3. If peak confirmed, scan for No entries above the confirmed peak
-    """
-    poll_time = datetime.now(timezone.utc)
-    log.debug("── poll %s ──────────────────────────────────────────────────",
-              poll_time.strftime("%H:%M:%S UTC"))
-
-    # ── Fetch NWS snapshot ────────────────────────────────────────────────
-    try:
-        nws_data = nws_feed.snapshot(city_filter)
-    except Exception as e:
-        log.error("NWS snapshot failed: %s — skipping poll", e)
-        return
-
-    cities = {
-        name: meta for name, meta in _CITY_REGISTRY.items()
-        if city_filter is None or name.lower() == city_filter.lower()
-    }
-
-    for city, meta in cities.items():
-        tz         = meta["tz"]
-        local_hour = _city_local_hour(tz)
-        nws        = nws_data.get(city, {})
-        obs_high   = nws.get("observed_high_f")
-        current_t  = nws.get("current_temp_f")
-
-        if obs_high is None or current_t is None:
-            log.debug("%-16s  no NWS data (obs_high=%s  current=%s) — skipping",
-                      city, obs_high, current_t)
+    signals = []
+    for bracket in brackets:
+        ticker = bracket.get("ticker", "")
+        if not ticker:
             continue
-
-        # ── Update peak detection state ───────────────────────────────────
-        just_confirmed = _update_peak_state(
-            city, poll_time, obs_high, current_t, local_hour
-        )
-
-        # ── If peak confirmed (now or previously), scan brackets ──────────
-        state = _peak_state.get(city, {})
-        if not state.get("confirmed"):
+        # B brackets only
+        bracket_code = ticker.split("-")[-1] if "-" in ticker else ""
+        if not bracket_code.startswith("B"):
             continue
-
-        confirmed_peak = state["peak_f"]
-        series         = _high_series(meta)
-        if not series:
-            log.warning("%-16s  no HIGH series in city config — skipping", city)
+        floor = _bracket_floor(bracket)
+        if floor is None:
             continue
-
-        today    = _today_str(tz)
-        brackets = _fetch_today_brackets(client, series, today)
-
-        if not brackets:
-            log.debug("%-16s  no open brackets for %s", city, today)
+        if not (floor - OBS_FLOOR_GAP <= obs_high <= floor + 0.1):
             continue
+        no_p = _no_price(bracket)
+        if not (NO_MIN_ENTRY <= no_p <= NO_MAX_ENTRY):
+            continue
+        if (city, ticker) in _fired:
+            continue
+        signals.append(bracket)
+    return signals
 
-        # ── Find eligible brackets ────────────────────────────────────────
-        eligible = [
-            b for b in brackets
-            if b["floor"] is not None
-            and b["floor"] > confirmed_peak + BRACKET_BUFFER
-            and MIN_NO_PRICE <= b["no_price"] <= MAX_NO_PRICE
-            and b["ticker"] not in _fired_tickers
-        ]
-
-        if just_confirmed or eligible:
-            log.info("%-16s  peak=%.1f°F  confirmed_at=%s  "
-                     "open brackets=%d  eligible=%d",
-                     city, confirmed_peak,
-                     state["confirmed_at"].strftime("%H:%M UTC"),
-                     len(brackets), len(eligible))
-
-        for b in eligible:
-            log.info("%-16s  SIGNAL  %s  No=%.2f  "
-                     "(floor=%.1f°F  peak=%.1f°F  gap=+%.1f°F)%s",
-                     city, b["ticker"], b["no_price"],
-                     b["floor"], confirmed_peak,
-                     b["floor"] - confirmed_peak,
-                     "  [PAPER]" if paper else "")
-            _fired_tickers.add(b["ticker"])
-            on_signal(client, city, b, confirmed_peak, paper)
-
-
-# ---------------------------------------------------------------------------
-# Signal handler — wire in order execution here
-# ---------------------------------------------------------------------------
-
-def on_signal(
-    client,
-    city:           str,
-    bracket:        dict,
-    confirmed_peak: float,
-    paper:          bool = False,
-) -> None:
-    """
-    Called when a No entry signal fires for a bracket above the confirmed peak.
-    Currently logs only. Wire in trader.place_order() when ready.
-
-    Args:
-        bracket:        {ticker, bracket, floor, cap, no_price, yes_price}
-        confirmed_peak: the confirmed daily high in °F
-    """
-    tag = "[PAPER] " if paper else ""
-    log.info("%-16s  %swould buy No on %s @ %.2f  "
-             "(floor=%.1f°F > peak=%.1f°F)",
-             city, tag, bracket["ticker"], bracket["no_price"],
-             bracket["floor"], confirmed_peak)
-
-    # TODO: wire in order execution, e.g.:
-    # try:
-    #     trader.place_order(
-    #         client        = client,
-    #         ticker        = bracket["ticker"],
-    #         side          = "no",
-    #         price_dollars = bracket["no_price"],
-    #         contracts     = 1,
-    #         paper         = paper,
-    #     )
-    # except Exception as e:
-    #     log.error("order failed for %s: %s", bracket["ticker"], e)
-
-
-# ---------------------------------------------------------------------------
-# Startup summary
-# ---------------------------------------------------------------------------
 
 def log_config() -> None:
-    """Print tunable parameters at startup."""
-    log.info("peak scanner initialised  "
-             "PEAK_MIN_HOUR=%dh  PEAK_STABLE_POLLS=%d  "
-             "PEAK_DROP_THRESHOLD=%.1f°F  BRACKET_BUFFER=%.1f°F  "
-             "entry=[%.2f–%.2f]",
-             PEAK_MIN_HOUR, PEAK_STABLE_POLLS,
-             PEAK_DROP_THRESHOLD, BRACKET_BUFFER,
-             MIN_NO_PRICE, MAX_NO_PRICE)
+    log.info(
+        "peak_scanner: NO=[%.2f, %.2f]  contracts=%d  gap=%.1fF  cities=%s",
+        NO_MIN_ENTRY, NO_MAX_ENTRY, MAX_CONTRACTS, OBS_FLOOR_GAP,
+        list(PEAK_CITIES.keys()),
+    )
+
+
+def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
+    import trader as _trader
+    import kalshi_scanner as _ks
+
+    cities = {c: p for c, p in PEAK_CITIES.items()
+              if city_filter is None or c.lower() == city_filter.lower()}
+    if not cities:
+        return
+
+    if nws_snapshot is None:
+        try:
+            import nws_feed
+            nws_snapshot = nws_feed.snapshot()
+        except Exception as e:
+            log.warning("peak_scanner: NWS fetch failed: %s", e)
+            nws_snapshot = {}
+
+    try:
+        kalshi_results = _ks.scan_all(city_filter=city_filter, market_type="high")
+    except Exception as e:
+        log.warning("peak_scanner: Kalshi scan failed: %s", e)
+        return
+
+    for city in cities:
+        nws_data   = nws_snapshot.get(city, {})
+        obs_high   = nws_data.get("observed_high_f")
+        if obs_high is None or obs_high <= 0:
+            continue
+
+        local_hour = _local_hour(city)
+        brackets   = kalshi_results.get(city, {}).get("brackets", [])
+        if not brackets:
+            continue
+
+        for bracket in _check_city(city, obs_high, brackets, local_hour):
+            ticker = bracket.get("ticker", "")
+            no_p   = _no_price(bracket)
+            floor  = _bracket_floor(bracket)
+
+            log.info(
+                "PEAK  %s  %s  No=%.2f  obs=%.1fF  floor=%.1fF  "
+                "hour=%d  safe_until=%dh  %dc",
+                city, ticker, no_p, obs_high, floor,
+                local_hour, PEAK_CITIES[city], MAX_CONTRACTS,
+            )
+
+            _fired.add((city, ticker))
+
+            # Capital check
+            try:
+                from trader import EngineCapital as _EC, get_balance as _gb
+                _cap = _EC(balance=_gb(client))
+                if not _cap.can_deploy("peak", no_p * MAX_CONTRACTS):
+                    log.debug("peak_scanner: %s — peak budget exhausted", ticker)
+                    continue
+            except Exception:
+                pass  # proceed without capital check if unavailable
+
+            if not paper:
+                try:
+                    _trader.place_order(
+                        client        = client,
+                        ticker        = ticker,
+                        side          = "no",
+                        price_dollars = no_p,
+                        contracts     = MAX_CONTRACTS,
+                        paper         = False,
+                    )
+                    _trader._append_trade_log({
+                        "ticker":       ticker,
+                        "city":         city,
+                        "side":         "no",
+                        "market_type":  "high",
+                        "score":        3,
+                        "score_detail": ["peak_obs_at_floor",
+                                         "before_peak_hour",
+                                         "no_price_quality"],
+                        "entry_price":  no_p,
+                        "contracts":    MAX_CONTRACTS,
+                        "placed_at":    datetime.now(timezone.utc).isoformat(),
+                        "paper":        False,
+                        "entry_tier":   "peak",
+                    })
+                    try:
+                        from trader import get_engine_capital as _gec
+                        _gec().record("peak", no_p * MAX_CONTRACTS)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.error("peak_scanner: order failed %s: %s", ticker, e)
+            else:
+                log.info("  [PAPER] would place No %dc @ $%.2f on %s",
+                         MAX_CONTRACTS, no_p, ticker)
+
+
+if __name__ == "__main__":
+    import os, json
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--paper", action="store_true")
+    parser.add_argument("--city",  type=str, default=None)
+    args = parser.parse_args()
+
+    config_file = Path("data/config.json")
+    if config_file.exists():
+        config = json.loads(config_file.read_text())
+        if config.get("key_id"):
+            os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
+        if config.get("key_file"):
+            os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
+        os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+
+    import trader
+    client = trader.make_client()
+    log_config()
+    run_scan(client=client, city_filter=args.city, paper=args.paper)

@@ -23,6 +23,8 @@ Usage:
 import json
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -46,10 +48,18 @@ CITY_SERIES = {
     "San Francisco": {"high": "KXHIGHTSFO",  "low": None},
     "Denver":        {"high": "KXHIGHDEN",   "low": "KXLOWTDEN"},
     "Philadelphia":  {"high": "KXHIGHPHIL",  "low": "KXLOWTPHIL"},
-    "Atlanta":       {"high": "KXHIGHTATL",  "low": None},
-    "Houston":       {"high": "KXHIGHTHOU",  "low": None},
-    "Phoenix":       {"high": "KXHIGHTPHX",  "low": None},
-    "Las Vegas":     {"high": "KXHIGHTLV",   "low": None},
+    "Atlanta":       {"high": "KXHIGHTATL",  "low": "KXLOWTATL"},
+    "Houston":       {"high": "KXHIGHTHOU",  "low": "KXLOWTHOU"},
+    "Phoenix":       {"high": "KXHIGHTPHX",  "low": "KXLOWTPHX"},
+    "Las Vegas":     {"high": "KXHIGHTLV",   "low": "KXLOWTLV"},
+    "Dallas":        {"high": "KXHIGHTDAL",  "low": "KXLOWTDAL"},
+    "Boston":        {"high": "KXHIGHTBOS",  "low": "KXLOWTBOS"},
+    "Washington DC": {"high": "KXHIGHTDC",   "low": "KXLOWTDC"},
+    "Seattle":       {"high": "KXHIGHTSEA",  "low": "KXLOWTSEA"},
+    "Minneapolis":   {"high": "KXHIGHTMIN",  "low": "KXLOWTMIN"},
+    "Oklahoma City": {"high": "KXHIGHTOKC",  "low": "KXLOWTOKC"},
+    "New Orleans":   {"high": "KXHIGHTNOLA", "low": "KXLOWTNOLA"},
+    "San Antonio":   {"high": "KXHIGHTSATX", "low": "KXLOWTSATX"},
 }
 
 API_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
@@ -68,16 +78,18 @@ CANDLE_MIN = 60    # 1-hour candles for intraday history (60 = 1hr in minutes)
 PRICE_HISTORY_WINDOW = 6   # ~90 minutes at 15-min polling interval
 
 _price_history: dict[str, list[tuple[str, float]]] = {}
+_price_history_lock = threading.Lock()  # guards concurrent writes
 
 
 def record_price(ticker: str, yes_price: float, ts: str | None = None) -> None:
     """Append a YES price observation to the in-memory history for a ticker."""
     if ts is None:
         ts = datetime.now(timezone.utc).isoformat()
-    history = _price_history.setdefault(ticker, [])
-    history.append((ts, yes_price))
-    if len(history) > PRICE_HISTORY_WINDOW:
-        del history[:-PRICE_HISTORY_WINDOW]
+    with _price_history_lock:
+        history = _price_history.setdefault(ticker, [])
+        history.append((ts, yes_price))
+        if len(history) > PRICE_HISTORY_WINDOW:
+            del history[:-PRICE_HISTORY_WINDOW]
 
 
 def get_price_history(ticker: str) -> list[tuple[str, float]]:
@@ -329,10 +341,9 @@ def _scan_brackets(markets: list[dict], series_ticker: str,
         skip_orderbook: True for converged brackets — no signal value
         skip_candles:   True for tomorrow's brackets — too little history
     """
-    brackets = []
-    for market in markets:
-        ticker = market["ticker"]
-
+    def _enrich_bracket(market: dict) -> dict:
+        """Fetch orderbook and candles for a single bracket. Runs in a thread."""
+        ticker  = market["ticker"]
         bracket = {
             "ticker":        ticker,
             "title":         market.get("title", ""),
@@ -384,9 +395,21 @@ def _scan_brackets(markets: list[dict], series_ticker: str,
 
         bracket["yes_price_history"]   = get_price_history(ticker)
         bracket["yes_trend_direction"] = yes_trend(ticker)
+        return bracket
 
-        brackets.append(bracket)
-        time.sleep(0.15)
+    # Parallelise bracket enrichment — orderbook + candle calls are independent
+    brackets = []
+    with ThreadPoolExecutor(max_workers=min(6, len(markets))) as ex:
+        futures = {ex.submit(_enrich_bracket, m): m for m in markets}
+        for future in as_completed(futures):
+            try:
+                brackets.append(future.result(timeout=20))
+            except Exception as e:
+                m = futures[future]
+                brackets.append({
+                    "ticker": m.get("ticker",""),
+                    "error":  str(e),
+                })
 
     brackets.sort(key=lambda b: b.get("floor") or 0)
     return brackets
@@ -459,24 +482,42 @@ def scan_city(city: str, market_type: str = "high") -> dict:
 # Scan all cities
 # ---------------------------------------------------------------------------
 
-def scan_all(city_filter: str = None, market_type: str = "high") -> dict:
+def scan_all(city_filter: str = None, market_type: str = "high",
+             max_workers: int = 4) -> dict:
+    """
+    Scan all cities in parallel using ThreadPoolExecutor.
+    Each city's scan is independent so we can run them concurrently.
+    max_workers=8 balances throughput vs API politeness.
+    """
     cities = list(CITY_SERIES.keys())
     if city_filter:
         cities = [c for c in cities if c.lower() == city_filter.lower()]
 
-    results = {}
-    for city in cities:
+    results   = {}
+    completed = {}   # city -> result, populated as futures complete
+
+    def _scan_and_log(city: str) -> tuple[str, dict]:
         result = scan_city(city, market_type)
         if result.get("error") == "No series ticker configured":
-            results[city] = result
-            continue
-        print(f"  Scanning {city} ({market_type})...", end=" ", flush=True)
+            return city, result
         if result.get("error"):
-            print(f"ERROR: {result['error']}")
+            print(f"  Scanning {city} ({market_type})... ERROR: {result['error']}")
         else:
-            print(f"{len(result['brackets'])} brackets")
-        results[city] = result
-        time.sleep(0.2)
+            print(f"  Scanning {city} ({market_type})... {len(result['brackets'])} brackets")
+        return city, result
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(cities))) as executor:
+        futures = {}
+        for city in cities:
+            futures[executor.submit(_scan_and_log, city)] = city
+            time.sleep(0.3)   # stagger submissions to avoid 429s
+        for future in as_completed(futures):
+            try:
+                city, result = future.result(timeout=60)
+                results[city] = result
+            except Exception as e:
+                city = futures[future]
+                results[city] = {"city": city, "error": str(e), "brackets": []}
 
     return results
 

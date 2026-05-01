@@ -182,8 +182,8 @@ class KalshiClient:
                 if resp.status_code == 429 or resp.status_code >= 500:
                     if attempt < MAX_RETRIES - 1:
                         delay = BASE_DELAY * (2 ** attempt)
-                        log.warning("[%d] retrying in %ds" +  # 
-                              f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                        log.warning("HTTP %d: retrying in %ds (attempt %d/%d)",
+                                    resp.status_code, delay, attempt + 1, MAX_RETRIES)
                         time.sleep(delay)
                         continue
                 resp.raise_for_status()
@@ -192,8 +192,8 @@ class KalshiClient:
             except requests.exceptions.Timeout:
                 if attempt < MAX_RETRIES - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    log.warning("[timeout] retrying in %ds" +  # 
-                          f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                    log.warning("timeout: retrying in %ds (attempt %d/%d)",
+                                delay, attempt + 1, MAX_RETRIES)
                     time.sleep(delay)
                 else:
                     raise
@@ -201,8 +201,8 @@ class KalshiClient:
             except requests.exceptions.ConnectionError:
                 if attempt < MAX_RETRIES - 1:
                     delay = BASE_DELAY * (2 ** attempt)
-                    log.warning("[connection error] retrying in %ds" +  # 
-                          f"(attempt {attempt + 1}/{MAX_RETRIES})...")
+                    log.warning("connection error: retrying in %ds (attempt %d/%d)",
+                                delay, attempt + 1, MAX_RETRIES)
                     time.sleep(delay)
                 else:
                     raise
@@ -275,6 +275,124 @@ def make_client(skip_confirmation: bool = False) -> KalshiClient:
 # ---------------------------------------------------------------------------
 # Account queries
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Engine capital manager
+# ---------------------------------------------------------------------------
+
+class EngineCapital:
+    """
+    Proportional capital allocator across trading engines.
+
+    Fetches the live Kalshi balance once per instance (or on demand),
+    then tracks deployed capital per engine against each engine's share.
+
+    Usage:
+        cap = EngineCapital(client)
+        if cap.can_deploy("cascade", cost=2.70):
+            place_order(...)
+            cap.record("cascade", 2.70)
+
+    The instance is recreated each poll cycle so balances stay fresh.
+    """
+
+    def __init__(self, client=None, balance: float = None):
+        if balance is not None:
+            self._balance = balance
+        elif client is not None:
+            try:
+                self._balance = get_balance(client)
+            except Exception as e:
+                log.warning("EngineCapital: balance fetch failed: %s — using 0", e)
+                self._balance = 0.0
+        else:
+            self._balance = 0.0
+
+        # Per-engine budget = balance * share
+        self._budget: dict[str, float] = {
+            engine: round(self._balance * share, 4)
+            for engine, share in ENGINE_ALLOCATIONS.items()
+        }
+
+        # Per-engine deployed this session (resets with each new instance)
+        self._deployed: dict[str, float] = {e: 0.0 for e in ENGINE_ALLOCATIONS}
+
+        log.debug(
+            "EngineCapital: balance=$%.2f  "
+            "main=$%.2f  cascade=$%.2f  topup=$%.2f  peak=$%.2f  tomorrow=$%.2f",
+            self._balance,
+            self._budget.get("main", 0),
+            self._budget.get("cascade", 0),
+            self._budget.get("topup", 0),
+            self._budget.get("peak", 0),
+            self._budget.get("tomorrow", 0),
+        )
+
+    @property
+    def balance(self) -> float:
+        return self._balance
+
+    def budget(self, engine: str) -> float:
+        """Total budget allocated to this engine."""
+        return self._budget.get(engine, 0.0)
+
+    def remaining(self, engine: str) -> float:
+        """Remaining undeployed budget for this engine."""
+        return max(0.0, self._budget.get(engine, 0.0) - self._deployed.get(engine, 0.0))
+
+    def can_deploy(self, engine: str, cost: float) -> bool:
+        """Return True if engine has enough remaining budget to cover cost."""
+        if cost <= 0:
+            return True
+        rem = self.remaining(engine)
+        ok  = rem >= cost
+        if not ok:
+            log.debug(
+                "EngineCapital: %s cannot deploy $%.2f "
+                "(budget=$%.2f  deployed=$%.2f  remaining=$%.2f)",
+                engine, cost,
+                self._budget.get(engine, 0),
+                self._deployed.get(engine, 0),
+                rem,
+            )
+        return ok
+
+    def record(self, engine: str, cost: float) -> None:
+        """Record capital deployed by an engine."""
+        if engine not in self._deployed:
+            self._deployed[engine] = 0.0
+        self._deployed[engine] = round(self._deployed[engine] + cost, 4)
+        log.debug(
+            "EngineCapital: %s deployed $%.2f  "
+            "(total_deployed=$%.2f  remaining=$%.2f)",
+            engine, cost,
+            self._deployed[engine],
+            self.remaining(engine),
+        )
+
+    def summary(self) -> str:
+        parts = []
+        for e in ENGINE_ALLOCATIONS:
+            parts.append(
+                f"{e}=${self.remaining(e):.2f}/{self._budget.get(e,0):.2f}"
+            )
+        return "  ".join(parts)
+
+
+# Module-level instance — recreated each poll cycle by run_pipeline()
+_engine_capital: EngineCapital | None = None
+
+
+def get_engine_capital(client=None) -> EngineCapital:
+    """
+    Return the current EngineCapital instance.
+    Creates a new one (fetching live balance) if none exists or client given.
+    """
+    global _engine_capital
+    if client is not None or _engine_capital is None:
+        _engine_capital = EngineCapital(client=client)
+    return _engine_capital
 
 def get_balance(client: KalshiClient) -> float:
     """Returns account balance in dollars."""
@@ -651,6 +769,14 @@ NO_STOP_LOSS_AFTERNOON = 0.0    # disabled
 
 # NO position: probability ceiling
 # Exit if YES crosses this regardless of our entry price — thesis is dead.
+# ── Top-up parameters ────────────────────────────────────────────────────────
+TOPUP_HOUR_START    = 13     # local hour — top-up window opens
+TOPUP_HOUR_END      = 15     # local hour — top-up window closes (inclusive)
+YES_TOPUP_MAX       = 0.30   # max Yes price seen during window to qualify
+                              # backtest: <=0.30 gives 98.6% WR, >0.40 turns negative EV
+TOPUP_MAX_CONTRACTS = 3      # additional contracts per top-up signal
+NO_TOPUP_MAX_PRICE  = 0.91   # don't top up if No has drifted above this
+
 NO_YES_CEILING      = 0.60   # Yes must reach 0.60 before we consider exiting
 NO_YES_CEILING_HOUR = 15     # Yes ceiling only fires at/after this local hour
 
@@ -687,6 +813,8 @@ SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the obse
 # ---------------------------------------------------------------------------
 
 _exited_this_session: set[str] = set()
+_topup_done:          set[str] = set()   # tickers already topped up this session
+_yes_peaks:           dict     = {}      # ticker -> max Yes price seen today
 
 # ---------------------------------------------------------------------------
 # Daily capital snapshot
@@ -697,8 +825,22 @@ from datetime import date as _date
 
 _day_open_balance: float      = 0.0
 _day_open_date:    _date|None = None
-CASCADE_RESERVE:   float      = 30.00   # $ always kept for cascade engine
-MAIN_BUDGET_PCT:   float      = 0.70    # fraction of day-open balance for main engine
+_deployed_today:   float      = 0.0   # running sum of main-engine capital committed today;
+                                       # persists across poll cycles, reset at midnight
+# ---------------------------------------------------------------------------
+# Engine capital allocation — proportional by proven EV/dollar
+# ---------------------------------------------------------------------------
+ENGINE_ALLOCATIONS: dict[str, float] = {
+    "main":     0.30,   # 30% — primary discovery engine
+    "cascade":  0.35,   # 35% — highest proven EV (LOWT cascade dominates)
+    "topup":    0.15,   # 15% — augments existing positions
+    "peak":     0.08,   # 8%  — newer signal, conservative start
+    "tomorrow": 0.12,   # 12% — 100% WR, overnight capital efficiency
+}
+
+# Legacy constants retained for backward compat
+CASCADE_RESERVE:   float      = 30.00
+MAIN_BUDGET_PCT:   float      = 0.70
 
 
 def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
@@ -706,24 +848,25 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     Refresh the daily snapshot if the date has changed.
     Returns (main_deployable, cascade_reserve) based on day-open balance.
 
-    main_deployable = how much of the main budget hasn't been deployed yet
-                    = day_open * MAIN_BUDGET_PCT - already_deployed
-    already_deployed = day_open_balance - current_balance
-                     (crude proxy: assumes only exits return cash intraday)
+    main_deployable = day_open * MAIN_BUDGET_PCT - _deployed_today
+
+    _deployed_today tracks capital committed by the main engine this session
+    and is reset at midnight. Unlike the old balance-diff proxy, it is not
+    disturbed by winning settlements that increase current_balance mid-day.
     """
-    global _day_open_balance, _day_open_date
+    global _day_open_balance, _day_open_date, _deployed_today
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
         _day_open_balance = current_balance
         _day_open_date    = today
+        _deployed_today   = 0.0
         log.info("day snapshot: $%.2f  (main_budget=$%.2f  cascade_reserve=$%.2f)",
                  current_balance,
                  round(current_balance * MAIN_BUDGET_PCT, 2),
                  CASCADE_RESERVE)
 
-    main_budget      = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
-    already_deployed = max(0.0, _day_open_balance - current_balance)
-    main_deployable  = max(0.0, round(main_budget - already_deployed, 2))
+    main_budget     = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
+    main_deployable = max(0.0, round(main_budget - _deployed_today, 2))
     return main_deployable, CASCADE_RESERVE
 
 
@@ -870,9 +1013,9 @@ def _post_exit_scan(
                 no_p = round(1.0 - yes_p, 4)
 
             # Must be live and in our entry range
-            if not (0.75 <= no_p <= NO_MAX_ENTRY_PRICE):
+            if not (decision_engine.NO_MIN_ENTRY_PRICE <= no_p <= decision_engine.NO_MAX_ENTRY_PRICE):
                 continue
-            if yes_p > 0.25:
+            if yes_p > decision_engine.NO_MAX_YES_PRICE:
                 continue
 
             # Check headroom
@@ -929,6 +1072,7 @@ def _post_exit_scan(
                         "contracts":    contracts,
                         "placed_at":    datetime.now(timezone.utc).isoformat(),
                         "paper":        False,
+                        "entry_tier":   "post_exit_scan",
                     })
                 except Exception as e:
                     log.error("post_exit_scan order failed for %s: %s", c["ticker"], e)
@@ -1099,7 +1243,7 @@ def check_exits(
                     if corrected_fcst is not None:
                         try:
                             from hight_decision_engine import _city_bias as _get_bias
-                            corrected_fcst = corrected_fcst + _get_bias(city)
+                            corrected_fcst = corrected_fcst - _get_bias(city)  # positive bias = NWS runs warm → subtract
                         except Exception:
                             pass
                         fcst_floor_gap = corrected_fcst - floor
@@ -1154,7 +1298,7 @@ def check_exits(
                             if corrected_fcst is not None:
                                 from hight_decision_engine import _city_bias as _get_bias
                                 try:
-                                    corrected_fcst = corrected_fcst + _get_bias(city)
+                                    corrected_fcst = corrected_fcst - _get_bias(city)  # positive bias = NWS runs warm → subtract
                                 except Exception:
                                     pass
 
@@ -1275,8 +1419,189 @@ def _city_local_date(city: str):
     return datetime.now(timezone.utc).date()
 
 
+def check_topups(
+    client:         KalshiClient,
+    paper:          bool  = False,
+    live_positions: list  = None,
+    balance:        float = 0.0,
+    deployable:     float = 0.0,
+) -> int:
+    """
+    Top-up open No positions where the Yes price has stayed low through the day.
+
+    Fires once per position per session during the 13:00-15:00 local window.
+    Adds TOPUP_MAX_CONTRACTS extra contracts when the maximum Yes price seen
+    during the window is <= YES_TOPUP_MAX (0.30).
+
+    Backtest (Apr 6-23, 18 days):
+      yes<=0.30 + 2c topup: 98.6% WR, +$67.91 additional PnL over base
+      Improves every day the window is active. No bad days added.
+
+    Returns number of top-up orders placed.
+    """
+    if live_positions is None:
+        try:
+            live_positions = sync_from_kalshi(client)
+        except Exception as e:
+            log.error("check_topups: could not fetch positions: %s", e)
+            return 0
+
+    if not live_positions:
+        return 0
+
+    # Filter to No positions only — top-up logic is No-specific
+    no_positions = [p for p in live_positions if p.get("side", "").lower() == "no"]
+    if not no_positions:
+        return 0
+
+    # Fetch live prices for all open tickers
+    tickers = [p["ticker"] for p in no_positions]
+    prices  = {}
+    try:
+        resp = requests.get(
+            "https://api.elections.kalshi.com/trade-api/v2/markets",
+            params={"tickers": ",".join(tickers)},
+            timeout=15,
+        ).json()
+        for m in resp.get("markets", []):
+            yes_bid = float(m.get("yes_bid_dollars") or 0)
+            no_bid  = float(m.get("no_bid_dollars")  or 0)
+            if yes_bid > 0 and no_bid == 0:
+                no_bid = round(1.0 - yes_bid, 4)
+            elif no_bid > 0 and yes_bid == 0:
+                yes_bid = round(1.0 - no_bid, 4)
+            prices[m["ticker"]] = {"yes": yes_bid, "no": no_bid,
+                                   "status": m.get("status", "active")}
+    except Exception as e:
+        log.warning("check_topups: price fetch failed: %s", e)
+        return 0
+
+    executed = 0
+    deployed_topup = 0.0
+
+    for pos in no_positions:
+        ticker    = pos["ticker"]
+        city      = pos.get("city") or _ticker_city(ticker)
+        if not city:
+            continue
+
+        # Local hour gate
+        local_hour = _local_hour(city)
+        if not (TOPUP_HOUR_START <= local_hour <= TOPUP_HOUR_END):
+            continue
+
+        # Already topped up this session
+        if ticker in _topup_done:
+            continue
+
+        # Market must still be active
+        mkt = prices.get(ticker, {})
+        if mkt.get("status", "active") != "active":
+            continue
+
+        curr_yes = mkt.get("yes", 1.0)
+        curr_no  = mkt.get("no",  0.0)
+
+        # Update Yes peak for this ticker
+        prev_peak = _yes_peaks.get(ticker, 0.0)
+        _yes_peaks[ticker] = max(prev_peak, curr_yes)
+
+        # Yes must have stayed low throughout the window
+        if _yes_peaks[ticker] > YES_TOPUP_MAX:
+            continue
+
+        # No price must still be in a sensible range
+        if curr_no > NO_TOPUP_MAX_PRICE or curr_no <= 0.0:
+            continue
+
+        # Headroom check — don't exceed overall contract cap
+        held     = pos.get("contracts", 0)
+        max_held = decision_engine.MAX_CONTRACTS   # HIGH market cap (3); LOWT positions filtered by timing gate
+        headroom = max_held - held
+        if headroom <= 0:
+            log.debug("TOPUP skip %s — no headroom (%d/%d)", ticker, held, max_held)
+            continue
+
+        contracts = min(TOPUP_MAX_CONTRACTS, headroom)
+        cost      = round(curr_no * contracts, 4)
+
+        # Capital gate — draw from topup allocation
+        cap = get_engine_capital()
+        if not cap.can_deploy("topup", cost):
+            log.debug("TOPUP skip %s — topup budget exhausted (cost=$%.2f)",
+                      ticker, cost)
+            continue
+
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        log.info("[%s] TOPUP  %s  +%dc @ $%.2f  "
+                 "(max_yes_seen=%.2f  held=%d→%d)",
+                 ts, ticker, contracts, curr_no,
+                 _yes_peaks[ticker], held, held + contracts)
+
+        if not paper:
+            try:
+                place_order(
+                    client        = client,
+                    ticker        = ticker,
+                    side          = "no",
+                    price_dollars = curr_no,
+                    contracts     = contracts,
+                    paper         = False,
+                )
+                _topup_done.add(ticker)
+                cap.record("topup", cost)
+                executed += 1
+                _append_trade_log({
+                    "ticker":       ticker,
+                    "city":         city,
+                    "side":         "no",
+                    "market_type":  "high",
+                    "score":        0,
+                    "score_detail": ["topup_yes_low"],
+                    "entry_price":  curr_no,
+                    "contracts":    contracts,
+                    "placed_at":    datetime.now(timezone.utc).isoformat(),
+                    "paper":        False,
+                    "entry_tier":   "topup",
+                })
+            except Exception as e:
+                log.error("TOPUP order failed  %s: %s", ticker, e)
+        else:
+            log.info("  [PAPER] would top up %s +%dc @ $%.2f", ticker, contracts, curr_no)
+            _topup_done.add(ticker)
+            executed += 1
+
+    if executed:
+        log.info("TOPUP: %d top-up order(s) placed  ($%.2f deployed)", executed, deployed_topup)
+    return deployed_topup
+
+
+def _ticker_city(ticker: str) -> str | None:
+    """Derive city name from ticker using SERIES_TO_CITY map."""
+    try:
+        from cities import SERIES_TO_CITY
+        return SERIES_TO_CITY.get(ticker.split("-")[0])
+    except Exception:
+        return None
+
+
+def _local_hour(city: str) -> int:
+    """Return current local hour for a city."""
+    try:
+        from cities import CITIES
+        from zoneinfo import ZoneInfo
+        tz_name = CITIES.get(city, {}).get("tz")
+        if tz_name:
+            return datetime.now(ZoneInfo(tz_name)).hour
+    except Exception:
+        pass
+    return datetime.now(timezone.utc).hour
+
+
+
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
+    global _deployed_today   # module-level tracker; += requires explicit global declaration
     # ── HIGH markets ─────────────────────────────────────────────────────────
     # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
     # to avoid a second full NWS sweep (60 API calls) each poll cycle.
@@ -1310,19 +1635,29 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
         live_positions = sync_from_kalshi(client)
         # Track contracts held per ticker (for per-bracket headroom check)
         open_contracts = {p["ticker"]: p["contracts"] for p in live_positions}
-        # Track positions held per city (for MAX_NO_PER_CITY gate)
+        # Track positions held per city, split by market type so HIGH and LOWT
+        # positions don't consume each other's per-city cap.
         from cities import SERIES_TO_CITY as _SERIES_TO_CITY
-        held_per_city: dict[str, int] = {}
+        held_high_per_city: dict[str, int] = {}
+        held_lowt_per_city: dict[str, int] = {}
         for ticker in open_contracts:
             city_name = _SERIES_TO_CITY.get(ticker.split("-")[0])
             if city_name:
-                held_per_city[city_name] = held_per_city.get(city_name, 0) + 1
+                if "LOWT" in ticker:
+                    held_lowt_per_city[city_name] = held_lowt_per_city.get(city_name, 0) + 1
+                else:
+                    held_high_per_city[city_name] = held_high_per_city.get(city_name, 0) + 1
     except Exception:
-        open_contracts = {}
-        held_per_city  = {}
+        open_contracts     = {}
+        held_high_per_city = {}
+        held_lowt_per_city = {}
 
     executed = 0
     deployed = 0.0
+
+    # Initialise engine capital with live balance
+    cap = EngineCapital(balance=balance)
+    log.info("EngineCapital: %s", cap.summary())
 
     for ev in evaluations:
         city    = ev["city"]
@@ -1339,18 +1674,19 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 log.debug("skip %s — cooldown", ticker)
                 continue
 
-            # Per-city cap: skip if already at MAX_NO_PER_CITY across all brackets.
-            # Uses decision_engine.MAX_NO_PER_CITY (positions per city) — NOT
-            # signal["max_contracts"] which is contracts per position.
-            city_held = held_per_city.get(city, 0)
-            if city_held >= decision_engine.MAX_NO_PER_CITY:
+            # Determine market type for this signal — drives city cap and counter
+            is_lowt_signal = signal.get("market_type", "high") == "lowt"
+            held_city_map  = held_lowt_per_city if is_lowt_signal else held_high_per_city
+            max_per_city   = (lowt_decision_engine.MAX_NO_PER_CITY if is_lowt_signal
+                              else decision_engine.MAX_NO_PER_CITY)
+
+            # Per-city cap: separate limits for HIGH and LOWT so one type
+            # doesn't consume the other's budget.
+            city_held = held_city_map.get(city, 0)
+            if city_held >= max_per_city:
                 log.debug("skip %s — %s already at MAX_NO_PER_CITY (%d/%d)",
-                          ticker, city, city_held, decision_engine.MAX_NO_PER_CITY)
+                          ticker, city, city_held, max_per_city)
                 continue
-            contracts = contracts_for_signal(signal)
-            side      = signal["trade_type"].lower()
-            price     = signal["entry_price"]
-            ticker    = signal["ticker"]
 
             held      = open_contracts.get(ticker, 0)
             max_contr = signal.get("max_contracts", 2)
@@ -1373,24 +1709,15 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             cost = price * contracts
 
-            # Cascade signals draw from the cascade reserve;
-            # main engine signals draw from the main deployable budget
-            is_cascade = signal.get("entry_tier", "").startswith("cascade")
-            if is_cascade:
-                if balance - cost < cascade_reserve:
-                    log.debug("skip %s — cascade reserve would be breached "
-                              "(balance=$%.2f  cost=$%.2f  reserve=$%.2f)",
-                              ticker, balance, cost, cascade_reserve)
-                    continue
-            else:
-                if deployed + cost > deployable:
-                    log.debug("skip %s — would exceed deployable cap "
-                              "(deployed=$%.2f + cost=$%.2f > $%.2f)",
-                              ticker, deployed, cost, deployable)
-                    continue
+            # Engine capital check — proportional allocation
+            tier = signal.get("entry_tier", "")
+            engine_key = "cascade" if tier.startswith("cascade") else "main"
+            if not cap.can_deploy(engine_key, cost):
+                log.debug("skip %s — %s budget exhausted (cost=$%.2f)",
+                          ticker, engine_key, cost)
+                continue
 
             log.info("SIGNAL  %s  %s", city, ticker)
-            tier = signal.get("entry_tier", "")
             if tier.startswith("cascade"):
                 detail = signal.get("trigger_info") or tier
             else:
@@ -1411,8 +1738,10 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     paper         = paper,
                 )
                 open_contracts[ticker] = open_contracts.get(ticker, 0) + contracts
-                held_per_city[city]    = held_per_city.get(city, 0) + 1
+                held_city_map[city]    = held_city_map.get(city, 0) + 1
+                cap.record(engine_key, cost)
                 deployed += cost
+                _deployed_today += cost
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,
@@ -1425,12 +1754,31 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                     "contracts":    contracts,
                     "placed_at":    datetime.now(timezone.utc).isoformat(),
                     "paper":        paper,
+                    "entry_tier":   signal.get("entry_tier", ""),
                 })
 
             except Exception as e:
                 log.error("order failed  %s: %s", ticker, e)
 
     log.info("%d order(s) placed", executed)
+
+    # ── Top-up pass ──────────────────────────────────────────────────────────
+    # After placing new entries, re-fetch positions and run the top-up check.
+    # Top-ups are gated to 13:00-15:00 local and only fire once per ticker.
+    try:
+        # Re-sync positions (new entries may have been added above)
+        live_positions_post = sync_from_kalshi(client)
+        topup_deployed = check_topups(
+            client         = client,
+            paper          = paper,
+            live_positions = live_positions_post,
+            balance        = balance,
+            deployable     = deployable,
+        )
+        _deployed_today += topup_deployed   # keep budget tracker current across poll cycles
+    except Exception as e:
+        log.warning("top-up check error (non-fatal): %s", e)
+
     return evaluations
 
 
