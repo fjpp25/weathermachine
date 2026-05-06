@@ -195,7 +195,6 @@ def run(kalshi_results: dict, city_filter: str = None,
     try:
         lowt_cascade = cascade_engine.run_lowt(kalshi_results, city_filter)
         evaluations.extend(lowt_cascade)
-        cascade_engine.display(lowt_cascade)
     except Exception as e:
         log.warning("LOWT cascade error (non-fatal): %s", e)
     return evaluations

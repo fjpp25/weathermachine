@@ -93,7 +93,7 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012839",
         "high_series":      "KXHIGHMIA",
         "lowt_series":      "KXLOWTMIA",
-        "trading_high":  True ,
+        "trading_high":  False ,
         "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@13:00, no forecast instability
@@ -111,7 +111,7 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013904",
         "high_series":      "KXHIGHAUS",
         "lowt_series":      "KXLOWTAUS",
-        "trading_high":  True ,
+        "trading_high":  False ,
         "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 9,           # 3 days: conv@17:00, overnight instability clears by 09:00
@@ -129,7 +129,7 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023174",
         "high_series":      "KXHIGHLAX",
         "lowt_series":      "KXLOWTLAX",
-        "trading_high":  True ,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
+        "trading_high":  False ,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
         "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 4 days: conv@12:00, best signal quality in dataset
@@ -279,7 +279,7 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023183",
         "high_series":      "KXHIGHTPHX",
         "lowt_series":      "KXLOWTPHX",
-        "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  False ,        # ENABLED: 50% conv, 2 days — cautious
         "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": 10,          # 2 days: conv@14:00, non-conv risk

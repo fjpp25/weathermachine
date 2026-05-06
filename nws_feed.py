@@ -455,8 +455,87 @@ def fmt(val) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Forecast shift tracker
 # ---------------------------------------------------------------------------
+
+class ForecastShiftTracker:
+    """
+    Tracks per-city NWS forecast changes across polls and emits a delta
+    when a significant shift is detected.
+
+    Usage (called once per poll per city, after nws_feed.snapshot()):
+
+        tracker = ForecastShiftTracker()   # module-level singleton
+
+        nws = nws_feed.snapshot()
+        for city, data in nws.items():
+            high_shift = tracker.update_high(city, data.get("forecast_high_f"))
+            low_shift  = tracker.update_low(city,  data.get("forecast_low_f"))
+            # high_shift is None (no change) or a negative/positive float (delta)
+
+    State resets at midnight UTC so stale deltas don't bleed across days.
+    """
+
+    HIGH_THRESHOLD = 1.5   # °F — minimum drop to trigger a HIGH signal
+    LOW_THRESHOLD  = 1.5   # °F — minimum rise to trigger a LOWT signal
+
+    def __init__(self) -> None:
+        self._high:  dict[str, float] = {}   # city → last forecast_high_f
+        self._low:   dict[str, float] = {}   # city → last forecast_low_f
+        self._reset_date: str | None  = None
+
+    def _maybe_reset(self) -> None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self._reset_date != today:
+            self._high.clear()
+            self._low.clear()
+            self._reset_date = today
+
+    def update_high(self, city: str, forecast: float | None) -> float | None:
+        """
+        Record the latest HIGH forecast for a city.
+        Returns the delta (negative = forecast dropped) if the absolute
+        change meets HIGH_THRESHOLD, otherwise None.
+        """
+        self._maybe_reset()
+        if forecast is None:
+            return None
+        prev = self._high.get(city)
+        self._high[city] = forecast
+        if prev is None:
+            return None
+        delta = forecast - prev
+        return delta if abs(delta) >= self.HIGH_THRESHOLD else None
+
+    def update_low(self, city: str, forecast: float | None) -> float | None:
+        """
+        Record the latest LOWT forecast for a city.
+        Returns the delta if the absolute change meets LOW_THRESHOLD.
+        """
+        self._maybe_reset()
+        if forecast is None:
+            return None
+        prev = self._low.get(city)
+        self._low[city] = forecast
+        if prev is None:
+            return None
+        delta = forecast - prev
+        return delta if abs(delta) >= self.LOW_THRESHOLD else None
+
+    def last_high(self, city: str) -> float | None:
+        """Return the most recently recorded HIGH forecast for a city."""
+        return self._high.get(city)
+
+    def last_low(self, city: str) -> float | None:
+        """Return the most recently recorded LOWT forecast for a city."""
+        return self._low.get(city)
+
+
+# Module-level singleton — imported by decision engines and tomorrow_scanner
+forecast_shift_tracker = ForecastShiftTracker()
+
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NWS live feed for Kalshi settlement stations")

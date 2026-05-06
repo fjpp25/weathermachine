@@ -263,7 +263,8 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
         next_date = _active_next_date[city]
         sig_key   = (city, next_date)
         if sig_key in _fired_signals:
-            continue
+            # Directional signal already fired — still check gradient/dismissed
+            pass
 
         # ── Fetch and evaluate next market ────────────────────────────────
         markets = _fetch_markets(client, series, next_date)
@@ -284,31 +285,232 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
 
         t_low       = T_markets[0]
         t_high      = T_markets[-1]
-        b_adj_low   = B_markets[0]    # adjacent to t_low
-        b_adj_high  = B_markets[-1]   # adjacent to t_high
+        b_adj_low   = B_markets[0]
+        b_adj_high  = B_markets[-1]
 
-        signal = _check_signal(t_low, t_high, b_adj_low, b_adj_high)
+        # ── Forecast shift detection ───────────────────────────────────────
+        # Update the tracker with tomorrow's NWS forecast (passed through
+        # from the main pipeline via nws_results if available, otherwise
+        # inferred from T bracket values as a proxy).
+        # When the forecast drops significantly, run the dismissed/gradient
+        # scan immediately — brackets may be mispriced before the market
+        # catches up to the updated model run.
+        _forecast_shift = None
+        try:
+            from nws_feed import forecast_shift_tracker as _fst
+            import nws_feed as _nws
+            _tmr_nws = _nws.snapshot(city_filter=city)
+            _tmr_fcst = (_tmr_nws.get(city) or {}).get("forecast_high_f")
+            _forecast_shift = _fst.update_high(f"{city}_tomorrow", _tmr_fcst)
+            if _forecast_shift is not None and _forecast_shift <= -1.5:
+                from log_setup import get_logger as _gl
+                _gl("tomorrow_scanner").info(
+                    "FORECAST_SHIFT_TMR  %s  %s  Δ%+.1f°F — "
+                    "scanning tomorrow brackets immediately",
+                    city, next_date, _forecast_shift,
+                )
+        except Exception:
+            pass
 
-        if signal:
-            trigger_t, adj_b, t_no, b_no = signal
-            print(
-                f"\n  ★ SIGNAL [{city}] {next_date} | "
-                f"{trigger_t['bracket']} No={t_no:.2f}  "
-                f"adj-B {adj_b['bracket']} No={b_no:.2f}"
+        if sig_key not in _fired_signals:
+            signal = _check_signal(t_low, t_high, b_adj_low, b_adj_high)
+
+            if signal:
+                trigger_t, adj_b, t_no, b_no = signal
+                print(
+                    f"\n  ★ SIGNAL [{city}] {next_date} | "
+                    f"{trigger_t['bracket']} No={t_no:.2f}  "
+                    f"adj-B {adj_b['bracket']} No={b_no:.2f}"
+                )
+                on_signal(
+                    client    = client,
+                    city      = city,
+                    sig_key   = sig_key,
+                    trigger_t = trigger_t,
+                    adj_b     = adj_b,
+                    paper     = paper,
+                )
+
+        # ── Dismissed-T signal ─────────────────────────────────────────────
+        # Fires on T brackets where Yes is already very low but No hasn't
+        # yet reached fair value. Independent of the directional signal.
+        if len(T_markets) >= 2:
+            dismissed = _check_dismissed_signal(
+                t_low  = T_markets[0],
+                t_high = T_markets[-1],
+                city   = city,
             )
-            _fired_signals.add(sig_key)
-            on_signal(
-                client    = client,
-                city      = city,
-                trigger_t = trigger_t,
-                adj_b     = adj_b,
-                paper     = paper,
+            if dismissed:
+                d_ticker   = dismissed.get("ticker", "")
+                d_no_price = float(dismissed.get("no_price", 0.0) or 0.0)
+                from log_setup import get_logger as _gl
+                _gl("tomorrow_scanner").info(
+                    "  ★ DISMISSED_T [%s] %s | %s  Yes=%.2f  No=%.2f",
+                    city, next_date, dismissed.get("bracket", ""),
+                    float(dismissed.get("yes_price", 0.0) or 0.0), d_no_price,
+                )
+                on_dismissed_signal(
+                    client   = client, city  = city,
+                    ticker   = d_ticker, no_price = d_no_price, paper = paper,
+                )
+
+        # ── Gradient open signal ───────────────────────────────────────────
+        # Scans all B+T brackets for a directional lean at market open.
+        # Also fires when a forecast shift makes upper brackets mispriced.
+        all_markets = T_markets + B_markets
+        gradient_candidates = _check_gradient_signal(all_markets, city)
+
+        # On a significant forecast shift, also consider brackets up to
+        # YES_DISMISSED * 3 (looser gate) — the market may not have moved yet
+        if _forecast_shift is not None and _forecast_shift <= -1.5 and not gradient_candidates:
+            gradient_candidates = _check_gradient_signal(
+                all_markets, city, yes_override=YES_DISMISSED * 3
+            )
+            if gradient_candidates:
+                from log_setup import get_logger as _gl
+                _gl("tomorrow_scanner").info(
+                    "  ★ GRADIENT_SHIFT [%s] %s | Δ%+.1f°F → %d bracket(s)",
+                    city, next_date, _forecast_shift, len(gradient_candidates),
+                )
+
+        if gradient_candidates:
+            from log_setup import get_logger as _gl
+            _gl("tomorrow_scanner").info(
+                "  ★ GRADIENT_OPEN [%s] %s | %d bracket(s) qualify",
+                city, next_date, len(gradient_candidates),
+            )
+        for bracket in gradient_candidates:
+            g_ticker   = bracket.get("ticker", "")
+            g_no_price = float(bracket.get("no_price", 0.0) or 0.0)
+            on_dismissed_signal(
+                client   = client, city  = city,
+                ticker   = g_ticker, no_price = g_no_price, paper = paper,
             )
 
 
 # ---------------------------------------------------------------------------
-# Signal logic
+# Signal parameters and helper functions
 # ---------------------------------------------------------------------------
+
+YES_DISMISSED         = 0.07
+YES_DISMISSED_T_OTHER = 0.10
+DISMISSED_NO_MIN      = 0.75
+DISMISSED_NO_MAX      = 0.92
+DISMISSED_HOUR_MAX    = 18
+OPEN_LEAN_MIN         = 0.10
+
+_bracket_entered: set[str] = set()
+
+
+def _check_dismissed_signal(t_low: dict, t_high: dict, city: str) -> Optional[dict]:
+    from zoneinfo import ZoneInfo
+    local_hour = datetime.now(ZoneInfo(
+        (_CITY_REGISTRY.get(city) or {}).get("tz", "UTC")
+    )).hour
+    if local_hour >= DISMISSED_HOUR_MAX:
+        return None
+    for dismissed, other in [(t_low, t_high), (t_high, t_low)]:
+        yes_p     = float(dismissed.get("yes_price", 1.0) or 1.0)
+        no_p      = float(dismissed.get("no_price",  0.0) or 0.0)
+        other_yes = float(other.get("yes_price", 1.0) or 1.0)
+        if (yes_p <= YES_DISMISSED
+                and DISMISSED_NO_MIN <= no_p < DISMISSED_NO_MAX
+                and other_yes >= YES_DISMISSED_T_OTHER):
+            return dismissed
+    return None
+
+
+def _check_gradient_signal(
+    all_brackets: list[dict],
+    city: str,
+    yes_override: float | None = None,
+) -> list[dict]:
+    from zoneinfo import ZoneInfo
+    local_hour = datetime.now(ZoneInfo(
+        (_CITY_REGISTRY.get(city) or {}).get("tz", "UTC")
+    )).hour
+    if local_hour >= DISMISSED_HOUR_MAX:
+        return []
+
+    def floor_of(b: dict) -> Optional[float]:
+        s = b.get("bracket", "")
+        try: return float(s[1:]) if s else None
+        except (ValueError, IndexError): return None
+
+    sortable = [(floor_of(b), b) for b in all_brackets]
+    sortable = [(f, b) for f, b in sortable if f is not None]
+    if len(sortable) < 6:
+        return []
+    sortable.sort(key=lambda x: x[0])
+    sorted_b = [b for _, b in sortable]
+    bottom3, top3 = sorted_b[:3], sorted_b[-3:]
+
+    def avg_yes(brackets):
+        vals = [float(b.get("yes_price", 0.0) or 0.0) for b in brackets]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    lean     = avg_yes(bottom3) - avg_yes(top3)
+    lean_abs = abs(lean)
+    if lean_abs < OPEN_LEAN_MIN:
+        return []
+
+    far_end  = top3 if lean > 0 else bottom3
+    yes_gate = yes_override if yes_override is not None else YES_DISMISSED
+    return [
+        b for b in far_end
+        if float(b.get("yes_price", 1.0) or 1.0) <= yes_gate
+        and DISMISSED_NO_MIN <= float(b.get("no_price", 0.0) or 0.0) < DISMISSED_NO_MAX
+    ]
+
+
+def on_dismissed_signal(
+    client, city: str, ticker: str, no_price: float, paper: bool = False,
+) -> None:
+    import trader as _trader
+    from log_setup import get_logger
+    _log = get_logger("tomorrow_scanner")
+
+    if ticker in _bracket_entered:
+        return
+
+    cost = round(no_price * TOMORROW_CONTRACTS, 4)
+    try:
+        deployable = _trader.get_tomorrow_deployable(ticker)
+        if deployable < cost:
+            _log.debug("TOMORROW_DIS skip %s %s — budget exhausted", city, ticker)
+            return
+    except Exception as e:
+        _log.warning("TOMORROW_DIS capital check failed: %s", e)
+        return
+
+    tag = "[PAPER] " if paper else ""
+    _log.info("%sTOMORROW_DIS  %s  %s  No=%.2f  %dc",
+              tag, city, ticker, no_price, TOMORROW_CONTRACTS)
+
+    if not paper:
+        try:
+            import datetime as _dt
+            _trader.place_order(
+                client=client, ticker=ticker, side="no",
+                price_dollars=no_price, contracts=TOMORROW_CONTRACTS, paper=False,
+            )
+            _trader._append_trade_log({
+                "ticker": ticker, "city": city, "side": "no",
+                "market_type": "high", "score": 5,
+                "score_detail": ["tomorrow_open_signal", f"no_price={no_price:.2f}"],
+                "entry_price": no_price, "contracts": TOMORROW_CONTRACTS,
+                "placed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "paper": False, "entry_tier": "tomorrow_dismissed",
+            })
+            _trader.record_tomorrow_deployed(cost, ticker)
+            _bracket_entered.add(ticker)
+        except Exception as e:
+            _log.error("TOMORROW_DIS order failed %s: %s", ticker, e)
+    else:
+        _log.info("  [PAPER] would place No %dc @ $%.2f on %s",
+                  TOMORROW_CONTRACTS, no_price, ticker)
+        _bracket_entered.add(ticker)
+
 
 def _check_signal(
     t_low: dict, t_high: dict,
@@ -340,6 +542,7 @@ def _check_signal(
 def on_signal(
     client,
     city:      str,
+    sig_key:   tuple,
     trigger_t: dict,
     adj_b:     dict,
     paper:     bool = False,
@@ -349,16 +552,21 @@ def on_signal(
       - The trigger T bracket (strong directional confirmation)
       - The adjacent B bracket (complementary range bet)
 
-    Capital is drawn from TOMORROW_RESERVE in trader.py. Positions are
-    held overnight and managed by check_exits() on their settlement date.
-    The date guard in check_exits() ensures today's NWS data does not
-    incorrectly trigger an exit on a future-dated position.
+    _fired_signals is only marked after at least one order succeeds.
+    If both orders fail (API error, price moved), the signal is not
+    marked fired and will be retried on the next poll cycle.
+
+    Capital is drawn from the session-scoped tomorrow budget in trader.py.
+    Positions are held overnight and managed by check_exits() on their
+    settlement date. The date guard in check_exits() ensures today's NWS
+    data does not incorrectly trigger an exit on a future-dated position.
     """
     import trader as _trader
     from log_setup import get_logger
     _log = get_logger("tomorrow_scanner")
 
     tag = "[PAPER] " if paper else ""
+    orders_placed = 0
 
     for bracket_dict, label in [(trigger_t, "T-trigger"), (adj_b, "adj-B")]:
         ticker   = bracket_dict["ticker"]
@@ -369,13 +577,14 @@ def on_signal(
                       city, ticker, no_price)
             continue
 
-        # Capital check against tomorrow allocation
+        # Capital check against session-scoped tomorrow budget
         cost = round(no_price * TOMORROW_CONTRACTS, 4)
         try:
-            from trader import EngineCapital as _EC, get_balance as _gb
-            _cap = _EC(balance=_gb(client))
-            if not _cap.can_deploy("tomorrow", cost):
-                _log.debug("TOMORROW skip %s %s — tomorrow budget exhausted", city, ticker)
+            deployable = _trader.get_tomorrow_deployable()
+            if deployable < cost:
+                _log.debug("TOMORROW skip %s %s — tomorrow budget exhausted "
+                           "(cost=$%.2f  remaining=$%.2f)",
+                           city, ticker, cost, deployable)
                 continue
         except Exception as e:
             _log.warning("TOMORROW capital check failed: %s — skipping %s", e, ticker)
@@ -408,14 +617,21 @@ def on_signal(
                     "paper":        False,
                     "entry_tier":   "tomorrow",
                 })
+                _trader.record_tomorrow_deployed(cost)
+                orders_placed += 1
             except Exception as e:
                 _log.error("TOMORROW order failed %s: %s", ticker, e)
-            else:
-                try:
-                    from trader import get_engine_capital as _gec
-                    _gec().record("tomorrow", cost)
-                except Exception:
-                    pass
         else:
             _log.info("  [PAPER] would place No %dc @ $%.2f on %s",
                       TOMORROW_CONTRACTS, no_price, ticker)
+            orders_placed += 1
+
+    # Only mark the signal as fired once at least one order succeeded.
+    # This allows a retry on the next poll if both orders failed.
+    if orders_placed > 0:
+        _fired_signals.add(sig_key)
+        _log.debug("TOMORROW signal fired: %s → marked as done (%d order(s))",
+                   sig_key, orders_placed)
+    else:
+        _log.warning("TOMORROW signal for %s produced no orders — will retry next poll",
+                     city)

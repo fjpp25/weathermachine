@@ -38,6 +38,7 @@ import trader
 import hight_decision_engine as decision_engine
 import tomorrow_scanner
 import peak_scanner
+import last_bracket
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
@@ -129,6 +130,7 @@ def run_scheduler(
         log.warning("scanner init error (non-fatal): %s", e)
 
     peak_scanner.log_config()
+    last_bracket.log_config()
 
     poll_count = 0
 
@@ -165,11 +167,18 @@ def run_scheduler(
             peak_scanner.run_scan(client=client, city_filter=city_filter, paper=paper)
             log.debug("[peak_scan] done  (%.1fs)", time.monotonic() - t0)
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        def _run_last_bracket():
+            t0 = time.monotonic()
+            log.debug("[last_bracket] starting")
+            last_bracket.run_scan(client=client, city_filter=city_filter, paper=paper)
+            log.debug("[last_bracket] done  (%.1fs)", time.monotonic() - t0)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {
-                pool.submit(_run_pipeline): "pipeline",
-                pool.submit(_run_scan):     "next_market_scan",
-                pool.submit(_run_peak):     "peak_scan",
+                pool.submit(_run_pipeline):      "pipeline",
+                pool.submit(_run_scan):          "next_market_scan",
+                pool.submit(_run_peak):          "peak_scan",
+                pool.submit(_run_last_bracket):  "last_bracket",
             }
             for fut in as_completed(futures):
                 name = futures[fut]

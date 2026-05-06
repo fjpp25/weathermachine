@@ -53,6 +53,7 @@ except ImportError:
 
 import hight_decision_engine as decision_engine
 import lowt_decision_engine
+import kalshi_scanner
 
 from log_setup import get_logger
 log = get_logger(__name__)
@@ -777,8 +778,12 @@ YES_TOPUP_MAX       = 0.30   # max Yes price seen during window to qualify
 TOPUP_MAX_CONTRACTS = 3      # additional contracts per top-up signal
 NO_TOPUP_MAX_PRICE  = 0.91   # don't top up if No has drifted above this
 
-NO_YES_CEILING      = 0.60   # Yes must reach 0.60 before we consider exiting
-NO_YES_CEILING_HOUR = 15     # Yes ceiling only fires at/after this local hour
+NO_YES_CEILING      = 0.60   # retained for reference — ceiling exit DISABLED (see check_exits)
+NO_YES_CEILING_HOUR = 15     # retained for reference
+
+# If Yes is at or above this price the market has effectively closed — no
+# No-side liquidity. Skip exit attempts to avoid spamming unfillable orders.
+YES_MARKET_CLOSED   = 0.97
 
 # NO position: forecast anchor
 # For HIGH: exit if observed high is within this many °F of the bracket floor.
@@ -825,8 +830,10 @@ from datetime import date as _date
 
 _day_open_balance: float      = 0.0
 _day_open_date:    _date|None = None
-_deployed_today:   float      = 0.0   # running sum of main-engine capital committed today;
-                                       # persists across poll cycles, reset at midnight
+_deployed_today:   float      = 0.0   # main engine    — persists across polls, resets midnight
+_deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
+_deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
+_deployed_tomorrow: float     = 0.0   # tomorrow scanner — persists across polls, resets midnight
 # ---------------------------------------------------------------------------
 # Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
@@ -848,26 +855,74 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     Refresh the daily snapshot if the date has changed.
     Returns (main_deployable, cascade_reserve) based on day-open balance.
 
-    main_deployable = day_open * MAIN_BUDGET_PCT - _deployed_today
-
-    _deployed_today tracks capital committed by the main engine this session
-    and is reset at midnight. Unlike the old balance-diff proxy, it is not
-    disturbed by winning settlements that increase current_balance mid-day.
+    All per-engine _deployed_* trackers reset at midnight so budgets are
+    based on day-open balance — not disturbed by intraday winning settlements.
     """
-    global _day_open_balance, _day_open_date, _deployed_today
+    global _day_open_balance, _day_open_date, _deployed_today, \
+           _deployed_cascade, _deployed_peak, _deployed_tomorrow
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
-        _day_open_balance = current_balance
-        _day_open_date    = today
-        _deployed_today   = 0.0
-        log.info("day snapshot: $%.2f  (main_budget=$%.2f  cascade_reserve=$%.2f)",
-                 current_balance,
-                 round(current_balance * MAIN_BUDGET_PCT, 2),
-                 CASCADE_RESERVE)
+        _day_open_balance   = current_balance
+        _day_open_date      = today
+        _deployed_today     = 0.0
+        _deployed_cascade   = 0.0
+        _deployed_peak      = 0.0
+        _deployed_tomorrow  = 0.0
+        log.info(
+            "day snapshot: $%.2f  "
+            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f)",
+            current_balance,
+            round(current_balance * ENGINE_ALLOCATIONS["main"],     2),
+            round(current_balance * ENGINE_ALLOCATIONS["cascade"],  2),
+            round(current_balance * ENGINE_ALLOCATIONS["peak"],     2),
+            round(current_balance * ENGINE_ALLOCATIONS["tomorrow"], 2),
+        )
 
     main_budget     = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
     main_deployable = max(0.0, round(main_budget - _deployed_today, 2))
     return main_deployable, CASCADE_RESERVE
+
+
+def get_cascade_deployable() -> float:
+    """Remaining cascade budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["cascade"], 2)
+    return max(0.0, round(budget - _deployed_cascade, 2))
+
+
+def record_cascade_deployed(cost: float) -> None:
+    """Record capital deployed by the cascade engine."""
+    global _deployed_cascade
+    _deployed_cascade = round(_deployed_cascade + cost, 4)
+    log.debug("cascade deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_cascade, get_cascade_deployable())
+
+
+def get_peak_deployable() -> float:
+    """Remaining peak scanner budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["peak"], 2)
+    return max(0.0, round(budget - _deployed_peak, 2))
+
+
+def record_peak_deployed(cost: float) -> None:
+    """Record capital deployed by the peak scanner."""
+    global _deployed_peak
+    _deployed_peak = round(_deployed_peak + cost, 4)
+    log.debug("peak deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_peak, get_peak_deployable())
+
+
+def get_tomorrow_deployable() -> float:
+    """Remaining tomorrow scanner budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["tomorrow"], 2)
+    return max(0.0, round(budget - _deployed_tomorrow, 2))
+
+
+def record_tomorrow_deployed(cost: float) -> None:
+    """Record capital deployed by the tomorrow scanner."""
+    global _deployed_tomorrow
+    _deployed_tomorrow = round(_deployed_tomorrow + cost, 4)
+    log.debug("tomorrow deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_tomorrow, get_tomorrow_deployable())
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -1180,6 +1235,15 @@ def check_exits(
         if status not in ("active", "initialized"):
             continue
 
+        # If Yes is at or near certainty the market has no No-side liquidity.
+        # Stop firing sell orders that will never fill.
+        if yes_price >= YES_MARKET_CLOSED:
+            log.debug(
+                "SKIP_EXIT  %s  yes=%.2f >= %.2f — market closed, no exit liquidity",
+                ticker, yes_price, YES_MARKET_CLOSED,
+            )
+            continue
+
         exit_reason = None
         exit_price  = None
 
@@ -1200,147 +1264,30 @@ def check_exits(
             # ── Settlement hold override ───────────────────────────────────
             # If it's late AND the observed value is well clear of the
             # dangerous boundary, suppress all exits and hold to settlement.
-            # This is a `continue` guard — if it fires, nothing below runs.
-            # If it doesn't fire (obs not clear enough), all checks below
-            # still run normally regardless of the hour.
             if local_hour >= SETTLEMENT_HOLD_HOUR and obs_val is not None:
                 if not is_lowt and floor is not None:
-                    # HIGH B bracket: safe if obs_high well below bracket floor
                     if (floor - obs_val) >= SETTLEMENT_CLEAR_BUFFER:
-                        log.debug("HOLD_SETTLE  %s  " +
-                              f"obs_high={obs_val}°F is "
-                              f"{floor - obs_val:.1f}°F below bracket floor {floor}°F  "
-                              f"(local={local_hour}h)")
+                        log.debug("HOLD_SETTLE  %s  obs_high=%.1f°F is %.1f°F below floor %.1f°F",
+                                  ticker, obs_val, floor - obs_val, floor)
                         continue
                 elif not is_lowt and floor is None and ceiling is not None:
-                    # HIGH bottom T: safe if obs_high well above ceiling
-                    # (temp already exceeded the "below X" threshold → bracket dead)
                     if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
-                        log.debug("HOLD_SETTLE  %s  " +
-                              f"obs_high={obs_val}°F is "
-                              f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
-                              f"(local={local_hour}h)")
+                        log.debug("HOLD_SETTLE  %s  obs_high=%.1f°F is %.1f°F above ceiling %.1f°F",
+                                  ticker, obs_val, obs_val - ceiling, ceiling)
                         continue
                 elif is_lowt and ceiling is not None:
-                    # LOWT: safe if obs_low well above bracket ceiling
                     if (obs_val - ceiling) >= SETTLEMENT_CLEAR_BUFFER:
-                        log.debug("HOLD_SETTLE  %s  " +
-                              f"obs_low={obs_val}°F is "
-                              f"{obs_val - ceiling:.1f}°F above bracket ceiling {ceiling}°F  "
-                              f"(local={local_hour}h)")
+                        log.debug("HOLD_SETTLE  %s  obs_low=%.1f°F is %.1f°F above ceiling %.1f°F",
+                                  ticker, obs_val, obs_val - ceiling, ceiling)
                         continue
 
-            # ── Probability ceiling (time-gated + forecast filter) ─────────
-            # Only fires after NO_YES_CEILING_HOUR local time.
-            # Additionally requires forecast to be within FORECAST_FLOOR_GAP_MAX
-            # of the bracket floor — if forecast is well clear, the Yes spike
-            # is almost certainly intraday noise that will revert by settlement.
-            if local_hour >= NO_YES_CEILING_HOUR and yes_price >= NO_YES_CEILING:
-                # Check forecast filter for B brackets
-                ceiling_bypass = False
-                if floor is not None:
-                    corrected_fcst = nws.get("forecast_high_f")
-                    if corrected_fcst is not None:
-                        try:
-                            from hight_decision_engine import _city_bias as _get_bias
-                            corrected_fcst = corrected_fcst - _get_bias(city)  # positive bias = NWS runs warm → subtract
-                        except Exception:
-                            pass
-                        fcst_floor_gap = corrected_fcst - floor
-                        if fcst_floor_gap > FORECAST_FLOOR_GAP_MAX:
-                            ceiling_bypass = True
-                            log.debug("YES_CEILING_BYPASS  %s  "
-                                      f"forecast {corrected_fcst:.1f}°F is {fcst_floor_gap:.1f}°F "
-                                      f"above floor {floor}°F — Yes spike is noise, holding")
-
-                if not ceiling_bypass:
-                    exit_reason = "yes_ceiling"
-                    exit_price  = no_price
-                    log.info("YES_CEILING  %s  YES=%.2f >= %.2f  hour=%d  "
-                             f"(entry NO=${avg_cost:.2f}  current NO=${no_price:.2f})",
-                             ticker, yes_price, NO_YES_CEILING, local_hour)
-
-            # ── Forecast anchor ────────────────────────────────────────────
-            # Only fires at or after ANCHOR_MIN_HOUR local time.
-            # Before the daily high has had a chance to establish (typically
-            # peaks 14:00–16:00 local), a small gap is normal temperature
-            # climbing and not a genuine danger signal.
-            #
-            # HIGH guard: only fire if obs_val < ceiling (bracket's upper edge).
-            # If obs_high is already above the cap, the bracket is physically
-            # eliminated — the day's high can't un-happen. Firing the anchor in
-            # that case causes false exits on winning positions (Denver bug).
-            # When obs >= cap, the settlement hold or normal expiry handles it.
-            if exit_reason is None and obs_val is not None and local_hour >= ANCHOR_MIN_HOUR \
-                    and yes_price >= ANCHOR_MIN_YES:
-                anchor_triggered = False
-                if not is_lowt and floor is not None:
-                    # HIGH: dangerous if observed high approaching bracket floor,
-                    # BUT only while obs hasn't yet cleared the bracket cap.
-                    _cap = ceiling if ceiling is not None else round(floor + 2.0, 1)
-                    if obs_val < _cap:
-                        gap = floor - obs_val
-                        if gap <= FORECAST_ANCHOR_BUFFER:
-                            # Two-sided forecast bypass:
-                            #
-                            # Case A — forecast BELOW floor (bracket above forecast):
-                            #   corrected_fcst < floor - buffer → temperature not expected
-                            #   to reach the bracket at all → approaching floor is noise.
-                            #
-                            # Case B — forecast ABOVE cap (bracket below forecast):
-                            #   corrected_fcst > cap + buffer → temperature expected to
-                            #   blow THROUGH the bracket on its way up → approaching the
-                            #   floor is the normal winning path, not a danger signal.
-                            #   Only applies to B brackets (cap is not None).
-                            #
-                            # Only fire when forecast is ambiguous (inside bracket zone).
-                            corrected_fcst = nws.get("forecast_high_f")
-                            if corrected_fcst is not None:
-                                from hight_decision_engine import _city_bias as _get_bias
-                                try:
-                                    corrected_fcst = corrected_fcst - _get_bias(city)  # positive bias = NWS runs warm → subtract
-                                except Exception:
-                                    pass
-
-                                below_floor = corrected_fcst < floor - FORECAST_ANCHOR_BUFFER
-                                above_cap   = (ceiling is not None and
-                                               corrected_fcst > ceiling + FORECAST_ANCHOR_BUFFER)
-
-                                if below_floor or above_cap:
-                                    reason = "below floor" if below_floor else "above cap"
-                                    log.debug("ANCHOR_BYPASS  %s  " +
-                                          f"obs_high={obs_val}°F near floor {floor}°F BUT "
-                                          f"corrected_fcst={corrected_fcst:.1f}°F is {reason} "
-                                          f"— outcome already implied, holding")
-                                else:
-                                    anchor_triggered = True
-                                    log.info("FORECAST_ANCHOR  %s  " +
-                                          f"obs_high={obs_val}°F within {gap:.1f}°F of "
-                                          f"bracket floor {floor}°F  "
-                                          f"corrected_fcst={corrected_fcst:.1f}°F is ambiguous")
-                            else:
-                                # No forecast available — fire conservatively
-                                anchor_triggered = True
-                                log.info("FORECAST_ANCHOR  %s  " +
-                                      f"obs_high={obs_val}°F within {gap:.1f}°F of "
-                                      f"bracket floor {floor}°F (no forecast available)")
-                elif is_lowt and ceiling is not None:
-                    # LOWT: dangerous if observed low approaching (or below) bracket ceiling.
-                    # Negative gap is correct here — obs already below cap means YES resolving.
-                    gap = obs_val - ceiling
-                    if gap <= FORECAST_ANCHOR_BUFFER:
-                        anchor_triggered = True
-                        log.info("FORECAST_ANCHOR  %s  " +
-                              f"obs_low={obs_val}°F within {gap:.1f}°F of bracket ceiling {ceiling}°F")
-
-                if anchor_triggered:
-                    exit_reason = "forecast_anchor"
-                    exit_price  = no_price
-
-            # ── Price stop loss — DISABLED ─────────────────────────────────
-            # Removed: data shows holding always beats exiting on price alone
-            # at every streak length and threshold (analysis Apr 22 2026).
-            # Only exit mechanism is YES ceiling + forecast filter above.
+            # ── Exit anchor DISABLED ───────────────────────────────────────
+            # Analysis (May 2026, 583 positions): exit system was net -$93 vs
+            # holding to settlement. Yes ceiling and forecast anchor both
+            # destroyed value at every threshold tested. Hold everything to
+            # settlement — the 95%+ WR makes exits counterproductive.
+            # YES_MARKET_CLOSED guard above handles the only remaining edge
+            # case (unfillable orders when market has resolved).
 
         else:
             # ── YES position: stop loss only, ride to resolution ───────────
@@ -1601,22 +1548,25 @@ def _local_hour(city: str) -> int:
 
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
-    global _deployed_today   # module-level tracker; += requires explicit global declaration
+    global _deployed_today, _deployed_cascade   # module-level trackers; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
     # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
     # to avoid a second full NWS sweep (60 API calls) each poll cycle.
-    evaluations, nws_snapshot = decision_engine.run(city_filter=city_filter)
+    evaluations, nws_snapshot, kalshi_results = decision_engine.run(city_filter=city_filter)
     decision_engine.display(evaluations)
 
     # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
+        lowt_kalshi = kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
         lowt_evals = lowt_decision_engine.run(
-            city_filter  = city_filter,
-            paper        = paper,
-            nws_snapshot = nws_snapshot,
+            kalshi_results = lowt_kalshi,
+            city_filter    = city_filter,
+            paper          = paper,
+            nws_results    = nws_snapshot,
         )
         lowt_decision_engine.display(lowt_evals)
         evaluations = evaluations + lowt_evals
+        cascade_engine.display(evaluations)
     except Exception as e:
         log.warning("LOWT pipeline error (non-fatal): %s", e)
 
@@ -1709,13 +1659,19 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             cost = price * contracts
 
-            # Engine capital check — proportional allocation
+            # Engine capital check — session-scoped per engine type
             tier = signal.get("entry_tier", "")
             engine_key = "cascade" if tier.startswith("cascade") else "main"
-            if not cap.can_deploy(engine_key, cost):
-                log.debug("skip %s — %s budget exhausted (cost=$%.2f)",
-                          ticker, engine_key, cost)
-                continue
+            if engine_key == "cascade":
+                if get_cascade_deployable() < cost:
+                    log.debug("skip %s — cascade session budget exhausted (cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, get_cascade_deployable())
+                    continue
+            else:
+                if not cap.can_deploy("main", cost):
+                    log.debug("skip %s — main budget exhausted (cost=$%.2f)",
+                              ticker, cost)
+                    continue
 
             log.info("SIGNAL  %s  %s", city, ticker)
             if tier.startswith("cascade"):
@@ -1741,7 +1697,10 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 held_city_map[city]    = held_city_map.get(city, 0) + 1
                 cap.record(engine_key, cost)
                 deployed += cost
-                _deployed_today += cost
+                if engine_key == "cascade":
+                    _deployed_cascade += cost
+                else:
+                    _deployed_today += cost
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,

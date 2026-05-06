@@ -108,6 +108,22 @@ T_BRACKET_FORECAST_MIN_ABOVE = 1.0   # °F above T cap required
 MAX_CONTRACTS       = 3        # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
+MIN_SCORE           = 1        # minimum score to enter a trade
+
+# ---------------------------------------------------------------------------
+# Near-cap signal parameters
+# ---------------------------------------------------------------------------
+# When obs_high is >= 80% of the way through a bracket (near its cap),
+# the two brackets above (N+2 and N+3) are very unlikely to be reached.
+# Backtest (HIGH, Apr 6 – May 4 2026, exc. one manual-trade day):
+#   n=85  WR=100%  EV=+$0.111  total_pnl=+$9.40  (rank N+2 + N+3 combined)
+NEAR_CAP_INTRA_MIN  = 0.80    # obs must be >= this fraction through the bracket
+NEAR_CAP_HOUR_MAX   = 12      # only fire before noon local (morning establishment)
+NEAR_CAP_NO_MIN     = 0.75    # minimum No price (same as main engine floor)
+NEAR_CAP_NO_MAX     = 0.95    # slightly wider than main engine — these are high-confidence
+                               # score=0 has 100% settled WR — gate kept at 1 as minimal
+                               # sanity check only (requires at least one positive signal)
+
 # Momentum detection
 MIN_CANDLES_FOR_MOMENTUM = 3   # need at least this many candles to score momentum
 MOMENTUM_LOOKBACK        = 3   # look at last N candles for direction
@@ -494,7 +510,9 @@ def evaluate_bracket(
     yes_depth = bracket.get("ob_yes_depth") or 0
 
     if spread is None or spread > MAX_SPREAD:
-        signal["skip_reason"] = f"Spread too wide or missing ({spread})"
+        reason = ("One-sided book (no spread available)" if spread is None
+                  else f"Spread too wide ({spread:.2f} > {MAX_SPREAD:.2f})")
+        signal["skip_reason"] = reason
         return signal
 
     if no_depth < MIN_DEPTH and yes_depth < MIN_DEPTH:
@@ -570,12 +588,12 @@ def evaluate_bracket(
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
     ):
-        # Score range is −1 to +5. Require score ≥ 1 to trade.
+        # Score range is −1 to +5. Require score ≥ MIN_SCORE to trade.
         # obs_inside_bracket penalty means a position with obs in range
         # needs at least two positive signals to remain actionable.
-        if score < 1:
+        if score < MIN_SCORE:
             signal["skip_reason"] = (
-                f"Score {score} below minimum (1 required) — "
+                f"Score {score} below minimum ({MIN_SCORE} required) — "
                 f"details: {details}"
             )
         else:
@@ -673,6 +691,15 @@ def evaluate_city(
     result["city_bias"]      = city_bias
     result["dynamic_buffer"] = dyn_buffer
 
+    # Pre-sort B brackets by floor for near-cap signal and any other
+    # multi-bracket logic that needs ordered access.
+    b_brackets_sorted = sorted(
+        [b for b in brackets
+         if b.get("ticker", "").split("-")[-1].startswith("B")
+         and b.get("floor") is not None and b.get("cap") is not None],
+        key=lambda b: b["floor"]
+    )
+
     for bracket in brackets:
         # Skip the forecast bracket — we don't trade YES, and NO on the
         # forecast bracket is the highest-risk position (most likely to resolve YES)
@@ -722,6 +749,87 @@ def evaluate_city(
                 signal["trade_type"] = None
                 signal["skip_reason"] = f"Exceeded MAX_NO_PER_CITY ({MAX_NO_PER_CITY})"
 
+    # ── Near-cap signal ───────────────────────────────────────────────────
+    # When obs_high is >= 80% through a bracket's range, the temperature has
+    # almost certainly peaked at or below that bracket's cap. The two brackets
+    # above (N+2 and N+3) are structurally excluded — they require the
+    # temperature to climb 2+ more degrees, which is physically unlikely when
+    # the morning high is already near the cap of the current bracket.
+    #
+    # Only fires before noon local (morning high establishment) and only
+    # on brackets not already covered by the main engine signal above.
+    if (observed_high is not None
+            and city_local_hour < NEAR_CAP_HOUR_MAX
+            and len(b_brackets_sorted) >= 4):
+
+        # Find which B bracket obs_high is currently inside
+        current_bracket = None
+        current_idx     = None
+        for idx, bkt in enumerate(b_brackets_sorted):
+            bkt_floor = bkt.get("floor")
+            bkt_cap   = bkt.get("cap")
+            if bkt_floor is not None and bkt_cap is not None:
+                if bkt_floor <= observed_high < bkt_cap:
+                    current_bracket = bkt
+                    current_idx     = idx
+                    break
+
+        if current_bracket is not None and current_idx is not None:
+            bkt_floor = current_bracket["floor"]
+            bkt_cap   = current_bracket["cap"]
+            bkt_width = bkt_cap - bkt_floor
+            intra_pos = (observed_high - bkt_floor) / bkt_width if bkt_width > 0 else 0.0
+
+            if intra_pos >= NEAR_CAP_INTRA_MIN:
+                # Target ranks N+2 and N+3 above the current bracket
+                already_traded = {
+                    s["ticker"] for s in result["signals"]
+                    if s.get("trade_type") == "NO"
+                }
+                for rank_offset in [2, 3]:
+                    target_idx = current_idx + rank_offset
+                    if target_idx >= len(b_brackets_sorted):
+                        continue
+                    target = b_brackets_sorted[target_idx]
+                    t_ticker  = target.get("ticker", "")
+                    t_no_ask  = float(target.get("ob_no_ask") or target.get("no_price") or 0)
+                    t_floor   = target.get("floor")
+
+                    if t_ticker in already_traded:
+                        continue
+                    if not (NEAR_CAP_NO_MIN <= t_no_ask <= NEAR_CAP_NO_MAX):
+                        continue
+
+                    log.info(
+                        "NEAR_CAP  %s  %s  obs=%.1f°  intra=%.2f  N+%d  No=%.2f",
+                        city, t_ticker, observed_high, intra_pos, rank_offset, t_no_ask,
+                    )
+                    result["signals"].append({
+                        "ticker":       t_ticker,
+                        "title":        target.get("title", ""),
+                        "floor":        t_floor,
+                        "cap":          target.get("cap"),
+                        "yes_ask":      float(target.get("ob_yes_ask") or 0),
+                        "no_ask":       t_no_ask,
+                        "spread":       target.get("ob_spread"),
+                        "yes_depth":    target.get("ob_yes_depth"),
+                        "no_depth":     target.get("ob_no_depth"),
+                        "volume":       target.get("volume"),
+                        "score":        4,
+                        "score_detail": [
+                            "near_cap_obs",
+                            f"intra_pos={intra_pos:.2f}",
+                            f"rank=N+{rank_offset}",
+                            f"obs={observed_high:.1f}F",
+                        ],
+                        "trade_type":    "NO",
+                        "entry_price":   t_no_ask,
+                        "entry_tier":    "near_cap",
+                        "market_type":   "high",
+                        "max_contracts": MAX_CONTRACTS,
+                        "skip_reason":   None,
+                    })
+
     return result
 
 
@@ -759,7 +867,7 @@ def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]
     cascade_evals = cascade_engine.run(kalshi_results, city_filter, nws_results=nws_results)
     evaluations.extend(cascade_evals)
 
-    return evaluations, nws_results
+    return evaluations, nws_results, kalshi_results
 
 
 # ---------------------------------------------------------------------------

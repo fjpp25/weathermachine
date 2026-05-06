@@ -171,12 +171,14 @@ def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
 
             _fired.add((city, ticker))
 
-            # Capital check
+            # Capital check against market-date-scoped peak budget
             try:
-                from trader import EngineCapital as _EC, get_balance as _gb
-                _cap = _EC(balance=_gb(client))
-                if not _cap.can_deploy("peak", no_p * MAX_CONTRACTS):
-                    log.debug("peak_scanner: %s — peak budget exhausted", ticker)
+                from trader import get_peak_deployable as _gpd, record_peak_deployed as _rpd
+                cost = no_p * MAX_CONTRACTS
+                if _gpd(ticker) < cost:
+                    log.debug("peak_scanner: %s — peak budget exhausted "
+                              "(cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, _gpd(ticker))
                     continue
             except Exception:
                 pass  # proceed without capital check if unavailable
@@ -207,8 +209,8 @@ def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
                         "entry_tier":   "peak",
                     })
                     try:
-                        from trader import get_engine_capital as _gec
-                        _gec().record("peak", no_p * MAX_CONTRACTS)
+                        from trader import record_peak_deployed as _rpd
+                        _rpd(no_p * MAX_CONTRACTS, ticker)
                     except Exception:
                         pass
                 except Exception as e:

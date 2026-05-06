@@ -213,6 +213,11 @@ def poll_once(observations: list[dict]) -> int:
       - uses the shared CITIES registry (no duplication)
       - applies LST boundary logic correctly (not a 24-hr rolling window)
       - benefits from retry logic and the grid cache
+
+    Tomorrow's brackets are fetched on every poll for both HIGH and LOWT —
+    not just after today converges. The dismissed-T signal window is brief
+    (1–3 polls) and appears throughout the day, so gating on convergence
+    was causing most of the actionable data to be missed.
     """
     poll_time  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows_added = 0
@@ -235,11 +240,18 @@ def poll_once(observations: list[dict]) -> int:
         forecast_issued_at = nws.get("forecast_issued_at")
         hazards            = nws.get("hazards", [])
 
+        # Cache fetched brackets so the summary section reuses them
+        # without making redundant API calls (was 2 extra fetches per city).
+        fetched_today    = {}   # market_type -> list[dict]
+        fetched_tomorrow = {}   # market_type -> list[dict]
+
         for market_type in ("high", "lowt"):
             series = cfg.get(f"{market_type}_series") or cfg.get(market_type)
             if not series:
                 continue
+
             brackets = fetch_brackets(series)
+            fetched_today[market_type] = brackets
             if not brackets:
                 continue
 
@@ -269,9 +281,8 @@ def poll_once(observations: list[dict]) -> int:
                 volume        = float(m.get("volume_fp") or 0)
                 open_interest = float(m.get("open_interest_fp") or 0)
                 bracket       = ticker.split("-")[-1] if "-" in ticker else ticker
-
-                yes_ask = round(1.0 - no_price, 4) if no_price > 0 else None
-                spread  = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
+                yes_ask       = round(1.0 - no_price, 4) if no_price > 0 else None
+                spread        = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
 
                 observations.append({
                     "poll_time_utc":      poll_time,
@@ -292,53 +303,56 @@ def poll_once(observations: list[dict]) -> int:
                     "spread":             spread,
                     "volume":             volume,
                     "open_interest":      open_interest,
+                    # Added 2026-05-06: instantaneous temperature reading.
+                    # Rows before this date have None here.
+                    # Use for afternoon-decline signal analysis (filter notna).
+                    "current_temp_f":     nws.get("current_temp_f"),
                 })
                 rows_added += 1
 
-            # When today's HIGH market is fully converged, also record tomorrow's
-            # brackets. This captures early price discovery on the next day's market
-            # — the data needed to validate the two-stage T bracket strategy.
+            # Always fetch tomorrow's brackets — for both HIGH and LOWT.
             # NWS fields are null (no same-day observations for tomorrow yet).
-            if market_type == "high" and _is_converged(brackets):
-                tomorrow_brackets = fetch_tomorrows_brackets(series)
-                if tomorrow_brackets:
-                    print(f"  [{city}] today converged — recording {len(tomorrow_brackets)} "
-                          f"tomorrow brackets")
-                    for m in tomorrow_brackets:
-                        ticker        = m.get("ticker", "")
-                        yes_price     = float(m.get("yes_bid_dollars") or 0)
-                        no_price      = float(m.get("no_bid_dollars")  or 0)
-                        volume        = float(m.get("volume_fp") or 0)
-                        open_interest = float(m.get("open_interest_fp") or 0)
-                        bracket       = ticker.split("-")[-1] if "-" in ticker else ticker
-                        yes_ask       = round(1.0 - no_price, 4) if no_price > 0 else None
-                        spread        = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
+            tomorrow_brackets = fetch_tomorrows_brackets(series)
+            fetched_tomorrow[market_type] = tomorrow_brackets
+            if tomorrow_brackets:
+                tmr_type = f"{market_type}_tomorrow"
+                for m in tomorrow_brackets:
+                    ticker        = m.get("ticker", "")
+                    yes_price     = float(m.get("yes_bid_dollars") or 0)
+                    no_price      = float(m.get("no_bid_dollars")  or 0)
+                    volume        = float(m.get("volume_fp") or 0)
+                    open_interest = float(m.get("open_interest_fp") or 0)
+                    bracket       = ticker.split("-")[-1] if "-" in ticker else ticker
+                    yes_ask       = round(1.0 - no_price, 4) if no_price > 0 else None
+                    spread        = round(yes_ask - yes_price, 4) if yes_ask and yes_price > 0 else None
 
-                        observations.append({
-                            "poll_time_utc":      poll_time,
-                            "city":               city,
-                            "market_type":        "high_tomorrow",
-                            "local_time":         local_time,
-                            "local_hour":         local_hour,
-                            "observed_high_f":    None,
-                            "forecast_high_f":    None,
-                            "observed_low_f":     None,
-                            "forecast_low_f":     None,
-                            "forecast_issued_at": None,
-                            "hazards":            [],
-                            "ticker":             ticker,
-                            "bracket":            bracket,
-                            "yes_price":          yes_price,
-                            "no_price":           no_price,
-                            "spread":             spread,
-                            "volume":             volume,
-                            "open_interest":      open_interest,
-                        })
-                        rows_added += 1
+                    observations.append({
+                        "poll_time_utc":      poll_time,
+                        "city":               city,
+                        "market_type":        tmr_type,
+                        "local_time":         local_time,
+                        "local_hour":         local_hour,
+                        "observed_high_f":    None,
+                        "forecast_high_f":    None,
+                        "observed_low_f":     None,
+                        "forecast_low_f":     None,
+                        "forecast_issued_at": None,
+                        "hazards":            [],
+                        "ticker":             ticker,
+                        "bracket":            bracket,
+                        "yes_price":          yes_price,
+                        "no_price":           no_price,
+                        "spread":             spread,
+                        "volume":             volume,
+                        "open_interest":      open_interest,
+                    })
+                    rows_added += 1
 
-        # Summary line per city
-        high_brackets = fetch_brackets(cfg.get("high_series") or cfg.get("high", ""))
-        lowt_brackets = fetch_brackets(cfg.get("lowt_series") or cfg.get("lowt", ""))
+        # Summary per city — two lines:
+        #   Line 1: today's market — observed temp, leading HIGH bracket, leading LOWT bracket
+        #   Line 2: tomorrow's brackets — full price list with dismissed brackets flagged
+        high_brackets = fetched_today.get("high", [])
+        lowt_brackets = fetched_today.get("lowt", [])
 
         def leading(brackets):
             if not brackets:
@@ -352,6 +366,20 @@ def poll_once(observations: list[dict]) -> int:
             volume  = float(top.get("volume_fp") or 0)
             return bracket, yes_p, spread, volume
 
+        def bracket_summary(brackets):
+            """Return a compact price list: 'B52.5:Y35/N64  B54.5:Y55/N44 ...'
+            Brackets with Yes<=0.07 are flagged with * to indicate dismissed."""
+            if not brackets:
+                return "—"
+            parts = []
+            for m in brackets:
+                label = m.get("ticker", "").split("-")[-1]
+                yes_p = float(m.get("yes_bid_dollars") or 0)
+                no_p  = float(m.get("no_bid_dollars")  or 0)
+                flag  = "*" if yes_p <= 0.07 else " "
+                parts.append(f"{flag}{label}:Y{yes_p:.2f}/N{no_p:.2f}")
+            return "  ".join(parts)
+
         hi_bracket, hi_pct, hi_spread, hi_vol = leading(high_brackets)
         lo_bracket, lo_pct, lo_spread, lo_vol = leading(lowt_brackets)
 
@@ -359,20 +387,42 @@ def poll_once(observations: list[dict]) -> int:
         lo_spread_str = f"spd={lo_spread:.2f}" if lo_spread else "spd=—"
 
         current_temp = nws.get("current_temp_f", "?")
+        obs_hi       = nws.get("observed_high_f")
+        obs_lo       = nws.get("observed_low_f")
+        obs_hi_str   = f"hi={obs_hi:.1f}°" if obs_hi else ""
+        obs_lo_str   = f"lo={obs_lo:.1f}°" if obs_lo else ""
+        obs_str      = "  ".join(x for x in [obs_hi_str, obs_lo_str] if x) or f"curr={current_temp}°"
+
         fcst_age_str = ""
         if forecast_issued_at:
             try:
                 issued  = datetime.fromisoformat(forecast_issued_at)
                 now_utc = datetime.now(timezone.utc)
                 age_h   = round((now_utc - issued).total_seconds() / 3600, 1)
-                fcst_age_str = f"  fcst_age={age_h}h"
+                fcst_age_str = f" age={age_h}h"
             except Exception:
                 pass
 
         hazard_str = f"  ⚠ {','.join(hazards)}" if hazards else ""
-        print(f"  {city:<14} {local_time}  obs={current_temp}°{fcst_age_str}{hazard_str}  "
-              f"HIGH: {hi_bracket}@{hi_pct:.0%} {hi_spread_str} vol={hi_vol:.0f}  "
+
+        # Line 1: today
+        print(f"  {city:<14} {local_time}  {obs_str}{fcst_age_str}{hazard_str}")
+        print(f"    TODAY  HIGH: {hi_bracket}@{hi_pct:.0%} {hi_spread_str} vol={hi_vol:.0f}  "
               f"LOWT: {lo_bracket}@{lo_pct:.0%} {lo_spread_str} vol={lo_vol:.0f}")
+
+        # Line 2: tomorrow (only if brackets are available)
+        tmr_high = fetched_tomorrow.get("high", [])
+        tmr_lowt = fetched_tomorrow.get("lowt", [])
+        if tmr_high or tmr_lowt:
+            tmr_high_str = bracket_summary(sorted(
+                tmr_high, key=lambda m: float(m.get("no_bid_dollars") or 0)
+            )) if tmr_high else "—"
+            tmr_lowt_str = bracket_summary(sorted(
+                tmr_lowt, key=lambda m: float(m.get("no_bid_dollars") or 0)
+            )) if tmr_lowt else "—"
+            print(f"    TOMORROW  HIGH: {tmr_high_str}")
+            print(f"              LOWT: {tmr_lowt_str}")
+        print()
 
     return rows_added
 

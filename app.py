@@ -82,12 +82,19 @@ except Exception:
 DATA_DIR    = Path("data")
 CONFIG_FILE = DATA_DIR / "config.json"
 
-def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
+def _fmt_bracket(bracket: str, market_type: str = "HIGH", t_is_top: bool | None = None) -> str:
     """
     Convert raw bracket code to a readable label.
     B78.5 → '78–79°'  (the .5 is the midpoint; range is floor(x) to floor(x)+1)
-    T55   → '>55°'    (above threshold for HIGH)
-    T31   → '<31°'    (below threshold for LOWT)
+
+    T brackets display the inclusive integer temperature bound:
+      HIGH top T:    T84  → '>85°'   (val+1 — bracket covers 85 and above)
+      LOWT top T:    T51  → '>52°'   (val+1 — overnight low above 52°F)
+      LOWT bottom T: T44  → '<43°'   (val-1 — bracket covers 43 and below)
+
+    t_is_top: True = top T bracket (use ">", val+1),
+              False = bottom T bracket (use "<", val-1),
+              None = infer from market_type (legacy: HIGH→top, LOW→bottom).
     """
     if not bracket:
         return bracket
@@ -99,10 +106,13 @@ def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
             return f"{lower}–{upper}°"
         elif bracket.startswith("T"):
             val = float(bracket[1:])
-            if market_type == "LOW":
-                return f"<{val:.0f}°"
+            # Determine direction when not explicitly provided
+            if t_is_top is None:
+                t_is_top = (market_type != "LOW")
+            if t_is_top:
+                return f">{int(val) + 1}°"
             else:
-                return f">{val:.0f}°"
+                return f"<{int(val) - 1}°"
     except ValueError:
         pass
     return bracket
@@ -122,16 +132,40 @@ def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
     return None
 
 
-def _bracket_from_ticker(ticker: str) -> str:
+def _bracket_from_ticker(ticker: str, all_tickers: list[str] | None = None) -> str:
     """Extract and format the bracket label from a Kalshi temperature ticker.
-    e.g. 'HIGHNY-24APR25-B67' → '67–69°',  'HIGHNY-24APR25-T72' → '>72°'
+    e.g. 'KXHIGHNY-26APR25-B83.5' → '83–84°',  'KXHIGHNY-26APR25-T84' → '>85°'
+
+    all_tickers: optional sibling tickers from the same market. Used to
+    determine whether a LOWT T bracket is the top or bottom one by comparing
+    its value to the other T bracket. Without this, HIGH T is assumed top and
+    LOWT T is assumed bottom (correct for HIGH; wrong for LOWT top T bracket).
     """
     parts = ticker.split("-")
     if len(parts) >= 3:
-        raw = parts[-1]          # e.g. "T69", "B67"
-        prefix = parts[0]        # e.g. "HIGHNY", "LOWTCHI"
+        raw         = parts[-1]
+        prefix      = parts[0]
         market_type = "LOW" if "LOWT" in prefix.upper() else "HIGH"
-        label = _fmt_bracket(raw, market_type)
+
+        t_is_top = None
+        if raw.startswith("T") and all_tickers:
+            try:
+                my_val = float(raw[1:])
+                other_t_vals = [
+                    float(t.split("-")[-1][1:])
+                    for t in all_tickers
+                    if t.split("-")[-1].startswith("T")
+                    and t.split("-")[-1] != raw
+                ]
+                if other_t_vals:
+                    t_is_top = my_val > min(other_t_vals)
+            except ValueError:
+                pass
+
+        if t_is_top is None and raw.startswith("T"):
+            t_is_top = (market_type == "HIGH")
+
+        label = _fmt_bracket(raw, market_type, t_is_top=t_is_top)
         return label if label else "—"
     return "—"
 
@@ -1303,11 +1337,16 @@ class HomeTab(QWidget):
             ["Market", "Bracket", "Engine", "Side", "Qty", "Entry", "Current", "Unreal. PnL", "Opened", "Status"]
         )
         hdr = self.pos_table.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        hdr.setMinimumSectionSize(1)
-        # Market wide, Bracket, Engine, Side, Qty narrow, Entry narrow, Current, Unreal PnL, Opened, Status
-        for col, pct in enumerate([28, 10, 9, 6, 4, 7, 8, 11, 12, 5]):
-            hdr.resizeSection(col, pct)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setMinimumSectionSize(40)
+        hdr.setStretchLastSection(False)
+        # Market stretches; all others are fixed pixel widths
+        # col: Market  Bracket  Engine  Side  Qty  Entry  Current  Unreal  Opened  Status
+        MARKET_COL_HOME = 0
+        hdr.setSectionResizeMode(MARKET_COL_HOME, QHeaderView.ResizeMode.Stretch)
+        for col, w in enumerate([0, 90, 90, 60, 52, 72, 72, 100, 100, 80]):
+            if col != MARKET_COL_HOME and w:
+                hdr.resizeSection(col, w)
         self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.pos_table.setAlternatingRowColors(True)
@@ -1370,7 +1409,8 @@ class HomeTab(QWidget):
                 dlg.setText("⚠  LIVE TRADING MODE")
                 dlg.setInformativeText(
                     "Real money will be deployed.\n\n"
-                    "Your account balance and the 70% deployable cap apply.\n\n"
+                    "Each engine draws from its own market-date budget "
+                    "(main 30%, cascade 35%, peak 8%, tomorrow 12%).\n\n"
                     "Are you sure you want to start?"
                 )
                 dlg.setStandardButtons(
@@ -2549,11 +2589,20 @@ class SessionTab(QWidget):
             ["Time", "Market", "Bracket", "Engine", "Side", "Qty", "Entry", "Score", "Unreal. PnL", "Status"]
         )
         th = t.horizontalHeader()
-        th.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        th.setMinimumSectionSize(1)
-        # Time, Market wide, Bracket, Engine, Side, Qty narrow, Entry narrow, Score, Unreal PnL, Status
-        for col, pct in enumerate([12, 24, 10, 9, 6, 4, 6, 7, 10, 8]):
-            th.resizeSection(col, pct)
+        # Interactive mode lets each column have its own width and be resized by the user.
+        # Stretch was previously forcing all columns to equal width and overriding
+        # the resizeSection calls.
+        th.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        th.setMinimumSectionSize(40)
+        th.setStretchLastSection(False)
+        # Market column stretches to fill remaining space; all others are fixed-width.
+        MARKET_COL = 1
+        th.setSectionResizeMode(MARKET_COL, QHeaderView.ResizeMode.Stretch)
+        # col:  Time  Market  Bracket  Engine  Side  Qty  Entry  Score  Unreal  Status
+        widths = [95,   0,      90,      90,     60,   52,   72,    72,    100,    85]
+        for col, w in enumerate(widths):
+            if col != MARKET_COL and w:
+                th.resizeSection(col, w)
         t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         t.setAlternatingRowColors(True)
@@ -2590,8 +2639,9 @@ class SessionTab(QWidget):
             for pos in positions:
                 if pos["ticker"] in existing_tickers:
                     continue
-                # Try to recover score from trade log
-                score = 0
+                # Try to recover score and placed_at from trade log
+                score      = 0
+                entered_at = "pre-session"
                 try:
                     import json, pathlib
                     log_path = pathlib.Path("data/trade_log.json")
@@ -2600,6 +2650,15 @@ class SessionTab(QWidget):
                         for t in reversed(trades):
                             if t.get("ticker") == pos["ticker"]:
                                 score = t.get("score", 0)
+                                placed_at = t.get("placed_at", "")
+                                if placed_at:
+                                    try:
+                                        dt = datetime.fromisoformat(
+                                            placed_at.replace("Z", "+00:00")
+                                        )
+                                        entered_at = dt.strftime("%H:%M UTC")
+                                    except Exception:
+                                        pass
                                 break
                 except Exception:
                     pass
@@ -2607,7 +2666,7 @@ class SessionTab(QWidget):
                 self._entries.append({
                     **pos,
                     "status":     "Open",
-                    "entered_at": "pre-session",
+                    "entered_at": entered_at,
                     "score":      score,
                 })
                 added += 1

@@ -84,6 +84,23 @@ AFTERNOON_END     = 15
 AFTERNOON_MAX_YES = 0.15
 
 # ---------------------------------------------------------------------------
+# RATCHET parameters
+# ---------------------------------------------------------------------------
+# A bracket whose No price climbs non-strictly for RATCHET_MIN_STREAK
+# consecutive polls and ends at or above RATCHET_NO_FLOOR settles No
+# with ~99% probability (backtest: 3,606 cases, 99.2% WR, evening window).
+#
+# Evening window only (18–21 local) — the overnight low starts pricing in
+# during this window, making the signal most reliable.
+
+RATCHET_MIN_STREAK  = 5      # consecutive non-decreasing polls required
+RATCHET_NO_FLOOR    = 0.88   # No price must be at least this at trigger
+RATCHET_NO_MAX      = 0.92   # don't enter if No has already moved past this
+RATCHET_EVENING_START = 18
+RATCHET_EVENING_END   = 21
+RATCHET_CONTRACTS   = 3      # flat sizing — high conviction, conservative start
+
+# ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
@@ -120,6 +137,11 @@ _lowt_td_entered:   set[str]                   = set()
 _lowt_td_made:      dict[tuple[str, str], int] = {}
 _lowt_td_locked:    dict[tuple[str, str], str] = {}
 _lowt_td_trigger:   dict[tuple[str, str], int] = {}
+
+# RATCHET session state — keyed by ticker (naturally date-scoped)
+_ratchet_streaks:  dict[str, int]   = {}   # ticker → current consecutive non-decreasing count
+_ratchet_last_no:  dict[str, float] = {}   # ticker → no_price seen last poll
+_ratchet_entered:  set[str]         = set()  # tickers already traded this session
 
 
 def _market_date(ticker: str) -> str:
@@ -782,6 +804,99 @@ def _lowt_td_signals(city: str, brackets: list[dict]) -> list[dict]:
     return signals
 
 
+def _ratchet_signals(city: str, brackets: list[dict]) -> list[dict]:
+    """
+    RATCHET signal — steady No climb over consecutive polls.
+
+    For each bracket, maintain a streak counter across polls. When the
+    No price has been non-decreasing for RATCHET_MIN_STREAK consecutive
+    polls AND has reached RATCHET_NO_FLOOR, fire a No entry.
+
+    Restricted to the evening window (18–21 local) where LOWT markets
+    are most informative — the overnight low starts pricing in during
+    this period.
+
+    Backtest: 3,606 cases in evening window, 99.2% WR at streak=5 +
+    floor=0.88. One of the highest-confidence signals in the system.
+
+    State persists across polls via module-level dicts keyed by ticker.
+    Tickers include the market date so state naturally expires overnight.
+    """
+    if not brackets:
+        return []
+
+    local_hour = _local_hour(city)
+    if not (RATCHET_EVENING_START <= local_hour <= RATCHET_EVENING_END):
+        return []
+
+    from log_setup import get_logger as _gl
+    _log = _gl("cascade_engine")
+
+    signals = []
+
+    for bracket in brackets:
+        ticker = bracket.get("ticker", "")
+        if not ticker:
+            continue
+
+        # B brackets only — T brackets have different dynamics
+        bracket_code = ticker.split("-")[-1] if "-" in ticker else ""
+        if not bracket_code.startswith("B"):
+            continue
+
+        if ticker in _ratchet_entered:
+            continue
+
+        no_p = _no_price(bracket)
+        if no_p <= 0.0:
+            continue
+
+        # Update streak
+        prev_no = _ratchet_last_no.get(ticker)
+        if prev_no is None:
+            # First time we see this ticker — start streak at 1
+            _ratchet_streaks[ticker] = 1
+        else:
+            if no_p >= prev_no:
+                _ratchet_streaks[ticker] = _ratchet_streaks.get(ticker, 1) + 1
+            else:
+                _ratchet_streaks[ticker] = 1   # reset on any dip
+
+        _ratchet_last_no[ticker] = no_p
+
+        streak = _ratchet_streaks[ticker]
+
+        _log.debug(
+            "RATCHET  %s  %s  No=%.2f  streak=%d",
+            city, ticker, no_p, streak,
+        )
+
+        # Check trigger conditions
+        if streak < RATCHET_MIN_STREAK:
+            continue
+        if no_p < RATCHET_NO_FLOOR:
+            continue
+        if no_p > RATCHET_NO_MAX:
+            continue
+
+        _ratchet_entered.add(ticker)
+
+        trigger_info = (
+            f"ratchet: No={no_p:.2f}  streak={streak}  "
+            f"floor={RATCHET_NO_FLOOR}  window=evening  {RATCHET_CONTRACTS}c"
+        )
+
+        _log.info(
+            "RATCHET  %s  %s  No=%.2f  streak=%d  → ENTRY",
+            city, ticker, no_p, streak,
+        )
+
+        signals.append(_make_signal(bracket, "cascade_ratchet", trigger_info,
+                                    RATCHET_CONTRACTS))
+
+    return signals
+
+
 def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
     """Evaluate LOWT cascade signals for a single city."""
     result = {
@@ -807,6 +922,7 @@ def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
 
     result["signals"].extend(_lowt_bu_signals(city, brackets))
     result["signals"].extend(_lowt_td_signals(city, brackets))
+    result["signals"].extend(_ratchet_signals(city, brackets))
 
     return result
 
@@ -909,6 +1025,7 @@ def display(evaluations: list[dict]):
                 "DIRECT-DOWN" if "directional_down"  in tier else
                 "LOWT-UP"     if "lowt_bu"           in tier else
                 "LOWT-DOWN"   if "lowt_td"           in tier else
+                "RATCHET"     if "ratchet"            in tier else
                 "TOMORROW"    if "tomorrow"           in tier else
                 "AFTERNOON"   if "afternoon"          in tier else
                 tier.upper()
