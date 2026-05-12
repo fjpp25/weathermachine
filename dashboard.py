@@ -367,18 +367,18 @@ def api_positions():
 # ---------------------------------------------------------------------------
 @app.route("/api/cities")
 def api_cities():
-    nws = get_nws(); out = {}
+    nws = get_nws(); out = []
     for city in _CITIES_ORDERED:
         tz  = _ALL_CITIES.get(city,{}).get("tz","UTC")
         now = datetime.now(ZoneInfo(tz)); h = now.hour
         d   = nws.get(city,{})
         ha  = 9 <= h < 15; la = h < 8 or h >= 22
-        win = ("HIGH + LOWT" if (ha and la) else "HIGH ▲" if ha else "LOWT ▼" if la else "between")
-        out[city] = {"local_time":now.strftime("%H:%M"),"tz_abbr":now.strftime("%Z"),
+        win = ("HIGH + LOWT" if (ha and la) else "HIGH ▲" if ha else "LOWT ▼" if la else "between windows")
+        out.append({"city":city,"local_time":now.strftime("%H:%M"),"tz_abbr":now.strftime("%Z"),
             "local_hour":h,"obs_hi":d.get("observed_high_f"),"fcst_hi":d.get("forecast_high_f"),
             "obs_lo":d.get("observed_low_f"),"fcst_lo":d.get("forecast_low_f"),
             "now":d.get("current_temp_f"),
-            "window":win,"high_active":ha,"lowt_active":la}
+            "window":win,"high_active":ha,"lowt_active":la})
     return jsonify(out)
 
 # ---------------------------------------------------------------------------
@@ -835,10 +835,21 @@ td.center{text-align:center}
 <div class="tab" id="tab-perf">
   <div class="sh">PERFORMANCE</div>
   <div class="stat-grid" id="perf-stats"></div>
-  <div class="chart-box"><div class="chart-lbl">EQUITY CURVE</div><canvas id="chart-equity"></canvas></div>
-  <div class="chart-box"><div class="chart-lbl">7-DAY ROLLING WIN RATE</div><canvas id="chart-wr"></canvas></div>
-  <div class="sh">SETTLEMENT HISTORY</div>
-  <div class="tbl-wrap" id="perf-table-wrap"></div>
+  <div class="stabs">
+    <button class="stb on" onclick="switchPerf('charts',this)">Charts</button>
+    <button class="stb" onclick="switchPerf('by-day',this)">By Day</button>
+    <button class="stb" onclick="switchPerf('settlements',this)">All Settlements</button>
+  </div>
+  <div class="sp on" id="sp-charts">
+    <div class="chart-box"><div class="chart-lbl">EQUITY CURVE</div><canvas id="chart-equity"></canvas></div>
+    <div class="chart-box"><div class="chart-lbl">7-DAY ROLLING WIN RATE</div><canvas id="chart-wr"></canvas></div>
+  </div>
+  <div class="sp" id="sp-by-day">
+    <div class="tbl-wrap" id="perf-byDay-wrap"></div>
+  </div>
+  <div class="sp" id="sp-settlements">
+    <div class="tbl-wrap" id="perf-table-wrap"></div>
+  </div>
 </div>
 
 </div><!-- /content -->
@@ -939,17 +950,17 @@ async function loadCities() {
     const cities = await fetch('/api/cities').then(r => r.json());
     const grid = document.getElementById('cgrid');
     grid.innerHTML = '';
-    for (const city of Object.keys(cities)) {
-      const d = cities[city] || {};
+    for (const d of cities) {
+      const city = d.city;
       const div = document.createElement('div');
       const ha = d.high_active, la = d.lowt_active;
       div.className = 'cc' + (ha ? ' ha' : '') + (la ? ' la' : '');
       div.onclick = () => openCityModal(city);
-      const now  = d.now  != null ? d.now.toFixed(0) + '°' : '—';
-      const obsH = d.obs_hi  != null ? d.obs_hi.toFixed(0)  + '°' : '--°';
-      const fcsH = d.fcst_hi != null ? d.fcst_hi.toFixed(0) + '°' : '--°';
-      const obsL = d.obs_lo  != null ? d.obs_lo.toFixed(0)  + '°' : '--°';
-      const fcsL = d.fcst_lo != null ? d.fcst_lo.toFixed(0) + '°' : '--°';
+      const now  = d.now  != null ? Number(d.now).toFixed(0)  + '°' : '—';
+      const obsH = d.obs_hi  != null ? Number(d.obs_hi).toFixed(0)  + '°' : '--°';
+      const fcsH = d.fcst_hi != null ? Number(d.fcst_hi).toFixed(0) + '°' : '--°';
+      const obsL = d.obs_lo  != null ? Number(d.obs_lo).toFixed(0)  + '°' : '--°';
+      const fcsL = d.fcst_lo != null ? Number(d.fcst_lo).toFixed(0) + '°' : '--°';
       const win  = d.window || 'between windows';
       const winCls = ha && la ? 'ba' : ha ? 'ha' : la ? 'la' : '';
       div.innerHTML = `
@@ -1037,49 +1048,79 @@ function escHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function switchPerf(id, btn) {
+  document.querySelectorAll('#tab-perf .stb').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('#tab-perf .sp').forEach(s => s.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('sp-' + id).classList.add('on');
+}
+
 // ── Performance ────────────────────────────────────────────────────────────
 async function loadPerf() {
   try {
     const d = await fetch('/api/performance').then(r => r.json());
     const s = d.stats || {};
     const stats = [
-      ['Win Rate', fmtPct(s.win_rate), s.win_rate >= 85 ? 'g' : ''],
-      ['Net PnL',  fmt$(s.net_pnl),    s.net_pnl  >= 0  ? 'g' : 'r'],
-      ['Total Fees', fmt$(s.total_fees), ''],
-      ['Total Trades', s.total ?? '—', ''],
-      ['Best Day',  fmt$(s.best_day),  'g'],
-      ['Worst Day', fmt$(s.worst_day), s.worst_day < 0 ? 'r' : ''],
+      ['Win Rate',    fmtPct(s.win_rate),   s.win_rate >= 85 ? 'g' : ''],
+      ['Net PnL',     fmt$(s.net_pnl),       s.net_pnl  >= 0  ? 'g' : 'r'],
+      ['Total Fees',  fmt$(s.total_fees),    ''],
+      ['Total Trades',s.total ?? '—',        ''],
+      ['Best Day',    fmt$(s.best_day),      'g'],
+      ['Worst Day',   fmt$(s.worst_day),     s.worst_day < 0 ? 'r' : ''],
     ];
     document.getElementById('perf-stats').innerHTML = stats.map(([k,v,c])=>
       `<div class="stat-card"><div class="stat-k">${k}</div><div class="stat-v ${c}">${v}</div></div>`
     ).join('');
 
-    // Equity chart
-    _buildChart('chart-equity', d.chart?.equity || [], 'Equity ($)', 'var(--ac)', 'var(--ac2)');
-    _buildChart('chart-wr',     d.chart?.win_rate || [], 'Win Rate (%)', 'var(--blu)', 'rgba(77,159,255,.1)');
+    // Charts
+    _buildChart('chart-equity', d.chart?.equity    || [], 'Equity ($)',       'var(--ac)',  'var(--ac2)');
+    _buildChart('chart-wr',     d.chart?.win_rate  || [], 'Win Rate (%)',     'var(--blu)', 'rgba(77,159,255,.1)');
 
-    // Settlement table
+    // By Day table
+    const days = d.by_day || [];
+    if (days.length) {
+      let html = `<table><thead><tr>
+        <th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Net PnL</th><th>Cum PnL</th>
+      </tr></thead><tbody>`;
+      for (const r of days) {
+        const cls = r.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+        html += `<tr>
+          <td>${r.date}</td><td class="center">${r.trades}</td>
+          <td class="center pnl-pos">${r.wins}</td>
+          <td class="center pnl-neg">${r.losses}</td>
+          <td class="center">${r.win_pct}</td>
+          <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+          <td class="${r.cum_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${r.cum_pnl >= 0 ? '+' : ''}${fmt$(r.cum_pnl)}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('perf-byDay-wrap').innerHTML = html;
+    } else {
+      document.getElementById('perf-byDay-wrap').innerHTML = '<div class="empty">No data yet</div>';
+    }
+
+    // All Settlements table
     const rows = d.all_settlements || [];
-    if (!rows.length) {
+    if (rows.length) {
+      let html = `<table><thead><tr>
+        <th>Date</th><th>Market</th><th>Bracket</th><th>Entry</th><th>Net PnL</th><th>Result</th>
+      </tr></thead><tbody>`;
+      for (const r of rows) {
+        const cls = r.result_class === 'green' ? 'pnl-pos' : r.result_class === 'red' ? 'pnl-neg' : '';
+        html += `<tr>
+          <td>${r.date || '—'}</td>
+          <td>${r.market_label || r.ticker}</td>
+          <td>${(r.ticker||'').split('-').pop()}</td>
+          <td>${fmt$(r.avg_entry || r.entry_price)}</td>
+          <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+          <td class="${cls}">${r.result_label}</td>
+        </tr>`;
+      }
+      html += '</tbody></table>';
+      document.getElementById('perf-table-wrap').innerHTML = html;
+    } else {
       document.getElementById('perf-table-wrap').innerHTML = '<div class="empty">No settlements yet</div>';
-      return;
     }
-    let html = `<table><thead><tr>
-      <th>Date</th><th>Market</th><th>Bracket</th><th>Entry</th><th>Net PnL</th><th>Result</th>
-    </tr></thead><tbody>`;
-    for (const r of rows) {
-      const cls = r.result_class === 'green' ? 'pnl-pos' : r.result_class === 'red' ? 'pnl-neg' : '';
-      html += `<tr>
-        <td>${r.date || '—'}</td>
-        <td>${r.market_label || r.ticker}</td>
-        <td>${(r.ticker||'').split('-').pop()}</td>
-        <td>${fmt$(r.avg_entry || r.entry_price)}</td>
-        <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
-        <td class="${cls}">${r.result_label}</td>
-      </tr>`;
-    }
-    html += '</tbody></table>';
-    document.getElementById('perf-table-wrap').innerHTML = html;
   } catch(e) { console.warn('perf', e); }
 }
 
