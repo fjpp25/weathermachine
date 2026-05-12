@@ -377,6 +377,7 @@ def api_cities():
         out[city] = {"local_time":now.strftime("%H:%M"),"tz_abbr":now.strftime("%Z"),
             "local_hour":h,"obs_hi":d.get("observed_high_f"),"fcst_hi":d.get("forecast_high_f"),
             "obs_lo":d.get("observed_low_f"),"fcst_lo":d.get("forecast_low_f"),
+            "now":d.get("current_temp_f"),
             "window":win,"high_active":ha,"lowt_active":la}
     return jsonify(out)
 
@@ -938,9 +939,7 @@ async function loadCities() {
     const cities = await fetch('/api/cities').then(r => r.json());
     const grid = document.getElementById('cgrid');
     grid.innerHTML = '';
-    {% for city in cities %}
-    (function() {
-      const city = {{ city | tojson }};
+    for (const city of Object.keys(cities)) {
       const d = cities[city] || {};
       const div = document.createElement('div');
       const ha = d.high_active, la = d.lowt_active;
@@ -961,8 +960,7 @@ async function loadCities() {
         <div class="clo">lo: ${obsL}&nbsp; fcst: ${fcsL}</div>
         <div class="cwin ${winCls}">${win}</div>`;
       grid.appendChild(div);
-    })();
-    {% endfor %}
+    }
   } catch(e) { console.warn('cities', e); }
 }
 
@@ -1166,11 +1164,7 @@ startCountdown();
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template_string(
-        _HTML,
-        cities=_CITIES_ORDERED,
-        all_cities=sorted(_ALL_CITIES.keys()),
-    )
+    return render_template_string(_HTML)
 
 
 # ---------------------------------------------------------------------------
