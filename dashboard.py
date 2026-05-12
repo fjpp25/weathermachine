@@ -604,546 +604,557 @@ def api_log():
             except Exception: pass
     return jsonify({"lines":_lb.tail(250),"source":"in-process"})
 
+
+# ---------------------------------------------------------------------------
+# HTML template
+# ---------------------------------------------------------------------------
 _HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>WeatherMachine</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>⛅ WeatherMachine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0d0f14;--panel:#141720;--alt:#181c24;
-  --ac:#00d4a0;--acd:#00896a;
-  --red:#ff4d6a;--yel:#f5c842;--blu:#5599ff;
-  --pri:#e8eaf0;--sec:#7a8099;--bdr:#232736;
-  --nav:60px;--hdr:52px;--r:8px;
+  --bg:#0b0d12;--panel:#111318;--panel2:#161920;--alt:#13161e;
+  --ac:#00d4a0;--acd:#009970;--ac2:rgba(0,212,160,.12);
+  --red:#ff4d6a;--red2:rgba(255,77,106,.12);
+  --yel:#f5c518;--yel2:rgba(245,197,24,.12);
+  --blu:#4d9fff;
+  --pri:#dde2ee;--sec:#5a6278;--ter:#3a3f52;
+  --bdr:#1e2230;--bdr2:#252a3a;
   --f:'JetBrains Mono','Consolas',monospace;
+  --r:6px;--r2:10px;
+  --hdr:52px;--tab:42px;
 }
-html,body{height:100%;background:var(--bg);color:var(--pri);font-family:var(--f);
-  font-size:13px;overscroll-behavior:none;-webkit-font-smoothing:antialiased}
-button{font-family:var(--f)}
-#app{display:flex;flex-direction:column;height:100dvh}
-/* Header */
-#hdr{flex-shrink:0;height:var(--hdr);background:var(--panel);
-  border-bottom:1px solid var(--bdr);display:flex;align-items:center;
-  padding:0 14px;gap:10px;z-index:100}
-#logo{color:var(--ac);font-weight:700;font-size:14px;letter-spacing:1.5px;flex:1}
-#logo small{color:var(--sec);font-weight:400;font-size:10px;display:block;letter-spacing:1px}
-#hdr-r{display:flex;align-items:center;gap:8px}
-#mode-b{font-size:10px;letter-spacing:1.5px;padding:3px 7px;border-radius:4px;
-  border:1px solid var(--ac);color:var(--ac);font-weight:600}
-#mode-b.live{border-color:var(--yel);color:var(--yel)}
-#rbtn{background:none;border:1px solid var(--bdr);color:var(--sec);
-  padding:5px 9px;border-radius:6px;cursor:pointer;font-size:14px;line-height:1}
-#rbtn:hover{border-color:var(--ac);color:var(--ac)}
-#cd{color:var(--sec);font-size:11px;min-width:28px;text-align:right}
-/* Content + tabs */
+html,body{height:100%;background:var(--bg);color:var(--pri);font-family:var(--f);font-size:13px;-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+button,select,input{font-family:var(--f)}
+
+/* ── Layout ── */
+#app{display:flex;flex-direction:column;min-height:100vh}
+
+/* ── Header ── */
+#hdr{height:var(--hdr);background:var(--panel);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:center;padding:0 20px;gap:16px;flex-shrink:0;position:sticky;top:0;z-index:200}
+#logo{color:var(--ac);font-weight:700;font-size:15px;letter-spacing:2px;flex:1}
+#logo small{color:var(--sec);font-weight:400;font-size:9px;letter-spacing:2px;display:block;margin-top:1px}
+.mode-badge{font-size:9px;letter-spacing:2px;padding:3px 8px;border-radius:4px;font-weight:700;border:1px solid var(--ac);color:var(--ac)}
+.mode-badge.live{border-color:var(--yel);color:var(--yel)}
+#hdr-status{color:var(--sec);font-size:11px;min-width:160px;text-align:right}
+#hdr-status.polling{color:var(--ac)}
+
+/* ── Tab bar ── */
+#tabbar{height:var(--tab);background:var(--panel);border-bottom:1px solid var(--bdr);
+  display:flex;align-items:stretch;padding:0 8px;flex-shrink:0;overflow-x:auto}
+.tb{padding:0 16px;font-size:11px;letter-spacing:1px;color:var(--sec);background:none;
+  border:none;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;
+  transition:color .15s,border-color .15s}
+.tb:hover{color:var(--pri)}
+.tb.on{color:var(--ac);border-bottom-color:var(--ac)}
+
+/* ── Content ── */
 #content{flex:1;overflow:hidden}
-.tab{display:none;height:100%;overflow-y:auto;
-  padding:14px 14px calc(var(--nav) + env(safe-area-inset-bottom) + 10px);
-  -webkit-overflow-scrolling:touch}
+.tab{display:none;height:100%;overflow-y:auto;padding:20px}
 .tab.on{display:block}
-/* Bottom nav */
-#nav{position:fixed;bottom:0;left:0;right:0;z-index:200;
-  height:calc(var(--nav) + env(safe-area-inset-bottom));
-  background:var(--panel);border-top:1px solid var(--bdr);
-  display:flex;align-items:flex-start;padding-top:4px}
-.nb{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:3px;background:none;border:none;color:var(--sec);cursor:pointer;
-  transition:color .15s;-webkit-tap-highlight-color:transparent;padding:6px 2px}
-.nb.on{color:var(--ac)}
-.nb svg{width:20px;height:20px}
-.nb span{font-size:9px;letter-spacing:.5px}
-/* Shared helpers */
-.sh{color:var(--sec);font-size:10px;letter-spacing:2px;text-transform:uppercase;
-  margin:18px 0 10px}
+
+/* ── Section heading ── */
+.sh{color:var(--sec);font-size:9px;letter-spacing:2.5px;text-transform:uppercase;
+  margin:24px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--bdr)}
 .sh:first-child{margin-top:0}
-.sg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
-.sg3{grid-template-columns:1fr 1fr 1fr}
-.sc{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r);padding:11px 13px}
-.sk{color:var(--sec);font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px}
-.sv{color:var(--pri);font-size:19px;font-weight:600}
-.g{color:var(--ac)}.r{color:var(--red)}.y{color:var(--yel)}.b{color:var(--blu)}.d{color:var(--sec)}
-/* Balance bar */
-#bal{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:12px 14px;margin-bottom:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.bk{color:var(--sec);font-size:10px;letter-spacing:1px;margin-bottom:2px}
-.bv{font-size:17px;font-weight:600}
-/* City grid */
-#cgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-bottom:14px}
-.cc{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:9px 11px;transition:border-color .2s}
-.cc.ha{border-color:var(--acd)}.cc.la{border-color:#3366aa}.cc.ba{border-color:var(--acd)}
+
+/* ── Balance bar ── */
+#bal-bar{display:flex;gap:24px;padding:14px 20px;background:var(--panel);
+  border-bottom:1px solid var(--bdr);flex-wrap:wrap;flex-shrink:0}
+.bal-item{}
+.bal-k{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:3px}
+.bal-v{font-size:16px;font-weight:600;color:var(--pri)}
+.bal-v.g{color:var(--ac)}
+.bal-v.r{color:var(--red)}
+
+/* ── City grid ── */
+#cgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:20px}
+@media(max-width:1200px){#cgrid{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:900px){#cgrid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:600px){#cgrid{grid-template-columns:repeat(2,1fr)}}
+.cc{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);
+  padding:12px 14px;cursor:pointer;transition:border-color .2s,background .2s}
+.cc:hover{border-color:var(--ter);background:var(--panel2)}
+.cc.ha{border-color:var(--acd)}.cc.la{border-color:#2a4a88}
 .cn{color:var(--sec);font-size:9px;letter-spacing:1.5px;text-transform:uppercase}
-.ct{color:var(--pri);font-size:12px;font-weight:600;margin:3px 0 2px}
-.chi{color:var(--ac);font-size:11px}.clo{color:var(--sec);font-size:11px}
-.cw{font-size:10px;margin-top:3px;color:var(--sec)}
-.cw.h{color:var(--ac)}.cw.l{color:var(--blu)}.cw.b{color:var(--ac)}
-/* Position cards */
-.pc{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:12px 13px;margin-bottom:8px}
-.ph{display:flex;align-items:baseline;gap:8px;margin-bottom:7px}
-.pm{color:var(--pri);font-size:13px;font-weight:500}
-.pe{font-size:10px;padding:1px 6px;border-radius:3px;border:1px solid;font-weight:600}
-.pe.m{color:var(--ac);border-color:var(--acd)}.pe.c{color:var(--blu);border-color:#335599}
-.pr{display:flex;justify-content:space-between;font-size:12px;color:var(--sec);margin-top:3px}
-.pv.no{color:var(--ac)}.pv.yes{color:var(--yel)}
-.ppnl{font-size:15px;font-weight:600}
-.ppnl.pos{color:var(--ac)}.ppnl.neg{color:var(--red)}
-/* Tables */
-.tw{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--bdr);
-  border-radius:var(--r);margin-bottom:14px}
-table{width:100%;border-collapse:collapse;min-width:420px;font-size:12px}
-th{background:var(--bg);color:var(--sec);padding:8px 10px;text-align:left;
-  font-size:10px;letter-spacing:1px;text-transform:uppercase;white-space:nowrap;
-  border-bottom:1px solid var(--bdr);font-weight:500}
-td{padding:9px 10px;border-bottom:1px solid var(--bdr);white-space:nowrap;color:var(--pri)}
-tr:last-child td{border-bottom:none}
-tr:nth-child(even) td{background:var(--alt)}
-td.c{text-align:center}
-/* Charts */
-.cbox{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:12px;margin-bottom:11px}
-.cl{color:var(--sec);font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:9px}
-.cbox canvas{max-height:155px}
-/* Sub-tabs */
-.stabs{display:flex;border-bottom:1px solid var(--bdr);margin-bottom:0}
-.stb{padding:8px 16px;font-size:11px;font-family:var(--f);color:var(--sec);
-  background:none;border:none;cursor:pointer;border-bottom:2px solid transparent;
-  margin-bottom:-1px;transition:color .15s;letter-spacing:.5px}
-.stb.on{color:var(--ac);border-bottom-color:var(--ac)}
-.sp{display:none;padding-top:12px}.sp.on{display:block}
-/* City select */
-.csel{width:100%;background:var(--panel);color:var(--pri);border:1px solid var(--bdr);
-  border-radius:var(--r);padding:10px 28px 10px 12px;font-family:var(--f);font-size:13px;
-  margin-bottom:14px;appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='7'%3E%3Cpath d='M1 1l4.5 5L10 1' stroke='%237a8099' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 11px center}
-/* Log */
-#log-out{background:var(--bg);border:1px solid var(--bdr);border-radius:var(--r);
-  padding:12px;font-size:11px;color:var(--sec);line-height:1.65;white-space:pre-wrap;
-  word-break:break-all;min-height:260px;max-height:65vh;overflow-y:auto;
-  -webkit-overflow-scrolling:touch}
-/* Misc */
-.empty{color:var(--sec);font-size:12px;padding:16px;text-align:center;
-  border:1px solid var(--bdr);border-radius:var(--r)}
-.spin{width:24px;height:24px;border:2px solid var(--bdr);border-top-color:var(--ac);
-  border-radius:50%;animation:spin .8s linear infinite;margin:24px auto}
+.ctime{color:var(--pri);font-size:11px;font-weight:500;margin:4px 0 2px}
+.cnow{color:var(--ac);font-size:12px;font-weight:600}
+.chi{color:var(--ac);font-size:11px}
+.clo{color:var(--sec);font-size:11px}
+.cwin{font-size:10px;margin-top:4px;color:var(--sec)}
+.cwin.ha{color:var(--ac)}.cwin.la{color:var(--blu)}
+
+/* ── Positions table ── */
+.tbl-wrap{overflow-x:auto;border:1px solid var(--bdr);border-radius:var(--r2);margin-bottom:20px}
+table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}
+thead th{background:var(--bg);color:var(--sec);padding:10px 14px;text-align:left;
+  font-size:9px;letter-spacing:1.5px;text-transform:uppercase;border-bottom:1px solid var(--bdr);font-weight:500}
+tbody td{padding:10px 14px;border-bottom:1px solid var(--bdr);color:var(--pri)}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:var(--panel2)}
+tbody tr.total-row td{background:var(--bg);color:var(--sec);font-weight:600}
+tbody tr.total-row td.qty-total{color:var(--ac)}
+td.center{text-align:center}
+.eng{font-size:10px;padding:2px 6px;border-radius:3px;border:1px solid;font-weight:600;letter-spacing:.5px}
+.eng.main{color:var(--ac);border-color:var(--acd)}
+.eng.cascade{color:var(--blu);border-color:#2a4a88}
+.eng.near_cap{color:var(--yel);border-color:#7a6200}
+.eng.tomorrow{color:#c084fc;border-color:#6b21a8}
+.side-no{color:var(--ac)}.side-yes{color:var(--yel)}
+.pnl-pos{color:var(--ac)}.pnl-neg{color:var(--red)}
+.status-live{color:var(--ac)}.status-settled{color:var(--sec)}
+
+/* ── Sub-tabs ── */
+.stabs{display:flex;border-bottom:1px solid var(--bdr);margin-bottom:16px;gap:0}
+.stb{padding:8px 16px;font-size:11px;color:var(--sec);background:none;border:none;
+  border-bottom:2px solid transparent;cursor:pointer;letter-spacing:.5px;transition:color .15s}
+.stb:hover{color:var(--pri)}.stb.on{color:var(--ac);border-bottom-color:var(--ac)}
+.sp{display:none}.sp.on{display:block}
+
+/* ── Buttons ── */
+.btn{padding:6px 14px;border-radius:var(--r);border:1px solid var(--bdr);background:none;
+  color:var(--sec);cursor:pointer;font-size:11px;transition:all .15s}
+.btn:hover{border-color:var(--ac);color:var(--ac)}
+.btn.active{border-color:var(--ac);color:var(--ac);background:var(--ac2)}
+
+/* ── Log ── */
+#log-out{background:var(--bg);border:1px solid var(--bdr);border-radius:var(--r2);
+  padding:14px;font-size:11px;color:var(--sec);line-height:1.7;white-space:pre-wrap;
+  word-break:break-all;height:calc(100vh - 200px);overflow-y:auto}
+.log-info{color:var(--sec)}.log-warn{color:var(--yel)}.log-err{color:var(--red)}
+.log-sig{color:var(--ac)}.log-trade{color:#c084fc}
+
+/* ── Stat cards ── */
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:20px}
+.stat-card{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);padding:14px 16px}
+.stat-k{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+.stat-v{font-size:22px;font-weight:600}
+
+/* ── City modal ── */
+#modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;
+  align-items:center;justify-content:center}
+#modal-bg.on{display:flex}
+#modal{background:var(--panel);border:1px solid var(--bdr2);border-radius:var(--r2);
+  width:min(700px,95vw);max-height:85vh;overflow-y:auto;padding:24px}
+.modal-close{float:right;background:none;border:none;color:var(--sec);font-size:20px;
+  cursor:pointer;line-height:1}
+.modal-close:hover{color:var(--pri)}
+
+/* ── Refresh bar ── */
+.refresh-bar{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.refresh-bar .btn{padding:5px 12px}
+#refresh-cd{color:var(--sec);font-size:11px}
+
+/* ── Empty / spinner ── */
+.empty{color:var(--sec);text-align:center;padding:32px;font-size:12px}
+.spin{width:20px;height:20px;border:2px solid var(--bdr);border-top-color:var(--ac);
+  border-radius:50%;animation:spin .7s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.fbar{display:flex;gap:6px;margin-bottom:12px}
-.fb{padding:5px 12px;border-radius:4px;font-family:var(--f);font-size:11px;
-  border:1px solid var(--bdr);background:none;color:var(--sec);cursor:pointer}
-.fb.on{border-color:var(--ac);color:var(--ac);background:rgba(0,212,160,.08)}
+
+/* ── Charts ── */
+.chart-box{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);
+  padding:16px;margin-bottom:16px}
+.chart-lbl{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}
+.chart-box canvas{max-height:200px}
 </style>
 </head>
 <body>
 <div id="app">
+
+<!-- Header -->
 <header id="hdr">
-  <div id="logo">⛅ WeatherMachine<small>KALSHI TEMPERATURE MARKETS</small></div>
-  <div id="hdr-r">
-    <span id="cd">60s</span>
-    <button id="rbtn" onclick="manualRefresh()">↻</button>
-    <div id="mode-b">DEMO</div>
-  </div>
+  <div id="logo">⛅ WEATHERMACHINE<small>KALSHI TEMPERATURE MARKETS</small></div>
+  <span class="mode-badge" id="mode-badge">DEMO</span>
+  <button class="btn" onclick="refreshAll()" title="Refresh all data">↻ Refresh</button>
+  <div id="hdr-status">Initialising...</div>
 </header>
 
+<!-- Balance bar -->
+<div id="bal-bar">
+  <div class="bal-item"><div class="bal-k">Balance</div><div class="bal-v" id="b-bal">—</div></div>
+  <div class="bal-item"><div class="bal-k">Deployable</div><div class="bal-v" id="b-dep">—</div></div>
+  <div class="bal-item"><div class="bal-k">Portfolio</div><div class="bal-v" id="b-prt">—</div></div>
+  <div class="bal-item"><div class="bal-k">Unrealised</div><div class="bal-v" id="b-unr">—</div></div>
+  <div class="bal-item"><div class="bal-k">Open</div><div class="bal-v" id="b-open">—</div></div>
+</div>
+
+<!-- Tab bar -->
+<div id="tabbar">
+  <button class="tb on" data-tab="home" onclick="switchTab('home',this)">Home</button>
+  <button class="tb" data-tab="session" onclick="switchTab('session',this)">Session</button>
+  <button class="tb" data-tab="log" onclick="switchTab('log',this)">Log</button>
+  <button class="tb" data-tab="perf" onclick="switchTab('perf',this)">Performance</button>
+</div>
+
+<!-- Content -->
 <div id="content">
-  <!-- HOME -->
-  <div id="tab-home" class="tab on">
-    <div id="bal">
-      <div><div class="bk">Balance</div><div class="bv" id="b-bal">—</div></div>
-      <div><div class="bk">Deployable</div><div class="bv g" id="b-dep">—</div></div>
-      <div><div class="bk">Portfolio</div><div class="bv" id="b-port">—</div></div>
-      <div><div class="bk">Unrealised</div><div class="bv" id="b-unr">—</div></div>
-    </div>
-    <div class="sh">City Status</div>
-    <div id="cgrid">
-      {% for city in cities %}
-      <div class="cc" id="cc-{{ city|replace(' ','_') }}">
-        <div class="cn">{{ city }}</div>
-        <div class="ct">--:--</div>
-        <div class="chi">hi: --°  fcst: --°</div>
-        <div class="clo">lo: --°  fcst: --°</div>
-        <div class="cw">—</div>
-      </div>
-      {% endfor %}
-    </div>
-    <div class="sh">Open Positions</div>
-    <div id="home-pos"><div class="empty">No open positions</div></div>
-  </div>
 
-  <!-- SESSION -->
-  <div id="tab-session" class="tab">
-    <div class="sg sg3">
-      <div class="sc"><div class="sk">Entries</div><div class="sv" id="se-ent">—</div></div>
-      <div class="sc"><div class="sk">Open</div><div class="sv g" id="se-opn">—</div></div>
-      <div class="sc"><div class="sk">Stopped</div><div class="sv" id="se-stp">—</div></div>
-      <div class="sc"><div class="sk">Avg Score</div><div class="sv" id="se-scr">—</div></div>
-      <div class="sc" style="grid-column:span 2">
-        <div class="sk">Unrealised PnL</div><div class="sv" id="se-unr">—</div>
-      </div>
-    </div>
-    <div class="fbar">
-      <button class="fb on" onclick="sfilt('all',this)">All</button>
-      <button class="fb" onclick="sfilt('HIGH',this)">High</button>
-      <button class="fb" onclick="sfilt('LOW',this)">Low</button>
-    </div>
-    <div id="sess-pos"><div class="empty">No positions this session</div></div>
-  </div>
+<!-- ── HOME ── -->
+<div class="tab on" id="tab-home">
+  <div class="sh">CITY STATUS</div>
+  <div id="cgrid"></div>
+</div>
 
-  <!-- PERFORMANCE -->
-  <div id="tab-performance" class="tab">
-    <div class="sg sg3">
-      <div class="sc"><div class="sk">Trades</div><div class="sv" id="pp-tot">—</div></div>
-      <div class="sc"><div class="sk">Win Rate</div><div class="sv" id="pp-wr">—</div></div>
-      <div class="sc"><div class="sk">Net PnL</div><div class="sv" id="pp-pnl">—</div></div>
-      <div class="sc"><div class="sk">Total Fees</div><div class="sv d" id="pp-fee">—</div></div>
-      <div class="sc"><div class="sk">Best Day</div><div class="sv g" id="pp-best">—</div></div>
-      <div class="sc"><div class="sk">Worst Day</div><div class="sv r" id="pp-worst">—</div></div>
-    </div>
-    <div class="cbox"><div class="cl">Equity Curve — Cumulative Net PnL</div><canvas id="ch-eq"></canvas></div>
-    <div class="cbox"><div class="cl">Rolling 7-Day Win Rate</div><canvas id="ch-wr"></canvas></div>
-    <div class="stabs">
-      <button class="stb on" onclick="stab('perf','byday',this)">By Day</button>
-      <button class="stb" onclick="stab('perf','sett',this)">All Settlements</button>
-    </div>
-    <div id="perf-byday" class="sp on">
-      <div class="tw"><table id="t-byday">
-        <thead><tr><th>Date</th><th>T</th><th>W</th><th>L</th><th>Win%</th><th>Net PnL</th><th>Cum PnL</th></tr></thead>
-        <tbody></tbody></table></div>
-    </div>
-    <div id="perf-sett" class="sp">
-      <div class="tw"><table id="t-sett">
-        <thead><tr><th>Date</th><th>Market</th><th>Side</th><th>Qty</th><th>Result</th><th>Net PnL</th></tr></thead>
-        <tbody></tbody></table></div>
-    </div>
+<!-- ── SESSION ── -->
+<div class="tab" id="tab-session">
+  <div class="refresh-bar">
+    <button class="btn" onclick="loadSession()">↻ Refresh</button>
+    <span id="refresh-cd"></span>
+    <span id="sess-summary" style="color:var(--sec);font-size:11px;margin-left:auto"></span>
   </div>
-
-  <!-- CITY HISTORY -->
-  <div id="tab-city" class="tab">
-    <select class="csel" id="city-sel" onchange="loadCity(this.value)">
-      <option value="">— select city —</option>
-      {% for city in all_cities %}<option value="{{ city }}">{{ city }}</option>{% endfor %}
-    </select>
-    <div id="city-body" style="display:none">
-      <div class="sg sg3">
-        <div class="sc"><div class="sk">Win Rate</div><div class="sv" id="ch-wrs">—</div></div>
-        <div class="sc"><div class="sk">Total PnL</div><div class="sv" id="ch-pnl">—</div></div>
-        <div class="sc"><div class="sk">Positions</div><div class="sv" id="ch-pos">—</div></div>
-        <div class="sc"><div class="sk">Avg Conv Hour</div><div class="sv" id="ch-conv">—</div></div>
-        <div class="sc"><div class="sk">Forecast Bias</div><div class="sv" id="ch-bias">—</div></div>
-        <div class="sc"><div class="sk">Latest Obs Hi</div><div class="sv" id="ch-obs">—</div></div>
-      </div>
-      <div class="cbox"><div class="cl">7-Day Rolling Win Rate</div><canvas id="ch-c-wr"></canvas></div>
-      <div class="cbox"><div class="cl">Cumulative PnL ($)</div><canvas id="ch-c-pnl"></canvas></div>
-      <div class="cbox"><div class="cl">Avg PnL by Entry Hour (Local)</div><canvas id="ch-c-hr"></canvas></div>
-      <div class="sh">Position History</div>
-      <div class="tw"><table id="t-city">
-        <thead><tr><th>Date</th><th>Bracket</th><th>Eng</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Outcome</th></tr></thead>
-        <tbody></tbody></table></div>
-    </div>
-    <div id="city-spin" style="display:none"><div class="spin"></div></div>
+  <div class="stabs">
+    <button class="stb on" onclick="switchSess('all',this)">All</button>
+    <button class="stb" onclick="switchSess('high',this)">High</button>
+    <button class="stb" onclick="switchSess('low',this)">Low</button>
   </div>
+  <div class="sp on" id="sp-all"></div>
+  <div class="sp" id="sp-high"></div>
+  <div class="sp" id="sp-low"></div>
+</div>
 
-  <!-- LOG -->
-  <div id="tab-log" class="tab">
-    <div class="sh">Activity Log</div>
-    <pre id="log-out">Loading...</pre>
+<!-- ── LOG ── -->
+<div class="tab" id="tab-log">
+  <div class="refresh-bar">
+    <button class="btn" onclick="loadLog()">↻ Refresh</button>
+    <button class="btn" id="log-follow-btn" onclick="toggleFollow()" title="Auto-scroll to bottom">Follow</button>
+  </div>
+  <pre id="log-out">Loading...</pre>
+</div>
+
+<!-- ── PERFORMANCE ── -->
+<div class="tab" id="tab-perf">
+  <div class="sh">PERFORMANCE</div>
+  <div class="stat-grid" id="perf-stats"></div>
+  <div class="chart-box"><div class="chart-lbl">EQUITY CURVE</div><canvas id="chart-equity"></canvas></div>
+  <div class="chart-box"><div class="chart-lbl">7-DAY ROLLING WIN RATE</div><canvas id="chart-wr"></canvas></div>
+  <div class="sh">SETTLEMENT HISTORY</div>
+  <div class="tbl-wrap" id="perf-table-wrap"></div>
+</div>
+
+</div><!-- /content -->
+
+<!-- City modal -->
+<div id="modal-bg" onclick="closeModal(event)">
+  <div id="modal">
+    <button class="modal-close" onclick="closeModal()">×</button>
+    <div id="modal-content"></div>
   </div>
 </div>
 
-<nav id="nav">
-  <button class="nb on" onclick="go('home',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-      <path d="M3 12L12 3l9 9M5 10v9a1 1 0 001 1h4v-4h4v4h4a1 1 0 001-1v-9"/>
-    </svg><span>Home</span>
-  </button>
-  <button class="nb" onclick="go('session',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-      <rect x="3" y="4" width="18" height="16" rx="2"/>
-      <path d="M7 8h10M7 12h10M7 16h6"/>
-    </svg><span>Session</span>
-  </button>
-  <button class="nb" onclick="go('performance',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-    </svg><span>Perf</span>
-  </button>
-  <button class="nb" onclick="go('city',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-      <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z"/>
-      <circle cx="12" cy="9" r="2.5"/>
-    </svg><span>Cities</span>
-  </button>
-  <button class="nb" onclick="go('log',this)">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-      <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
-      <polyline points="14 2 14 8 20 8"/>
-      <line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
-    </svg><span>Log</span>
-  </button>
-</nav>
-</div>
+</div><!-- /app -->
 
 <script>
-const AC='#00d4a0',RD='#ff4d6a',YL='#f5c842',BL='#5599ff',SC='#7a8099',BD='#232736',PN='#141720';
-let activeTab='home', sf='all', perfLoaded=false, sessData=null, cCharts={}, pCharts={};
-let countdown=60, cdTimer=null;
+// ── State ──────────────────────────────────────────────────────────────────
+let _sessData = [];
+let _sessFilt = 'all';
+let _autoRefresh;
+let _cdSecs = 60;
+let _cdInt;
+let _logFollow = true;
+let _charts = {};
 
-// Chart.js defaults
-const asc=(cb)=>({
-  x:{ticks:{color:SC,font:{family:'JetBrains Mono',size:9},maxTicksLimit:7},grid:{color:BD}},
-  y:{ticks:{color:SC,font:{family:'JetBrains Mono',size:9},callback:cb||undefined},grid:{color:BD}}
-});
-const baseOpts=(cb)=>({responsive:true,maintainAspectRatio:true,
-  plugins:{legend:{display:false},tooltip:{mode:'index',intersect:false,
-    backgroundColor:PN,titleColor:SC,bodyColor:AC,borderColor:BD,borderWidth:1}},
-  scales:asc(cb)});
+const fmt$ = v => v == null ? '—' : '$' + v.toFixed(2);
+const fmtPct = v => v == null ? '—' : v.toFixed(1) + '%';
+const clsPnl = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+const clsEng = e => ({'MAIN':'main','CASCADE':'cascade','NEAR_CAP':'near_cap',
+  'TOMORROW_DISMISSED':'tomorrow'}[e?.toUpperCase()] ?? 'main');
 
-function mkLine(id,labels,data,color,fill,cb,extra){
-  return new Chart(document.getElementById(id).getContext('2d'),{type:'line',
-    data:{labels,datasets:[{data,borderColor:color,borderWidth:2,pointRadius:0,
-      fill:fill?'origin':false,backgroundColor:fill?`${color}22`:undefined,tension:0.3},
-      ...(extra||[])]},options:baseOpts(cb)});
-}
-function mkBar(id,labels,data,colors,cb){
-  return new Chart(document.getElementById(id).getContext('2d'),{type:'bar',
-    data:{labels,datasets:[{data,backgroundColor:colors,borderRadius:3}]},options:baseOpts(cb)});
-}
-
-// Nav
-function go(tab,btn){
-  document.querySelectorAll('.tab').forEach(p=>p.classList.remove('on'));
-  document.querySelectorAll('.nb').forEach(b=>b.classList.remove('on'));
-  document.getElementById('tab-'+tab).classList.add('on');
-  btn.classList.add('on'); activeTab=tab; loadTab(tab);
-}
-function stab(g,n,btn){
-  const pre=`#tab-${g} `;
-  document.querySelectorAll(pre+'.stb').forEach(b=>b.classList.remove('on'));
-  document.querySelectorAll(pre+'.sp').forEach(p=>p.classList.remove('on'));
+// ── Tab switching ──────────────────────────────────────────────────────────
+function switchTab(id, btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('on'));
+  document.querySelectorAll('.tb').forEach(b => b.classList.remove('on'));
+  document.getElementById('tab-' + id).classList.add('on');
   btn.classList.add('on');
-  document.getElementById(g+'-'+n).classList.add('on');
-}
-function sfilt(t,btn){
-  document.querySelectorAll('.fb').forEach(b=>b.classList.remove('on'));
-  btn.classList.add('on'); sf=t;
-  if(sessData) renderSessPos(sessData.positions);
+  if (id === 'session') loadSession();
+  if (id === 'log')     loadLog();
+  if (id === 'perf')    loadPerf();
 }
 
-// Auto-refresh
-function startCd(){
-  clearInterval(cdTimer); countdown=60;
-  cdTimer=setInterval(()=>{
-    countdown--; document.getElementById('cd').textContent=countdown+'s';
-    if(countdown<=0){refreshAll();countdown=60;}
-  },1000);
-}
-function manualRefresh(){refreshAll();countdown=60;document.getElementById('cd').textContent='60s';}
-function refreshAll(){loadTab(activeTab,true);if(activeTab!=='home')loadHome();}
-function loadTab(tab,force){
-  if(tab==='home')        loadHome();
-  if(tab==='session')     loadSession();
-  if(tab==='performance') loadPerf(force);
-  if(tab==='log')         loadLog();
+function switchSess(filt, btn) {
+  document.querySelectorAll('.stb').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('.sp').forEach(s => s.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('sp-' + filt).classList.add('on');
+  _sessFilt = filt;
+  renderSessTable(filt);
 }
 
-// Home
-async function loadHome(){
-  const [st,ci,po]=await Promise.all([
-    fetch('/api/status').then(r=>r.json()).catch(()=>({})),
-    fetch('/api/cities').then(r=>r.json()).catch(()=>({})),
-    fetch('/api/positions').then(r=>r.json()).catch(()=>[]),
-  ]);
-  renderStatus(st); renderCities(ci); renderHomePos(po);
+// ── Refresh cycle ──────────────────────────────────────────────────────────
+function startCountdown() {
+  clearInterval(_cdInt);
+  _cdSecs = 60;
+  _cdInt = setInterval(() => {
+    _cdSecs--;
+    const el = document.getElementById('refresh-cd');
+    if (el) el.textContent = `Next refresh in ${_cdSecs}s`;
+    if (_cdSecs <= 0) { refreshAll(); startCountdown(); }
+  }, 1000);
 }
-function fmt$(v){return v!=null?'$'+v.toFixed(2):'—';}
-function renderStatus(s){
-  if(!s.balance && s.balance!==0) return;
-  document.getElementById('b-bal').textContent=fmt$(s.balance);
-  document.getElementById('b-dep').textContent=fmt$(s.deployable);
-  document.getElementById('b-port').textContent=fmt$(s.portfolio);
-  const u=s.unrealised||0, el=document.getElementById('b-unr');
-  el.textContent=(u>=0?'+':'')+fmt$(Math.abs(u));
-  el.className='bv '+(u>0?'g':u<0?'r':'');
-  const mb=document.getElementById('mode-b');
-  mb.textContent=s.mode; mb.className=s.mode==='LIVE'?'live':'';
+
+function refreshAll() {
+  setStatus('Refreshing...');
+  Promise.all([loadStatus(), loadCities(), loadSession()]).then(() => {
+    setStatus('Ready');
+    startCountdown();
+  });
 }
-function renderCities(cities){
-  for(const[city,d] of Object.entries(cities)){
-    const id='cc-'+city.replace(/ /g,'_');
-    const el=document.getElementById(id); if(!el) continue;
-    const ch=el.children;
-    ch[1].textContent=d.local_time+' '+d.tz_abbr;
-    const hi=d.obs_hi!=null?d.obs_hi.toFixed(0)+'°':'--°';
-    const fhi=d.fcst_hi!=null?d.fcst_hi.toFixed(0)+'°':'--°';
-    ch[2].textContent='hi: '+hi+'  fcst: '+fhi;
-    const lo=d.obs_lo!=null?d.obs_lo.toFixed(0)+'°':'--°';
-    const flo=d.fcst_lo!=null?d.fcst_lo.toFixed(0)+'°':'--°';
-    ch[3].textContent='lo: '+lo+'  fcst: '+flo;
-    el.className='cc';
-    if(d.high_active&&d.lowt_active){el.classList.add('ba');ch[4].className='cw b';ch[4].textContent=d.window;}
-    else if(d.high_active){el.classList.add('ha');ch[4].className='cw h';ch[4].textContent=d.window;}
-    else if(d.lowt_active){el.classList.add('la');ch[4].className='cw l';ch[4].textContent=d.window;}
-    else{ch[4].className='cw';ch[4].textContent='between windows';}
+
+function setStatus(msg, polling=false) {
+  const el = document.getElementById('hdr-status');
+  el.textContent = msg;
+  el.className = polling ? 'polling' : '';
+}
+
+// ── Status / balance ───────────────────────────────────────────────────────
+async function loadStatus() {
+  try {
+    const d = await fetch('/api/status').then(r => r.json());
+    document.getElementById('b-bal').textContent  = fmt$(d.balance);
+    document.getElementById('b-dep').textContent  = fmt$(d.deployable);
+    document.getElementById('b-prt').textContent  = fmt$(d.portfolio);
+    document.getElementById('b-open').textContent = d.open ?? '—';
+    const unr = d.unrealised ?? 0;
+    const uEl = document.getElementById('b-unr');
+    uEl.textContent = (unr >= 0 ? '+' : '') + fmt$(unr);
+    uEl.className   = 'bal-v ' + clsPnl(unr);
+    const mb = document.getElementById('mode-badge');
+    mb.textContent  = d.mode;
+    mb.className    = 'mode-badge' + (d.mode === 'LIVE' ? ' live' : '');
+  } catch(e) { console.warn('status', e); }
+}
+
+// ── Cities ─────────────────────────────────────────────────────────────────
+async function loadCities() {
+  try {
+    const cities = await fetch('/api/cities').then(r => r.json());
+    const grid = document.getElementById('cgrid');
+    grid.innerHTML = '';
+    {% for city in cities %}
+    (function() {
+      const city = {{ city | tojson }};
+      const d = cities[city] || {};
+      const div = document.createElement('div');
+      const ha = d.high_active, la = d.lowt_active;
+      div.className = 'cc' + (ha ? ' ha' : '') + (la ? ' la' : '');
+      div.onclick = () => openCityModal(city);
+      const now  = d.now  != null ? d.now.toFixed(0) + '°' : '—';
+      const obsH = d.obs_hi  != null ? d.obs_hi.toFixed(0)  + '°' : '--°';
+      const fcsH = d.fcst_hi != null ? d.fcst_hi.toFixed(0) + '°' : '--°';
+      const obsL = d.obs_lo  != null ? d.obs_lo.toFixed(0)  + '°' : '--°';
+      const fcsL = d.fcst_lo != null ? d.fcst_lo.toFixed(0) + '°' : '--°';
+      const win  = d.window || 'between windows';
+      const winCls = ha && la ? 'ba' : ha ? 'ha' : la ? 'la' : '';
+      div.innerHTML = `
+        <div class="cn">${city}</div>
+        <div class="ctime">${d.local_time || '--:--'} ${d.tz_abbr || ''}</div>
+        <div class="cnow">now: ${now}</div>
+        <div class="chi">hi: ${obsH}&nbsp; fcst: ${fcsH}</div>
+        <div class="clo">lo: ${obsL}&nbsp; fcst: ${fcsL}</div>
+        <div class="cwin ${winCls}">${win}</div>`;
+      grid.appendChild(div);
+    })();
+    {% endfor %}
+  } catch(e) { console.warn('cities', e); }
+}
+
+// ── Session ────────────────────────────────────────────────────────────────
+async function loadSession() {
+  try {
+    const d = await fetch('/api/session').then(r => r.json());
+    _sessData = d.positions || [];
+    const unr = d.unrealised ?? 0;
+    document.getElementById('sess-summary').textContent =
+      `${d.open} open  |  unrealised ${unr >= 0 ? '+' : ''}${fmt$(unr)}`;
+    renderSessTable(_sessFilt);
+  } catch(e) { console.warn('session', e); }
+}
+
+function renderSessTable(filt) {
+  let rows = _sessData;
+  if (filt === 'high') rows = rows.filter(r => r.market_type === 'HIGH');
+  if (filt === 'low')  rows = rows.filter(r => r.market_type !== 'HIGH');
+  const sp = document.getElementById('sp-' + filt);
+  if (!rows.length) { sp.innerHTML = '<div class="empty">No open positions</div>'; return; }
+
+  const totalQty = rows.reduce((s, r) => s + (r.contracts || 1), 0);
+  const cols = ['Time','Market','Bracket','Engine','Side','Qty','Entry','Score','Unreal. PnL','Status'];
+  let html = `<div class="tbl-wrap"><table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>`;
+  for (const r of rows) {
+    const unr = r.unrealised ?? 0;
+    const eng = r.engine || 'MAIN';
+    const time = (r.entered_at || '').split(' ')[1] || '—';
+    html += `<tr>
+      <td>${time} UTC</td>
+      <td>${r.market || '—'}</td>
+      <td>${r.bracket || '—'}</td>
+      <td><span class="eng ${clsEng(eng)}">${eng}</span></td>
+      <td class="center"><span class="${r.side==='NO'?'side-no':'side-yes'}">${r.side||'—'}</span></td>
+      <td class="center">${r.contracts || 1}</td>
+      <td>${fmt$(r.avg_cost)}</td>
+      <td class="center">${r.score || '—'}</td>
+      <td class="${clsPnl(unr)}">${unr>=0?'+':''}${fmt$(unr)}</td>
+      <td><span class="status-live">Open</span></td>
+    </tr>`;
+  }
+  // Total row
+  html += `<tr class="total-row"><td colspan="4"></td><td></td><td class="center qty-total">${totalQty}</td><td colspan="4"></td></tr>`;
+  html += '</tbody></table></div>';
+  sp.innerHTML = html;
+}
+
+// ── Log ────────────────────────────────────────────────────────────────────
+async function loadLog() {
+  try {
+    const d = await fetch('/api/log').then(r => r.json());
+    const el = document.getElementById('log-out');
+    const lines = (d.lines || []).join('\n');
+    // Colour-code log lines
+    el.innerHTML = lines.split('\n').map(line => {
+      let cls = 'log-info';
+      if (/WARNING|WARN/.test(line))  cls = 'log-warn';
+      if (/ERROR|FAIL/.test(line))    cls = 'log-err';
+      if (/★|SIGNAL|NEAR_CAP|GRAD/.test(line)) cls = 'log-sig';
+      if (/order|placed|BUY|SELL/.test(line))  cls = 'log-trade';
+      return `<span class="${cls}">${escHtml(line)}</span>`;
+    }).join('\n');
+    if (_logFollow) el.scrollTop = el.scrollHeight;
+  } catch(e) { console.warn('log', e); }
+}
+
+function toggleFollow() {
+  _logFollow = !_logFollow;
+  document.getElementById('log-follow-btn').classList.toggle('active', _logFollow);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Performance ────────────────────────────────────────────────────────────
+async function loadPerf() {
+  try {
+    const d = await fetch('/api/performance').then(r => r.json());
+    const s = d.stats || {};
+    const stats = [
+      ['Win Rate', fmtPct(s.win_rate), s.win_rate >= 85 ? 'g' : ''],
+      ['Net PnL',  fmt$(s.net_pnl),    s.net_pnl  >= 0  ? 'g' : 'r'],
+      ['Total Fees', fmt$(s.total_fees), ''],
+      ['Total Trades', s.total ?? '—', ''],
+      ['Best Day',  fmt$(s.best_day),  'g'],
+      ['Worst Day', fmt$(s.worst_day), s.worst_day < 0 ? 'r' : ''],
+    ];
+    document.getElementById('perf-stats').innerHTML = stats.map(([k,v,c])=>
+      `<div class="stat-card"><div class="stat-k">${k}</div><div class="stat-v ${c}">${v}</div></div>`
+    ).join('');
+
+    // Equity chart
+    _buildChart('chart-equity', d.chart?.equity || [], 'Equity ($)', 'var(--ac)', 'var(--ac2)');
+    _buildChart('chart-wr',     d.chart?.win_rate || [], 'Win Rate (%)', 'var(--blu)', 'rgba(77,159,255,.1)');
+
+    // Settlement table
+    const rows = d.all_settlements || [];
+    if (!rows.length) {
+      document.getElementById('perf-table-wrap').innerHTML = '<div class="empty">No settlements yet</div>';
+      return;
+    }
+    let html = `<table><thead><tr>
+      <th>Date</th><th>Market</th><th>Bracket</th><th>Entry</th><th>Net PnL</th><th>Result</th>
+    </tr></thead><tbody>`;
+    for (const r of rows) {
+      const cls = r.result_class === 'green' ? 'pnl-pos' : r.result_class === 'red' ? 'pnl-neg' : '';
+      html += `<tr>
+        <td>${r.date || '—'}</td>
+        <td>${r.market_label || r.ticker}</td>
+        <td>${(r.ticker||'').split('-').pop()}</td>
+        <td>${fmt$(r.avg_entry || r.entry_price)}</td>
+        <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+        <td class="${cls}">${r.result_label}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    document.getElementById('perf-table-wrap').innerHTML = html;
+  } catch(e) { console.warn('perf', e); }
+}
+
+function _buildChart(id, data, label, color, fill) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (_charts[id]) { _charts[id].destroy(); }
+  _charts[id] = new Chart(canvas, {
+    type: 'line',
+    data: { datasets: [{ label, data, borderColor: color, backgroundColor: fill,
+      borderWidth: 1.5, pointRadius: 0, fill: true, tension: 0.3 }] },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      scales: {
+        x: { type:'category', ticks:{ color:'#5a6278', font:{family:'JetBrains Mono',size:10} },
+             grid:{ color:'#1e2230' } },
+        y: { ticks:{ color:'#5a6278', font:{family:'JetBrains Mono',size:10} },
+             grid:{ color:'#1e2230' } }
+      },
+      plugins: { legend:{ display:false } }
+    }
+  });
+}
+
+// ── City modal ─────────────────────────────────────────────────────────────
+async function openCityModal(city) {
+  document.getElementById('modal-bg').classList.add('on');
+  document.getElementById('modal-content').innerHTML =
+    '<div style="text-align:center;padding:24px"><span class="spin"></span> Loading ' + city + '...</div>';
+  try {
+    const d = await fetch('/api/city/' + encodeURIComponent(city)).then(r => r.json());
+    const s = d.stats || {};
+    const pos = d.positions || [];
+    let html = `<h2 style="color:var(--ac);font-size:16px;font-weight:700;margin-bottom:16px">⛅ ${city}</h2>`;
+    html += `<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
+      ${[['Win Rate',fmtPct(s.win_rate),''],['Net PnL',fmt$(s.total_pnl),s.total_pnl>=0?'g':'r'],
+         ['Positions',s.positions,''],['Avg Conv',s.avg_conv,''],['Bias',s.bias,''],['Obs Hi',s.obs_hi,'']]
+        .map(([k,v,c])=>`<div class="stat-card"><div class="stat-k">${k}</div><div class="stat-v ${c}" style="font-size:16px">${v}</div></div>`).join('')}
+    </div>`;
+    if (pos.length) {
+      html += `<div class="sh" style="margin-top:0">POSITION HISTORY</div>
+        <div class="tbl-wrap"><table><thead><tr>
+          <th>Date</th><th>Bracket</th><th>Engine</th><th>Entry</th><th>PnL</th><th>Result</th>
+        </tr></thead><tbody>`;
+      for (const p of pos.slice(0,20)) {
+        const cls = p.outcome==='win'?'pnl-pos':p.outcome==='loss'?'pnl-neg':'';
+        html += `<tr><td>${p.date||'—'}</td><td>${p.bracket||'—'}</td>
+          <td><span class="eng ${clsEng(p.engine)}">${p.engine||'MAIN'}</span></td>
+          <td>${p.entry||'—'}</td>
+          <td class="${cls}">${p.pnl>=0?'+':''}${fmt$(p.pnl)}</td>
+          <td class="${cls}">${p.outcome_label||'—'}</td></tr>`;
+      }
+      html += '</tbody></table></div>';
+    } else {
+      html += '<div class="empty">No position history for this city</div>';
+    }
+    document.getElementById('modal-content').innerHTML = html;
+  } catch(e) {
+    document.getElementById('modal-content').innerHTML = '<div class="empty">Failed to load city data</div>';
   }
 }
-function posCard(p){
-  const u=p.unrealised||0,s=u>=0?'+':'',cls=u>0?'pos':u<0?'neg':'';
-  const eg=(p.engine||'MAIN').toUpperCase(),ec=eg==='CASCADE'?'c':'m';
-  const cur=p.current_price?` · curr $${p.current_price.toFixed(2)}`:'';
-  return `<div class="pc">
-    <div class="ph"><span class="pm">${p.market}</span><span class="pe ${ec}">${eg}</span></div>
-    <div class="pr"><span>Side</span><span class="pv ${p.side.toLowerCase()}">${p.side}</span></div>
-    <div class="pr"><span>${p.contracts}c @ $${p.avg_cost.toFixed(2)}${cur}</span>
-      <span class="ppnl ${cls}">${s}$${Math.abs(u).toFixed(2)}</span></div>
-    <div class="pr"><span>${p.bracket} · ${p.market_type}</span>
-      <span class="d" style="font-size:11px">${p.last_updated?p.last_updated.slice(0,16).replace('T',' '):'—'}</span>
-    </div></div>`;
-}
-function renderHomePos(pos){
-  const el=document.getElementById('home-pos');
-  el.innerHTML=pos.length?pos.map(posCard).join(''):'<div class="empty">No open positions</div>';
+
+function closeModal(e) {
+  if (!e || e.target === document.getElementById('modal-bg'))
+    document.getElementById('modal-bg').classList.remove('on');
 }
 
-// Session
-async function loadSession(){
-  sessData=await fetch('/api/session').then(r=>r.json()).catch(()=>null);
-  if(!sessData) return;
-  document.getElementById('se-ent').textContent=sessData.entries;
-  document.getElementById('se-opn').textContent=sessData.open;
-  document.getElementById('se-stp').textContent=sessData.stopped;
-  document.getElementById('se-scr').textContent=sessData.avg_score;
-  const u=sessData.unrealised||0, el=document.getElementById('se-unr');
-  el.textContent=(u>=0?'+':'')+'$'+Math.abs(u).toFixed(2);
-  el.className='sv '+(u>0?'g':u<0?'r':'');
-  renderSessPos(sessData.positions);
-}
-function renderSessPos(pos){
-  let f=pos;
-  if(sf==='HIGH') f=pos.filter(p=>p.market_type==='HIGH');
-  if(sf==='LOW')  f=pos.filter(p=>p.market_type==='LOW');
-  const el=document.getElementById('sess-pos');
-  el.innerHTML=f.length?f.map(p=>{
-    const u=p.unrealised||0,s=u>=0?'+':'',cls=u>0?'pos':u<0?'neg':'';
-    const eg=(p.engine||'MAIN').toUpperCase(),ec=eg==='CASCADE'?'c':'m';
-    return `<div class="pc">
-      <div class="ph"><span class="pm">${p.market}</span><span class="pe ${ec}">${eg}</span></div>
-      <div class="pr"><span>Side</span><span class="pv ${p.side.toLowerCase()}">${p.side}</span></div>
-      <div class="pr"><span>${p.contracts}c @ $${p.avg_cost.toFixed(2)} · ${p.score}</span>
-        <span class="ppnl ${cls}">${s}$${Math.abs(u).toFixed(2)}</span></div>
-      <div class="pr"><span>${p.bracket} · ${p.market_type}</span>
-        <span class="d">${p.entered_at||'—'}</span></div></div>`;
-  }).join(''):'<div class="empty">No positions</div>';
-}
+document.addEventListener('keydown', e => { if (e.key==='Escape') closeModal(); });
 
-// Performance
-async function loadPerf(force){
-  if(perfLoaded&&!force) return;
-  const d=await fetch('/api/performance').then(r=>r.json()).catch(()=>null);
-  if(!d) return; perfLoaded=true;
-  if(d.stats&&d.stats.total) renderPerfStats(d.stats);
-  if(d.chart) renderPerfCharts(d.chart);
-  if(d.by_day) renderByDay(d.by_day);
-  if(d.all_settlements) renderSett(d.all_settlements);
-}
-function renderPerfStats(s){
-  document.getElementById('pp-tot').textContent=s.total;
-  const we=document.getElementById('pp-wr');
-  we.textContent=s.win_rate+'%'; we.className='sv '+(s.win_rate>=70?'g':s.win_rate>=50?'y':'r');
-  const pe=document.getElementById('pp-pnl');
-  pe.textContent=(s.net_pnl>=0?'+':'')+'$'+s.net_pnl.toFixed(2);
-  pe.className='sv '+(s.net_pnl>=0?'g':'r');
-  document.getElementById('pp-fee').textContent='$'+s.total_fees.toFixed(2);
-  document.getElementById('pp-best').textContent='+$'+s.best_day.toFixed(2);
-  document.getElementById('pp-worst').textContent='$'+s.worst_day.toFixed(2);
-}
-function renderPerfCharts(c){
-  if(pCharts.eq){pCharts.eq.destroy();pCharts.wr.destroy();}
-  const ref={data:c.win_rate.map(()=>70),borderColor:'rgba(0,137,106,.4)',
-    borderWidth:1,borderDash:[4,4],pointRadius:0,fill:false};
-  pCharts.eq=mkLine('ch-eq',c.equity.map(p=>p.x),c.equity.map(p=>p.y),AC,true,v=>'$'+v.toFixed(2));
-  pCharts.wr=mkLine('ch-wr',c.win_rate.map(p=>p.x),c.win_rate.map(p=>p.y),YL,true,v=>v+'%',[ref]);
-  pCharts.wr.options.scales.y.min=0;pCharts.wr.options.scales.y.max=100;pCharts.wr.update();
-}
-function renderByDay(rows){
-  document.querySelector('#t-byday tbody').innerHTML=rows.map(r=>`<tr>
-    <td class="d">${r.date}</td><td class="c">${r.trades}</td>
-    <td class="c g">${r.wins}</td>
-    <td class="c ${r.losses>0?'r':'d'}">${r.losses}</td>
-    <td class="c">${r.win_pct}</td>
-    <td class="${r.net_pnl>=0?'g':'r'}">${r.net_pnl>=0?'+':''}$${r.net_pnl.toFixed(2)}</td>
-    <td class="${r.cum_pnl>=0?'g':'r'}">${r.cum_pnl>=0?'+':''}$${r.cum_pnl.toFixed(2)}</td>
-  </tr>`).join('');
-}
-function renderSett(rows){
-  document.querySelector('#t-sett tbody').innerHTML=rows.map(r=>`<tr>
-    <td class="d">${r.date}</td><td>${r.market_label||r.ticker}</td>
-    <td class="${r.side==='NO'?'g':'y'}">${r.side}</td>
-    <td class="c">${r.contracts}</td>
-    <td class="${r.result_class}">${r.result_label}</td>
-    <td class="${r.net_pnl>=0?'g':'r'}">${r.net_pnl>=0?'+':''}$${r.net_pnl.toFixed(2)}</td>
-  </tr>`).join('');
-}
-
-// City history
-async function loadCity(city){
-  if(!city) return;
-  document.getElementById('city-body').style.display='none';
-  document.getElementById('city-spin').style.display='block';
-  const d=await fetch('/api/city/'+encodeURIComponent(city)).then(r=>r.json()).catch(()=>null);
-  document.getElementById('city-spin').style.display='none';
-  if(!d) return;
-  document.getElementById('city-body').style.display='block';
-  renderCityStats(d.stats); renderCityCharts(d.chart); renderCityPos(d.positions);
-}
-function renderCityStats(s){
-  const we=document.getElementById('ch-wrs');
-  we.textContent=s.win_rate+'%'; we.className='sv '+(s.win_rate>=90?'g':s.win_rate>=75?'y':'r');
-  const pe=document.getElementById('ch-pnl');
-  pe.textContent=(s.total_pnl>=0?'+':'')+'$'+s.total_pnl.toFixed(2);
-  pe.className='sv '+(s.total_pnl>=0?'g':'r');
-  document.getElementById('ch-pos').textContent=s.positions;
-  document.getElementById('ch-conv').textContent=s.avg_conv;
-  document.getElementById('ch-bias').textContent=s.bias;
-  document.getElementById('ch-obs').textContent=s.obs_hi;
-}
-function renderCityCharts(c){
-  for(const k of Object.keys(cCharts)) if(cCharts[k]){cCharts[k].destroy();cCharts[k]=null;}
-  cCharts.wr=mkLine('ch-c-wr',c.rolling_wr.map(p=>p.x),c.rolling_wr.map(p=>p.y),AC,true,v=>v+'%');
-  cCharts.wr.options.scales.y.min=0;cCharts.wr.options.scales.y.max=100;cCharts.wr.update();
-  cCharts.pnl=mkLine('ch-c-pnl',c.cum_pnl.map(p=>p.x),c.cum_pnl.map(p=>p.y),AC,true,v=>'$'+v.toFixed(2));
-  const hd=c.by_hour,avgs=hd.map(p=>p.avg);
-  cCharts.hr=mkBar('ch-c-hr',hd.map(p=>p.hour+'h'),avgs,
-    avgs.map(v=>v>=0?'rgba(0,212,160,.7)':'rgba(255,77,106,.7)'),v=>'$'+v.toFixed(2));
-}
-function renderCityPos(pos){
-  document.querySelector('#t-city tbody').innerHTML=pos.map(p=>`<tr>
-    <td class="d">${p.date}</td><td>${p.bracket}</td>
-    <td class="${p.engine==='CASCADE'?'b':'g'}">${p.engine}</td>
-    <td class="${p.side==='NO'?'g':'y'}">${p.side}</td>
-    <td>${p.entry}</td><td class="d">${p.exit}</td>
-    <td class="${p.pnl>0?'g':p.pnl<0?'r':'d'}">${p.pnl!==0?(p.pnl>0?'+':'')+'$'+p.pnl.toFixed(2):'—'}</td>
-    <td class="${p.outcome_class}">${p.outcome_label}</td>
-  </tr>`).join('');
-}
-
-// Log
-async function loadLog(){
-  const d=await fetch('/api/log').then(r=>r.json()).catch(()=>null);
-  const el=document.getElementById('log-out');
-  if(!d){el.textContent='Failed to load log';return;}
-  el.textContent=d.lines.join('\n'); el.scrollTop=el.scrollHeight;
-}
-
-// Boot
-loadHome(); startCd();
+// ── Boot ───────────────────────────────────────────────────────────────────
+document.getElementById('log-follow-btn').classList.add('active');
+refreshAll();
+startCountdown();
 </script>
 </body>
 </html>"""
@@ -1151,6 +1162,7 @@ loadHome(); startCd();
 
 # ---------------------------------------------------------------------------
 # Main route
+
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
