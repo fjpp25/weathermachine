@@ -1164,7 +1164,8 @@ startCountdown();
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return render_template_string(_HTML)
+    from flask import Response
+    return Response(_HTML, mimetype='text/html')
 
 
 # ---------------------------------------------------------------------------
