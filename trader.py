@@ -33,6 +33,7 @@ import time
 import base64
 import argparse
 import uuid
+import cascade_engine
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -321,13 +322,15 @@ class EngineCapital:
 
         log.debug(
             "EngineCapital: balance=$%.2f  "
-            "main=$%.2f  cascade=$%.2f  topup=$%.2f  peak=$%.2f  tomorrow=$%.2f",
+            "main=$%.2f  cascade=$%.2f  topup=$%.2f  "
+            "peak=$%.2f  tomorrow=$%.2f  econv=$%.2f",
             self._balance,
-            self._budget.get("main", 0),
-            self._budget.get("cascade", 0),
-            self._budget.get("topup", 0),
-            self._budget.get("peak", 0),
+            self._budget.get("main",     0),
+            self._budget.get("cascade",  0),
+            self._budget.get("topup",    0),
+            self._budget.get("peak",     0),
             self._budget.get("tomorrow", 0),
+            self._budget.get("econv",    0),
         )
 
     @property
@@ -776,6 +779,9 @@ TOPUP_HOUR_END      = 15     # local hour — top-up window closes (inclusive)
 YES_TOPUP_MAX       = 0.30   # max Yes price seen during window to qualify
                               # backtest: <=0.30 gives 98.6% WR, >0.40 turns negative EV
 TOPUP_MAX_CONTRACTS = 3      # additional contracts per top-up signal
+TOPUP_TOTAL_CAP     = 9      # max total contracts across all engines on a single ticker
+                              # higher than MAX_CONTRACTS (3) to allow cascade + main + topup
+                              # to stack without the headroom check silently blocking everything
 NO_TOPUP_MAX_PRICE  = 0.91   # don't top up if No has drifted above this
 
 NO_YES_CEILING      = 0.60   # retained for reference — ceiling exit DISABLED (see check_exits)
@@ -834,15 +840,17 @@ _deployed_today:   float      = 0.0   # main engine    — persists across polls
 _deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
 _deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
 _deployed_tomorrow: float     = 0.0   # tomorrow scanner — persists across polls, resets midnight
+_deployed_econv:   float      = 0.0   # evening convergence — persists across polls, resets midnight
 # ---------------------------------------------------------------------------
 # Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
 ENGINE_ALLOCATIONS: dict[str, float] = {
     "main":     0.30,   # 30% — primary discovery engine
     "cascade":  0.35,   # 35% — highest proven EV (LOWT cascade dominates)
-    "topup":    0.15,   # 15% — augments existing positions
-    "peak":     0.08,   # 8%  — newer signal, conservative start
+    "topup":    0.10,   # 10% — augments existing positions (trimmed from 15%)
+    "peak":     0.08,   # 8%  — intraday peak confirmation
     "tomorrow": 0.12,   # 12% — 100% WR, overnight capital efficiency
+    "econv":    0.05,   # 5%  — evening convergence (3-active, hr>=19, B non-forecast)
 }
 
 # Legacy constants retained for backward compat
@@ -859,7 +867,7 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     based on day-open balance — not disturbed by intraday winning settlements.
     """
     global _day_open_balance, _day_open_date, _deployed_today, \
-           _deployed_cascade, _deployed_peak, _deployed_tomorrow
+           _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
         _day_open_balance   = current_balance
@@ -868,14 +876,16 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
         _deployed_cascade   = 0.0
         _deployed_peak      = 0.0
         _deployed_tomorrow  = 0.0
+        _deployed_econv     = 0.0
         log.info(
             "day snapshot: $%.2f  "
-            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f)",
+            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f)",
             current_balance,
             round(current_balance * ENGINE_ALLOCATIONS["main"],     2),
             round(current_balance * ENGINE_ALLOCATIONS["cascade"],  2),
             round(current_balance * ENGINE_ALLOCATIONS["peak"],     2),
             round(current_balance * ENGINE_ALLOCATIONS["tomorrow"], 2),
+            round(current_balance * ENGINE_ALLOCATIONS["econv"],    2),
         )
 
     main_budget     = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
@@ -923,6 +933,20 @@ def record_tomorrow_deployed(cost: float) -> None:
     _deployed_tomorrow = round(_deployed_tomorrow + cost, 4)
     log.debug("tomorrow deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
               cost, _deployed_tomorrow, get_tomorrow_deployable())
+
+
+def get_econv_deployable() -> float:
+    """Remaining evening convergence budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["econv"], 2)
+    return max(0.0, round(budget - _deployed_econv, 2))
+
+
+def record_econv_deployed(cost: float) -> None:
+    """Record capital deployed by the evening convergence engine."""
+    global _deployed_econv
+    _deployed_econv = round(_deployed_econv + cost, 4)
+    log.debug("econv deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_econv, get_econv_deployable())
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -984,7 +1008,7 @@ def _no_stop_threshold(local_hour: int) -> float:
 
 
 def _city_local_hour(city: str) -> int:
-    """Return the current local hour for a city. Defaults to 12 if unknown."""
+    """Return the current local hour for a city. Falls back to UTC hour."""
     try:
         from cities import CITIES as _CITIES
         tz_name = _CITIES.get(city, {}).get("tz")
@@ -992,7 +1016,7 @@ def _city_local_hour(city: str) -> int:
             return datetime.now(ZoneInfo(tz_name)).hour
     except Exception:
         pass
-    return 12
+    return datetime.now(timezone.utc).hour
 
 
 def _post_exit_scan(
@@ -1433,7 +1457,7 @@ def check_topups(
             continue
 
         # Local hour gate
-        local_hour = _local_hour(city)
+        local_hour = _city_local_hour(city)
         if not (TOPUP_HOUR_START <= local_hour <= TOPUP_HOUR_END):
             continue
 
@@ -1461,12 +1485,14 @@ def check_topups(
         if curr_no > NO_TOPUP_MAX_PRICE or curr_no <= 0.0:
             continue
 
-        # Headroom check — don't exceed overall contract cap
+        # Headroom check — don't exceed the cross-engine total cap.
+        # TOPUP_TOTAL_CAP (9) is intentionally larger than any single engine's
+        # MAX_CONTRACTS so that positions built up across main + cascade + topup
+        # can all receive a top-up without the check silently blocking every time.
         held     = pos.get("contracts", 0)
-        max_held = decision_engine.MAX_CONTRACTS   # HIGH market cap (3); LOWT positions filtered by timing gate
-        headroom = max_held - held
+        headroom = TOPUP_TOTAL_CAP - held
         if headroom <= 0:
-            log.debug("TOPUP skip %s — no headroom (%d/%d)", ticker, held, max_held)
+            log.debug("TOPUP skip %s — no headroom (%d/%d)", ticker, held, TOPUP_TOTAL_CAP)
             continue
 
         contracts = min(TOPUP_MAX_CONTRACTS, headroom)
@@ -1530,20 +1556,6 @@ def _ticker_city(ticker: str) -> str | None:
         return SERIES_TO_CITY.get(ticker.split("-")[0])
     except Exception:
         return None
-
-
-def _local_hour(city: str) -> int:
-    """Return current local hour for a city."""
-    try:
-        from cities import CITIES
-        from zoneinfo import ZoneInfo
-        tz_name = CITIES.get(city, {}).get("tz")
-        if tz_name:
-            return datetime.now(ZoneInfo(tz_name)).hour
-    except Exception:
-        pass
-    return datetime.now(timezone.utc).hour
-
 
 
 def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):

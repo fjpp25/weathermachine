@@ -22,7 +22,14 @@ import argparse
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional
+from cities import CITIES as _CITIES
 from log_setup import get_logger
+from market_utils import (
+    local_hour as _local_hour,
+    no_price   as _no_price,
+    yes_price  as _yes_price,
+    load_config_env,
+)
 
 log = get_logger(__name__)
 
@@ -47,29 +54,6 @@ CITY_WINDOWS: dict[str, str] = {
     "Oklahoma City":"BOTH","Philadelphia":"BOTH","San Antonio":"BOTH",
     "San Francisco":"BOTH",
 }
-
-_CITY_TZ: dict[str, str] = {
-    "New York":"America/New_York","Chicago":"America/Chicago",
-    "Miami":"America/New_York","Austin":"America/Chicago",
-    "Los Angeles":"America/Los_Angeles","Denver":"America/Denver",
-    "Philadelphia":"America/New_York","San Francisco":"America/Los_Angeles",
-    "Boston":"America/New_York","Las Vegas":"America/Los_Angeles",
-    "Atlanta":"America/New_York","Oklahoma City":"America/Chicago",
-    "Phoenix":"America/Phoenix","Washington DC":"America/New_York",
-    "Seattle":"America/Los_Angeles","Houston":"America/Chicago",
-    "Dallas":"America/Chicago","San Antonio":"America/Chicago",
-    "New Orleans":"America/Chicago","Minneapolis":"America/Chicago",
-}
-
-def _local_hour(city: str) -> int:
-    return datetime.now(ZoneInfo(_CITY_TZ.get(city,"UTC"))).hour
-
-def _no_price(b: dict) -> float:
-    return float(b.get("ob_no_bid") or b.get("ob_no_ask") or
-                 b.get("no_ask") or b.get("no_bid") or b.get("no_price") or 0.0)
-
-def _yes_price(b: dict) -> float:
-    return float(b.get("ob_yes_ask") or b.get("yes_ask") or b.get("yes_price") or 0.0)
 
 def _bval(bracket: dict) -> Optional[float]:
     for src in [bracket.get("bracket",""),
@@ -225,18 +209,11 @@ def display(evaluations: list[dict]) -> None:
 
 
 if __name__ == "__main__":
-    import os, json
-    from pathlib import Path
     parser = argparse.ArgumentParser()
     parser.add_argument("--city",  type=str, default=None)
     parser.add_argument("--paper", action="store_true")
     args = parser.parse_args()
-    config_file = Path("data/config.json")
-    if config_file.exists():
-        config = json.loads(config_file.read_text())
-        if config.get("key_id"): os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
-        if config.get("key_file"): os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
-        os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+    load_config_env()
     import kalshi_scanner, trader
     client = trader.make_client()
     print("Scanning Kalshi LOWT markets...")

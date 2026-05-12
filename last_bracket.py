@@ -38,10 +38,17 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from typing import Optional
 
+from cities import CITIES as _CITIES
 from log_setup import get_logger
+from market_utils import (
+    local_hour  as _local_hour,
+    no_price    as _no_price,
+    yes_price   as _yes_price,
+    is_resolved as _is_resolved,
+    load_config_env,
+)
 
 log = get_logger(__name__)
 
@@ -54,33 +61,6 @@ NO_MAX_ENTRY       = 0.94    # skip if already priced past actionable range
 RESOLVED_THRESHOLD = 0.95    # above this → bracket is resolved
 MIN_LOCAL_HOUR     = 16      # only fire if 2-bracket phase first seen at >= this hour
 MAX_CONTRACTS      = 3       # contracts per order
-
-# ---------------------------------------------------------------------------
-# City timezone registry
-# ---------------------------------------------------------------------------
-
-_CITY_TZ: dict[str, str] = {
-    "New York":      "America/New_York",
-    "Chicago":       "America/Chicago",
-    "Miami":         "America/New_York",
-    "Austin":        "America/Chicago",
-    "Los Angeles":   "America/Los_Angeles",
-    "Denver":        "America/Denver",
-    "Philadelphia":  "America/New_York",
-    "San Francisco": "America/Los_Angeles",
-    "Boston":        "America/New_York",
-    "Las Vegas":     "America/Los_Angeles",
-    "Atlanta":       "America/New_York",
-    "Oklahoma City": "America/Chicago",
-    "Phoenix":       "America/Phoenix",
-    "Washington DC": "America/New_York",
-    "Seattle":       "America/Los_Angeles",
-    "Houston":       "America/Chicago",
-    "Dallas":        "America/Chicago",
-    "San Antonio":   "America/Chicago",
-    "New Orleans":   "America/Chicago",
-    "Minneapolis":   "America/Chicago",
-}
 
 # ---------------------------------------------------------------------------
 # Session state
@@ -98,30 +78,6 @@ _two_bracket_first_seen: dict[str, int] = {}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _local_hour(city: str) -> int:
-    tz = _CITY_TZ.get(city, "UTC")
-    return datetime.now(ZoneInfo(tz)).hour
-
-
-def _no_price(bracket: dict) -> float:
-    return float(
-        bracket.get("ob_no_ask") or bracket.get("ob_no_bid")
-        or bracket.get("no_price") or 0.0
-    )
-
-
-def _yes_price(bracket: dict) -> float:
-    return float(
-        bracket.get("ob_yes_ask") or bracket.get("ob_yes_bid")
-        or bracket.get("yes_price") or 0.0
-    )
-
-
-def _is_resolved(bracket: dict) -> bool:
-    """A bracket is resolved when either side has collapsed to near-certainty."""
-    return _no_price(bracket) >= RESOLVED_THRESHOLD or _yes_price(bracket) >= RESOLVED_THRESHOLD
-
 
 def _market_key(city: str, brackets: list[dict]) -> Optional[str]:
     """
@@ -178,7 +134,7 @@ def run_scan(
     import trader as _trader
     import kalshi_scanner as _ks
 
-    cities = list(_CITY_TZ.keys())
+    cities = list(_CITIES.keys())
     if city_filter:
         cities = [c for c in cities if c.lower() == city_filter.lower()]
 
@@ -312,7 +268,7 @@ def _check_city(
 def log_config() -> None:
     log.info(
         "last_bracket: NO=[%.2f, %.2f]  min_hour=%dh  contracts=%d  cities=%d",
-        NO_MIN_ENTRY, NO_MAX_ENTRY, MIN_LOCAL_HOUR, MAX_CONTRACTS, len(_CITY_TZ),
+        NO_MIN_ENTRY, NO_MAX_ENTRY, MIN_LOCAL_HOUR, MAX_CONTRACTS, len(_CITIES),
     )
 
 
@@ -321,23 +277,12 @@ def log_config() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
-    import json
-    from pathlib import Path
-
     parser = argparse.ArgumentParser(description="Last Bracket signal scanner")
     parser.add_argument("--paper", action="store_true")
     parser.add_argument("--city",  type=str, default=None)
     args = parser.parse_args()
 
-    config_file = Path("data/config.json")
-    if config_file.exists():
-        config = json.loads(config_file.read_text())
-        if config.get("key_id"):
-            os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
-        if config.get("key_file"):
-            os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
-        os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+    load_config_env()
 
     import trader
     client = trader.make_client()

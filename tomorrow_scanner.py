@@ -57,6 +57,35 @@ TOMORROW_CONTRACTS    = 3      # contracts per bracket (T and adj-B each get thi
 NO_MAX_ENTRY          = 0.92   # don't enter if No has already moved past this
 
 # ---------------------------------------------------------------------------
+# Sweep signal parameters
+# ---------------------------------------------------------------------------
+# Per-city minimum No-price floor derived from backtest (Apr–May 2026).
+# Only cities with a clean 100% WR floor are included; others are excluded.
+# Floor of 0.75 raised to 0.80 across the board: drops 10 trades but
+# eliminates the lowest-confidence entries. Seattle (0.91) is provisional
+# — only 3 observations.
+#
+# Excluded cities (no clean floor): Austin, Boston, Dallas, Houston,
+#   Miami, New Orleans, San Antonio.
+SWEEP_FLOORS: dict[str, float] = {
+    "Philadelphia":  0.80,
+    "Las Vegas":     0.80,
+    "Phoenix":       0.80,
+    "San Francisco": 0.85,
+    "Minneapolis":   0.88,
+    "New York":      0.88,
+    "Chicago":       0.90,
+    "Los Angeles":   0.90,
+    "Atlanta":       0.91,
+    "Denver":        0.91,
+    "Seattle":       0.91,
+    "Washington DC": 0.91,
+    "Oklahoma City": 0.94,
+}
+SWEEP_CEILING   = 0.97   # brackets at/above this are effectively settled — skip
+SWEEP_CONTRACTS = 3      # contracts per bracket
+
+# ---------------------------------------------------------------------------
 # Per-city state
 # ---------------------------------------------------------------------------
 
@@ -66,6 +95,10 @@ _active_next_date: dict[str, str] = {}
 
 # (city, market_date_str) pairs already entered — never re-enter
 _fired_signals: set[tuple[str, str]] = set()
+
+# Individual tickers already swept this session — prevents re-entry on the
+# same bracket across multiple poll cycles. Keyed on ticker string directly.
+_sweep_entered: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +149,7 @@ def _fetch_markets(client, series: str, mdate: str) -> list[dict]:
     Returns [] if the market doesn't exist yet or fetch fails.
     """
     try:
-        resp = client.get_markets(series_ticker=series, status="open")
+        resp = client.get("markets", params={"series_ticker": series, "status": "open"})
         markets_raw = resp.get("markets", []) if isinstance(resp, dict) else []
         results = []
         for m in markets_raw:
@@ -289,12 +322,6 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
         b_adj_high  = B_markets[-1]
 
         # ── Forecast shift detection ───────────────────────────────────────
-        # Update the tracker with tomorrow's NWS forecast (passed through
-        # from the main pipeline via nws_results if available, otherwise
-        # inferred from T bracket values as a proxy).
-        # When the forecast drops significantly, run the dismissed/gradient
-        # scan immediately — brackets may be mispriced before the market
-        # catches up to the updated model run.
         _forecast_shift = None
         try:
             from nws_feed import forecast_shift_tracker as _fst
@@ -332,8 +359,6 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
                 )
 
         # ── Dismissed-T signal ─────────────────────────────────────────────
-        # Fires on T brackets where Yes is already very low but No hasn't
-        # yet reached fair value. Independent of the directional signal.
         if len(T_markets) >= 2:
             dismissed = _check_dismissed_signal(
                 t_low  = T_markets[0],
@@ -355,13 +380,9 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
                 )
 
         # ── Gradient open signal ───────────────────────────────────────────
-        # Scans all B+T brackets for a directional lean at market open.
-        # Also fires when a forecast shift makes upper brackets mispriced.
         all_markets = T_markets + B_markets
         gradient_candidates = _check_gradient_signal(all_markets, city)
 
-        # On a significant forecast shift, also consider brackets up to
-        # YES_DISMISSED * 3 (looser gate) — the market may not have moved yet
         if _forecast_shift is not None and _forecast_shift <= -1.5 and not gradient_candidates:
             gradient_candidates = _check_gradient_signal(
                 all_markets, city, yes_override=YES_DISMISSED * 3
@@ -386,6 +407,23 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
                 client   = client, city  = city,
                 ticker   = g_ticker, no_price = g_no_price, paper = paper,
             )
+
+        # ── Sweep signal ───────────────────────────────────────────────────
+        if city in SWEEP_FLOORS:
+            sweep_candidates = _check_sweep_signal(markets, city)
+            for candidate in sweep_candidates:
+                s_ticker   = candidate.get("ticker", "")
+                s_no_price = float(candidate.get("no_price", 0.0) or 0.0)
+                from log_setup import get_logger as _gl
+                _gl("tomorrow_scanner").info(
+                    "  ★ SWEEP [%s] %s | %s  No=%.2f  %dc",
+                    city, next_date, candidate.get("bracket", ""),
+                    s_no_price, SWEEP_CONTRACTS,
+                )
+                on_sweep_signal(
+                    client   = client, city     = city,
+                    ticker   = s_ticker, no_price = s_no_price, paper = paper,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +550,121 @@ def on_dismissed_signal(
         _bracket_entered.add(ticker)
 
 
+# ---------------------------------------------------------------------------
+# Sweep signal
+# ---------------------------------------------------------------------------
+
+def _check_sweep_signal(markets: list[dict], city: str) -> list[dict]:
+    """
+    Scan all brackets for a city's tomorrow market and return those that
+    qualify for a sweep entry.
+
+    Rules:
+      - City must be in SWEEP_FLOORS (caller already checks this).
+      - Skip the forecast bracket: the one with the highest Yes price.
+        That bracket is where the market thinks the temperature will land —
+        entering No there is the directional bet, not a tail sweep.
+      - For every remaining bracket qualify if:
+          SWEEP_FLOORS[city] <= no_price < SWEEP_CEILING
+      - Skip tickers already in _sweep_entered (once-per-session guard).
+
+    Returns a list of qualifying bracket dicts, possibly empty.
+    """
+    if not markets:
+        return []
+
+    floor = SWEEP_FLOORS.get(city)
+    if floor is None:
+        return []
+
+    # Identify the forecast bracket (highest Yes price across all brackets).
+    forecast = max(markets, key=lambda m: float(m.get("yes_price", 0.0) or 0.0))
+    forecast_ticker = forecast.get("ticker", "")
+
+    candidates = []
+    for m in markets:
+        ticker   = m.get("ticker", "")
+        no_price = float(m.get("no_price", 0.0) or 0.0)
+
+        if ticker == forecast_ticker:
+            continue                          # skip forecast bracket
+        if ticker in _sweep_entered:
+            continue                          # already entered this session
+        if floor <= no_price < SWEEP_CEILING:
+            candidates.append(m)
+
+    return candidates
+
+
+def on_sweep_signal(
+    client, city: str, ticker: str, no_price: float, paper: bool = False,
+) -> None:
+    """
+    Place a No order for a sweep entry and record it.
+
+    Capital is drawn from the session-scoped tomorrow budget (same pool as
+    dismissed / gradient signals). The ticker is marked in _sweep_entered
+    immediately on a successful order so it is never re-entered this session.
+    Top-ups on these positions are handled by the existing top-up engine in
+    trader.py once the position appears in today's markets (TOPUP_TOTAL_CAP=9
+    ensures headroom exists after the initial 3-contract entry).
+    """
+    import trader as _trader
+    from log_setup import get_logger
+    _log = get_logger("tomorrow_scanner")
+
+    if ticker in _sweep_entered:
+        return
+
+    cost = round(no_price * SWEEP_CONTRACTS, 4)
+    try:
+        deployable = _trader.get_tomorrow_deployable(ticker)
+        if deployable < cost:
+            _log.debug("SWEEP skip %s %s — budget exhausted (cost=$%.2f)",
+                       city, ticker, cost)
+            return
+    except Exception as e:
+        _log.warning("SWEEP capital check failed %s: %s", ticker, e)
+        return
+
+    tag = "[PAPER] " if paper else ""
+    _log.info("%sSWEEP  %s  %s  No=%.2f  %dc",
+              tag, city, ticker, no_price, SWEEP_CONTRACTS)
+
+    if not paper:
+        try:
+            import datetime as _dt
+            _trader.place_order(
+                client        = client,
+                ticker        = ticker,
+                side          = "no",
+                price_dollars = no_price,
+                contracts     = SWEEP_CONTRACTS,
+                paper         = False,
+            )
+            _trader._append_trade_log({
+                "ticker":       ticker,
+                "city":         city,
+                "side":         "no",
+                "market_type":  "high",
+                "score":        5,
+                "score_detail": ["tomorrow_sweep", f"no_price={no_price:.2f}"],
+                "entry_price":  no_price,
+                "contracts":    SWEEP_CONTRACTS,
+                "placed_at":    _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "paper":        False,
+                "entry_tier":   "tomorrow_sweep",
+            })
+            _trader.record_tomorrow_deployed(cost, ticker)
+            _sweep_entered.add(ticker)
+        except Exception as e:
+            _log.error("SWEEP order failed %s: %s", ticker, e)
+    else:
+        _log.info("  [PAPER] would place No %dc @ $%.2f on %s",
+                  SWEEP_CONTRACTS, no_price, ticker)
+        _sweep_entered.add(ticker)
+
+
 def _check_signal(
     t_low: dict, t_high: dict,
     b_adj_low: dict, b_adj_high: dict,
@@ -536,7 +689,7 @@ def _check_signal(
 
 
 # ---------------------------------------------------------------------------
-# Signal handler — wire in order execution here
+# Signal handler
 # ---------------------------------------------------------------------------
 
 def on_signal(
@@ -627,7 +780,6 @@ def on_signal(
             orders_placed += 1
 
     # Only mark the signal as fired once at least one order succeeded.
-    # This allows a retry on the next poll if both orders failed.
     if orders_placed > 0:
         _fired_signals.add(sig_key)
         _log.debug("TOMORROW signal fired: %s → marked as done (%d order(s))",

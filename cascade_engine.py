@@ -45,6 +45,11 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from cities import CITIES as _CITY_REGISTRY
+from market_utils import (
+    local_hour as _local_hour,
+    no_price   as _no_price,
+    yes_price  as _yes_price,
+)
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -155,39 +160,12 @@ def _market_date(ticker: str) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _local_hour(city: str) -> int:
-    tz_name = _CITY_REGISTRY.get(city, {}).get("tz")
-    if tz_name:
-        return datetime.now(ZoneInfo(tz_name)).hour
-    return datetime.now(timezone.utc).hour
-
-
 def _is_paused(city: str, market_type: str = "high") -> bool:
     """Check if trading is disabled for a city/market-type combination."""
     meta = _CITY_REGISTRY.get(city, {})
     if market_type == "lowt":
         return not meta.get("trading_lowt", meta.get("trading_high", True))
     return not meta.get("trading_high", meta.get("trading", True))
-
-
-def _no_price(bracket: dict) -> float:
-    return (
-        bracket.get("ob_no_bid") or
-        bracket.get("ob_no_ask") or
-        bracket.get("no_ask")    or
-        bracket.get("no_bid")    or
-        bracket.get("no_price")  or
-        0.0
-    )
-
-
-def _yes_price(bracket: dict) -> float:
-    return (
-        bracket.get("ob_yes_ask") or
-        bracket.get("yes_ask")    or
-        bracket.get("yes_price")  or
-        0.0
-    )
 
 
 def _contracts_for(no_price: float) -> int:

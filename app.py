@@ -82,19 +82,12 @@ except Exception:
 DATA_DIR    = Path("data")
 CONFIG_FILE = DATA_DIR / "config.json"
 
-def _fmt_bracket(bracket: str, market_type: str = "HIGH", t_is_top: bool | None = None) -> str:
+def _fmt_bracket(bracket: str, market_type: str = "HIGH") -> str:
     """
     Convert raw bracket code to a readable label.
     B78.5 → '78–79°'  (the .5 is the midpoint; range is floor(x) to floor(x)+1)
-
-    T brackets display the inclusive integer temperature bound:
-      HIGH top T:    T84  → '>85°'   (val+1 — bracket covers 85 and above)
-      LOWT top T:    T51  → '>52°'   (val+1 — overnight low above 52°F)
-      LOWT bottom T: T44  → '<43°'   (val-1 — bracket covers 43 and below)
-
-    t_is_top: True = top T bracket (use ">", val+1),
-              False = bottom T bracket (use "<", val-1),
-              None = infer from market_type (legacy: HIGH→top, LOW→bottom).
+    T55   → '>55°'    (above threshold for HIGH)
+    T31   → '<31°'    (below threshold for LOWT)
     """
     if not bracket:
         return bracket
@@ -106,13 +99,10 @@ def _fmt_bracket(bracket: str, market_type: str = "HIGH", t_is_top: bool | None 
             return f"{lower}–{upper}°"
         elif bracket.startswith("T"):
             val = float(bracket[1:])
-            # Determine direction when not explicitly provided
-            if t_is_top is None:
-                t_is_top = (market_type != "LOW")
-            if t_is_top:
-                return f">{int(val) + 1}°"
+            if market_type == "LOW":
+                return f"<{val:.0f}°"
             else:
-                return f"<{int(val) - 1}°"
+                return f">{val:.0f}°"
     except ValueError:
         pass
     return bracket
@@ -132,40 +122,16 @@ def _city_from_ticker(ticker: str, bare: bool = False) -> str | None:
     return None
 
 
-def _bracket_from_ticker(ticker: str, all_tickers: list[str] | None = None) -> str:
+def _bracket_from_ticker(ticker: str) -> str:
     """Extract and format the bracket label from a Kalshi temperature ticker.
-    e.g. 'KXHIGHNY-26APR25-B83.5' → '83–84°',  'KXHIGHNY-26APR25-T84' → '>85°'
-
-    all_tickers: optional sibling tickers from the same market. Used to
-    determine whether a LOWT T bracket is the top or bottom one by comparing
-    its value to the other T bracket. Without this, HIGH T is assumed top and
-    LOWT T is assumed bottom (correct for HIGH; wrong for LOWT top T bracket).
+    e.g. 'HIGHNY-24APR25-B67' → '67–69°',  'HIGHNY-24APR25-T72' → '>72°'
     """
     parts = ticker.split("-")
     if len(parts) >= 3:
-        raw         = parts[-1]
-        prefix      = parts[0]
+        raw = parts[-1]          # e.g. "T69", "B67"
+        prefix = parts[0]        # e.g. "HIGHNY", "LOWTCHI"
         market_type = "LOW" if "LOWT" in prefix.upper() else "HIGH"
-
-        t_is_top = None
-        if raw.startswith("T") and all_tickers:
-            try:
-                my_val = float(raw[1:])
-                other_t_vals = [
-                    float(t.split("-")[-1][1:])
-                    for t in all_tickers
-                    if t.split("-")[-1].startswith("T")
-                    and t.split("-")[-1] != raw
-                ]
-                if other_t_vals:
-                    t_is_top = my_val > min(other_t_vals)
-            except ValueError:
-                pass
-
-        if t_is_top is None and raw.startswith("T"):
-            t_is_top = (market_type == "HIGH")
-
-        label = _fmt_bracket(raw, market_type, t_is_top=t_is_top)
+        label = _fmt_bracket(raw, market_type)
         return label if label else "—"
     return "—"
 
@@ -193,12 +159,42 @@ def _load_trade_log() -> list:
 
 
 def _engine_from_ticker(ticker: str) -> str:
-    """Return 'CASCADE' or 'MAIN' for a ticker based on trade_log entry_tier."""
+    """Return 'CASCADE' or 'MAIN' for a ticker based on trade_log entry_tier.
+    Kept for backward compatibility — prefer _engine_display() for new code."""
     for entry in reversed(_load_trade_log()):
         if entry.get("ticker") == ticker:
             tier = (entry.get("entry_tier", "") or "").lower()
             return "CASCADE" if "cascade" in tier else "MAIN"
     return "MAIN"
+
+
+# Colour assigned to each engine label in all tables.
+# Add a new entry here whenever a new engine is introduced.
+_ENGINE_COLORS: dict[str, str] = {
+    "CASCADE": "#378ADD",   # blue
+    "ECONV":   "#E8A03E",   # amber  — evening convergence
+    "MAIN":    "#00d4a0",   # teal green (= ACCENT, inlined to avoid forward-reference)
+}
+
+def _engine_display(tier: str) -> tuple[str, str]:
+    """
+    Map a raw entry_tier string to (display_label, hex_colour).
+
+    Rules:
+      - "cascade*"  → ("CASCADE", blue)
+      - "econv"     → ("ECONV",   amber)
+      - any other non-empty tier (e.g. "peak", "topup", "last_bracket")
+                    → (tier.upper(), TEXT_SEC)
+      - empty/None  → ("MAIN",    teal)
+    """
+    t = (tier or "").lower().strip()
+    if "cascade" in t:
+        return "CASCADE", _ENGINE_COLORS["CASCADE"]
+    if t == "econv":
+        return "ECONV", _ENGINE_COLORS["ECONV"]
+    if t:
+        return t.upper(), TEXT_SEC
+    return "MAIN", _ENGINE_COLORS["MAIN"]
 
 
 def _entry_tier_from_ticker(ticker: str) -> str:
@@ -811,7 +807,9 @@ class CityCard(QFrame):
     def __init__(self, city: str):
         super().__init__()
         self.city = city
-        self.setFixedSize(200, 82)
+        # Expand to fill grid cells — no fixed size
+        self.setMinimumSize(180, 110)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(f"""
             QFrame {{
@@ -822,26 +820,40 @@ class CityCard(QFrame):
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 5, 10, 5)
-        layout.setSpacing(1)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(2)
 
+        # Row 1: city name — card header, most prominent
         self.name_label = QLabel(city)
-        self.name_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px; letter-spacing: 1px;")
+        self.name_label.setStyleSheet(
+            f"color: {TEXT_PRI}; font-size: 17px; font-weight: bold; letter-spacing: 1px;"
+        )
 
+        # Row 2: local time — subdued, below the header
         self.time_label = QLabel("--:-- --")
-        self.time_label.setStyleSheet(f"color: {TEXT_PRI}; font-size: 12px; font-weight: bold;")
+        self.time_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 13px;")
 
+        # Row 3: current station temperature — live reading
+        self.curr_label = QLabel("now: --°")
+        self.curr_label.setStyleSheet(
+            f"color: {ACCENT}; font-size: 20px; font-weight: bold; letter-spacing: 1px;"
+        )
+
+        # Row 4: observed hi + forecast hi
         self.hi_label = QLabel("hi: --°  fcst: --°")
-        self.hi_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+        self.hi_label.setStyleSheet(f"color: {ACCENT}; font-size: 15px;")
 
+        # Row 5: observed lo + forecast lo
         self.lo_label = QLabel("lo: --°  fcst: --°")
-        self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+        self.lo_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 15px;")
 
+        # Row 6: trading window indicator
         self.status_label = QLabel("—")
-        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 11px;")
+        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 13px;")
 
         layout.addWidget(self.name_label)
         layout.addWidget(self.time_label)
+        layout.addWidget(self.curr_label)
         layout.addWidget(self.hi_label)
         layout.addWidget(self.lo_label)
         layout.addWidget(self.status_label)
@@ -855,6 +867,10 @@ class CityCard(QFrame):
                     obs_lo: float = None, fcst_lo: float = None,
                     local_hour: int = None):
         self.time_label.setText(local_time)
+
+        # Current station temperature
+        curr_str = f"now: {curr:.0f}°" if curr is not None else "now: --°"
+        self.curr_label.setText(curr_str)
 
         hi_str  = f"{obs_hi:.0f}°"  if obs_hi  else "--°"
         lo_str  = f"{obs_lo:.0f}°"  if obs_lo  else "--°"
@@ -942,56 +958,46 @@ class CityDetailDialog(QDialog):
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-weight: bold;")
         layout.addWidget(title)
 
-        # ── Open positions ────────────────────────────────────────────────
+        # ── Open positions from session tab ───────────────────────────────
         pos_hdr = QLabel("OPEN POSITIONS")
         pos_hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
         layout.addWidget(pos_hdr)
 
-        city_positions = [
-            p for p in positions
-            if _city_from_ticker(p.get("ticker", ""), bare=True) == city
-        ]
-
-        if city_positions:
+        open_pos = [p for p in positions if p.get("status", "Open") == "Open"]
+        if open_pos:
             pos_table = QTableWidget()
             pos_table.setColumnCount(5)
-            pos_table.setHorizontalHeaderLabels(["Market", "Side", "Qty", "Avg Cost", "Unreal. PnL"])
-            pos_table.setRowCount(len(city_positions))
+            pos_table.setHorizontalHeaderLabels(["Bracket", "Engine", "Side", "Qty", "Unreal. PnL"])
+            pos_table.setRowCount(len(open_pos))
             pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
             pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
             hdr_m = pos_table.horizontalHeader()
             hdr_m.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-            hdr_m.setMinimumSectionSize(1)
-            for col, pct in enumerate([30, 12, 9, 16, 16]):
-                hdr_m.resizeSection(col, pct)
             pos_table.verticalHeader().setVisible(False)
-
-            for row, pos in enumerate(city_positions):
-                ticker  = pos.get("ticker", "")
-                side    = pos.get("side", "").upper()
-                qty     = pos.get("contracts", 1)
-                cost    = pos.get("avg_cost", 0)
-                unreal  = pos.get("unrealised_pnl", 0)
-                sign    = "+" if unreal >= 0 else ""
-                bracket = ticker.split("-")[-1] if "-" in ticker else ticker
-                mtype   = "HIGH" if "HIGH" in ticker else "LOW"
-                label   = f"{mtype} {_fmt_bracket(bracket, mtype)}"
+            for row, pos in enumerate(open_pos):
+                ticker     = pos.get("ticker", "")
+                bracket    = _bracket_from_ticker(ticker)
+                entry_tier = _entry_tier_from_ticker(ticker)
+                engine_str, eng_color = _engine_display(entry_tier)
+                side       = pos.get("side", "").upper()
+                qty        = pos.get("contracts", 1)
+                unreal     = pos.get("unrealised_pnl", 0) or 0
+                sign       = "+" if unreal >= 0 else ""
                 for col, (val, color) in enumerate([
-                    (label,                       TEXT_PRI),
-                    (side,                        ACCENT if side == "NO" else YELLOW),
-                    (str(qty),                    TEXT_PRI),
-                    (f"${cost:.2f}",              TEXT_PRI),
-                    (f"{sign}${unreal:.2f}",      ACCENT if unreal >= 0 else RED),
+                    (bracket,                TEXT_SEC),
+                    (engine_str,             eng_color),
+                    (side,                   ACCENT if side == "NO" else YELLOW),
+                    (str(qty),               TEXT_PRI),
+                    (f"{sign}${unreal:.2f}", ACCENT if unreal >= 0 else RED),
                 ]):
                     item = QTableWidgetItem(val)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setForeground(QColor(color))
                     pos_table.setItem(row, col, item)
-
-            pos_table.setFixedHeight(min(len(city_positions) * 30 + 34, 180))
+            pos_table.setFixedHeight(min(len(open_pos) * 30 + 34, 180))
             layout.addWidget(pos_table)
         else:
-            no_pos = QLabel("No open positions for this city.")
+            no_pos = QLabel("No open positions for this city this session.")
             no_pos.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
             layout.addWidget(no_pos)
 
@@ -1239,8 +1245,8 @@ class HomeTab(QWidget):
         self._last_balance = 0.0
 
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(20, 8, 20, 8)
+        main_layout.setSpacing(4)
 
         # ── Top bar: controls + balance ──────────────────────────────────
         top_bar = QHBoxLayout()
@@ -1257,9 +1263,6 @@ class HomeTab(QWidget):
 
         self.status_label = QLabel("Idle")
         self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
-
-        self.countdown_label = QLabel("")
-        self.countdown_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
 
         self.sync_btn = QPushButton("⟳  Sync")
         self.sync_btn.setFixedHeight(36)
@@ -1282,7 +1285,6 @@ class HomeTab(QWidget):
         top_bar.addSpacing(16)
         top_bar.addWidget(self.status_label)
         top_bar.addStretch()
-        top_bar.addWidget(self.countdown_label)
 
         # ── Balance bar ──────────────────────────────────────────────────
         bal_bar = QHBoxLayout()
@@ -1313,7 +1315,7 @@ class HomeTab(QWidget):
         city_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
 
         city_grid = QGridLayout()
-        city_grid.setSpacing(10)
+        city_grid.setSpacing(28)
         self.city_cards = {}
         for i, city in enumerate(_CITIES_ORDERED):
             card = CityCard(city)
@@ -1321,49 +1323,26 @@ class HomeTab(QWidget):
             self.city_cards[city] = card
             city_grid.addWidget(card, i % 4, i // 4)
 
-        # Positions table
-        pos_frame = QFrame()
-        pos_layout = QVBoxLayout(pos_frame)
-        pos_layout.setContentsMargins(0, 0, 0, 0)
-        pos_layout.setSpacing(6)
-
-        pos_hdr = QLabel("OPEN POSITIONS")
-        pos_hdr.setStyleSheet(f"color: {TEXT_SEC}; font-size: 10px; letter-spacing: 2px;")
-        pos_layout.addWidget(pos_hdr)
-
-        self.pos_table = QTableWidget()
-        self.pos_table.setColumnCount(10)
-        self.pos_table.setHorizontalHeaderLabels(
-            ["Market", "Bracket", "Engine", "Side", "Qty", "Entry", "Current", "Unreal. PnL", "Opened", "Status"]
-        )
-        hdr = self.pos_table.horizontalHeader()
-        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        hdr.setMinimumSectionSize(40)
-        hdr.setStretchLastSection(False)
-        # Market stretches; all others are fixed pixel widths
-        # col: Market  Bracket  Engine  Side  Qty  Entry  Current  Unreal  Opened  Status
-        MARKET_COL_HOME = 0
-        hdr.setSectionResizeMode(MARKET_COL_HOME, QHeaderView.ResizeMode.Stretch)
-        for col, w in enumerate([0, 90, 90, 60, 52, 72, 72, 100, 100, 80]):
-            if col != MARKET_COL_HOME and w:
-                hdr.resizeSection(col, w)
-        self.pos_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.pos_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.pos_table.setAlternatingRowColors(True)
-        self.pos_table.setStyleSheet(
-            self.pos_table.styleSheet() +
-            f"QTableWidget {{ alternate-background-color: {BG_ROW_ALT}; }}"
-        )
-        pos_layout.addWidget(self.pos_table)
+        # Equal stretch on all 4 rows and 5 columns so cards fill the screen
+        for row in range(4):
+            city_grid.setRowStretch(row, 1)
+        for col in range(5):
+            city_grid.setColumnStretch(col, 1)
 
         # ── Assemble ─────────────────────────────────────────────────────
-        main_layout.addLayout(top_bar)
-        main_layout.addLayout(bal_bar)
+        # Header: fixed-height compact block (top_bar + bal_bar)
+        header_frame = QFrame()
+        header_frame.setFixedHeight(64)
+        hf_layout = QVBoxLayout(header_frame)
+        hf_layout.setContentsMargins(0, 0, 0, 0)
+        hf_layout.setSpacing(2)
+        hf_layout.addLayout(top_bar)
+        hf_layout.addLayout(bal_bar)
+
+        main_layout.addWidget(header_frame)
         main_layout.addWidget(self._hline())
         main_layout.addWidget(city_label)
-        main_layout.addLayout(city_grid)
-        main_layout.addWidget(self._hline())
-        main_layout.addWidget(pos_frame, stretch=1)
+        main_layout.addLayout(city_grid, stretch=1)
 
         # Timers
         self._city_timer = QTimer()
@@ -1393,8 +1372,10 @@ class HomeTab(QWidget):
 
     def _on_city_card_clicked(self, city: str):
         """Open city detail dialog when a card is clicked."""
-        positions = getattr(self, '_last_positions', [])
-        dlg = CityDetailDialog(city, positions, self._client, parent=self)
+        session_entries = getattr(self, '_last_session_entries', [])
+        city_entries = [e for e in session_entries
+                        if _city_from_ticker(e.get("ticker",""), bare=True) == city]
+        dlg = CityDetailDialog(city, city_entries, self._client, parent=self)
         dlg.exec()
 
     def toggle_scheduler(self):
@@ -1483,19 +1464,8 @@ class HomeTab(QWidget):
 
     def _on_client_ready(self, client):
         self._client = client
-        # Notify any registered callbacks (e.g. PnL tab)
         for cb in getattr(self, '_client_ready_callbacks', []):
             cb(client)
-        self.sync_positions_from_kalshi()
-
-    def _on_poll_started(self, poll_num: int):
-        self.status_label.setText(f"Poll #{poll_num} running...")
-        self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
-
-    def _on_poll_finished(self, poll_num: int, next_secs: int):
-        self._next_poll_ts = time.time() + next_secs
-        self.status_label.setText(f"Sleeping — next poll in {next_secs//60} min")
-        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
         self.sync_positions_from_kalshi()
 
     def _on_balance_updated(self, bal: float, dep: float):
@@ -1503,16 +1473,27 @@ class HomeTab(QWidget):
         self.balance_label.setText(f"Balance  ${bal:.2f}")
         self.deployable_label.setText(f"Deployable  ${dep:.2f}")
 
+    def _on_poll_started(self, poll_num: int):
+        self.status_label.setText(f"Poll #{poll_num} running...")
+        self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 12px;")
+
+    def _on_poll_finished(self, poll_num: int, next_secs: int):
+        self._next_poll_ts = time.time() + next_secs
+        m, s = divmod(next_secs, 60)
+        self.status_label.setText(f"Next poll in {m:02d}:{s:02d}")
+        self.status_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 12px;")
+        self.sync_positions_from_kalshi()
+
     def _tick_countdown(self):
         if self._next_poll_ts is None:
-            self.countdown_label.setText("")
             return
         remaining = int(self._next_poll_ts - time.time())
-        if remaining <= 0:
-            self.countdown_label.setText("polling...")
-        else:
-            m, s = divmod(remaining, 60)
-            self.countdown_label.setText(f"next poll in {m:02d}:{s:02d}")
+        if "running" not in self.status_label.text():
+            if remaining <= 0:
+                self.status_label.setText("polling...")
+            else:
+                m, s = divmod(remaining, 60)
+                self.status_label.setText(f"Next poll in {m:02d}:{s:02d}")
 
     @pyqtSlot(str)
     def append_log(self, text: str):
@@ -1552,69 +1533,20 @@ class HomeTab(QWidget):
         )
 
     def _update_positions_table(self, positions: list):
-        """Update the positions table from a list of enriched position dicts."""
-        self._last_positions = positions  # cache for city detail dialog
-        # Sort oldest first (chronological order)
-        sorted_positions = sorted(
-            positions,
-            key=lambda p: p.get("last_updated", ""),
-        )
-        self.pos_table.setRowCount(len(sorted_positions))
-        total_unrealised = 0.0
-
-        for row, pos in enumerate(sorted_positions):
-            ticker    = pos.get("ticker", "")
-            side      = pos.get("side", "").upper()
-            qty       = pos.get("contracts", 1)
-            avg_cost  = pos.get("avg_cost", 0)
-            current   = pos.get("current_price", 0)
-            unreal    = pos.get("unrealised_pnl", 0)
-            updated   = pos.get("last_updated", "")
-            is_live   = pos.get("live", True)
-            total_unrealised += unreal
-
-            # Derive city name from ticker prefix
-            city_display = _city_from_ticker(ticker) or ticker
-            bracket      = _bracket_from_ticker(ticker)
-            engine       = _engine_from_ticker(ticker)
-            eng_color    = "#378ADD" if engine == "CASCADE" else ACCENT
-
-            pnl_color    = ACCENT if unreal >= 0 else RED
-            sign         = "+" if unreal >= 0 else ""
-            status_str   = "Live" if is_live else "Settling"
-            status_color = ACCENT if is_live else YELLOW
-
-            items = [
-                (city_display,           TEXT_PRI),
-                (bracket,                TEXT_SEC),
-                (engine,                 eng_color),
-                (side,                   ACCENT if side == "NO" else YELLOW),
-                (str(qty),               TEXT_PRI),
-                (f"${avg_cost:.2f}",     TEXT_PRI),
-                (f"${current:.2f}",      TEXT_PRI),
-                (f"{sign}${unreal:.2f}", pnl_color),
-                (updated,                TEXT_SEC),
-                (status_str,             status_color),
-            ]
-
-            for col, (val, color) in enumerate(items):
-                item = QTableWidgetItem(val)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                item.setForeground(QColor(color))
-                self.pos_table.setItem(row, col, item)
-
-        # Update unrealised PnL and portfolio value
-        total_current = sum(
-            pos.get("current_price", 0) * pos.get("contracts", 1)
-            for pos in sorted_positions
-        )
+        """Update balance labels and cache positions for city detail dialog."""
+        self._last_positions = positions  # Kalshi live positions
+        total_unrealised = sum(p.get("unrealised_pnl", 0) for p in positions)
         sign  = "+" if total_unrealised >= 0 else ""
         color = ACCENT if total_unrealised >= 0 else RED
         self.pnl_label.setText(f"Unrealised  {sign}${total_unrealised:.2f}")
         self.pnl_label.setStyleSheet(f"color: {color}; font-size: 14px;")
 
         # Portfolio = cash balance + current market value of open positions
-        bal = getattr(self, '_last_balance', 0.0)
+        bal           = getattr(self, '_last_balance', 0.0)
+        total_current = sum(
+            p.get("current_price", 0) * p.get("contracts", 1)
+            for p in positions
+        )
         portfolio = bal + total_current
         self.portfolio_label.setText(f"Portfolio  ${portfolio:.2f}")
         self.portfolio_label.setStyleSheet(f"color: {TEXT_SEC}; font-size: 14px;")
@@ -1628,10 +1560,9 @@ class HomeTab(QWidget):
             tz = _ALL_CITIES[city]["tz"]
             now = datetime.now(ZoneInfo(tz))
             h    = now.hour
-            active = True  # 24/7 window
             card.update_data(
                 local_time  = now.strftime("%H:%M %Z"),
-                curr        = None,
+                curr        = getattr(card, '_curr_temp', None),
                 obs_hi      = getattr(card, '_obs_hi', None),
                 fcst_hi     = getattr(card, '_fcst_hi', None),
                 obs_lo      = getattr(card, '_obs_lo', None),
@@ -1693,19 +1624,21 @@ class HomeTab(QWidget):
             tz = _ALL_CITIES[city]["tz"]
             now = datetime.now(ZoneInfo(tz))
             active = True  # 24/7 window
-            data    = results.get(city, {})
-            obs_hi  = data.get("observed_high_f")
-            fcst_hi = data.get("forecast_high_f")
-            obs_lo  = data.get("observed_low_f")
-            fcst_lo = data.get("forecast_low_f")
+            data     = results.get(city, {})
+            curr_t   = data.get("current_temp_f")
+            obs_hi   = data.get("observed_high_f")
+            fcst_hi  = data.get("forecast_high_f")
+            obs_lo   = data.get("observed_low_f")
+            fcst_lo  = data.get("forecast_low_f")
             # Cache on card so clock ticks preserve the values
-            card._obs_hi  = obs_hi
-            card._fcst_hi = fcst_hi
-            card._obs_lo  = obs_lo
-            card._fcst_lo = fcst_lo
+            card._curr_temp = curr_t
+            card._obs_hi    = obs_hi
+            card._fcst_hi   = fcst_hi
+            card._obs_lo    = obs_lo
+            card._fcst_lo   = fcst_lo
             card.update_data(
                 local_time  = now.strftime("%H:%M %Z"),
-                curr        = None,
+                curr        = curr_t,
                 obs_hi      = obs_hi,
                 fcst_hi     = fcst_hi,
                 obs_lo      = obs_lo,
@@ -2599,7 +2532,7 @@ class SessionTab(QWidget):
         MARKET_COL = 1
         th.setSectionResizeMode(MARKET_COL, QHeaderView.ResizeMode.Stretch)
         # col:  Time  Market  Bracket  Engine  Side  Qty  Entry  Score  Unreal  Status
-        widths = [95,   0,      90,      90,     60,   52,   72,    72,    100,    85]
+        widths = [142,  0,     135,     135,     90,   78,  108,   108,    150,   128]
         for col, w in enumerate(widths):
             if col != MARKET_COL and w:
                 th.resizeSection(col, w)
@@ -2772,12 +2705,7 @@ class SessionTab(QWidget):
             avg_cost = e.get("avg_cost", 0)
             ticker   = e.get("ticker", "")
             entry_tier = _entry_tier_from_ticker(ticker)
-            engine_str = "CASCADE" if "cascade" in entry_tier.lower() else (
-                entry_tier.upper() if entry_tier else "MAIN"
-            )
-            eng_color  = "#378ADD" if "cascade" in entry_tier.lower() else (
-                TEXT_SEC if entry_tier else ACCENT
-            )
+            engine_str, eng_color = _engine_display(entry_tier)
             score_str  = f"{score}/5" if not entry_tier else "—"
             if status == "Open":
                 status_color = ACCENT
@@ -2812,6 +2740,23 @@ class SessionTab(QWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 item.setForeground(QColor(color))
                 table.setItem(row, col, item)
+
+        # ── Qty total row ─────────────────────────────────────────────────
+        # A single blank row with only the Qty column filled, showing the sum.
+        total_qty = sum(e.get("contracts", 1) for e in entries)
+        total_row = table.rowCount()
+        table.setRowCount(total_row + 1)
+        for col in range(table.columnCount()):
+            item = QTableWidgetItem("")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            if col == 5:   # Qty column
+                item.setText(str(total_qty))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                item.setForeground(QColor(ACCENT))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            table.setItem(total_row, col, item)
 
     def _rebuild(self):
         all_entries = list(reversed(self._entries))  # newest first
@@ -3456,8 +3401,8 @@ class CityHistoryTab(QWidget):
 
             # Engine — check trade_log entry_tier
             tlog    = tlog_idx.get(tk, {})
-            tier    = (tlog.get("entry_tier","") or "").lower()
-            eng     = "CASCADE" if "cascade" in tier else "MAIN"
+            tier    = (tlog.get("entry_tier","") or "")
+            eng, eng_color_hex = _engine_display(tier)
 
             # Side
             side = (item.get("side","NO") or "NO").upper()
@@ -3490,7 +3435,7 @@ class CityHistoryTab(QWidget):
             out_text, out_color = outcome_map.get(out, (out.upper(), DIM_COLOR))
 
             pnl_color = WIN_COLOR if p > 0 else (LOSS_COLOR if p < 0 else DIM_COLOR)
-            eng_color = QColor("#378ADD") if eng == "CASCADE" else QColor(ACCENT)
+            eng_color = QColor(eng_color_hex)
 
             cells  = [date_str, bracket, eng, side, entry, exit_str, pnl_str, contr, out_text]
             colors = [None, None, eng_color, None, None, None, pnl_color, None, out_color]
@@ -3663,6 +3608,10 @@ class MainWindow(QMainWindow):
         worker = self.home_tab._worker
         if worker:
             worker.session_entry.connect(self.session_tab.add_entry)
+            worker.session_entry.connect(
+                lambda _: setattr(self.home_tab, '_last_session_entries',
+                                  list(self.session_tab._entries))
+            )
             worker.session_exit.connect(
                 lambda ticker, reason: self.session_tab.update_status(ticker, reason)
             )

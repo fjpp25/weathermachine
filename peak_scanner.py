@@ -30,9 +30,13 @@ Excluded (high variance): Miami, Minneapolis, New York, Philadelphia,
 from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from typing import Optional
 from log_setup import get_logger
+from market_utils import (
+    local_hour as _local_hour,
+    no_price   as _no_price,
+    load_config_env,
+)
 
 log = get_logger(__name__)
 
@@ -54,32 +58,7 @@ PEAK_CITIES: dict[str, int] = {
     "Seattle":       17,
 }
 
-_CITY_TZ: dict[str, str] = {
-    "Atlanta":       "America/New_York",
-    "Boston":        "America/New_York",
-    "Chicago":       "America/Chicago",
-    "Denver":        "America/Denver",
-    "Houston":       "America/Chicago",
-    "Los Angeles":   "America/Los_Angeles",
-    "New Orleans":   "America/Chicago",
-    "Phoenix":       "America/Phoenix",
-    "San Francisco": "America/Los_Angeles",
-    "Seattle":       "America/Los_Angeles",
-}
-
 _fired: set[tuple[str, str]] = set()
-
-
-def _local_hour(city: str) -> int:
-    return datetime.now(ZoneInfo(_CITY_TZ.get(city, "UTC"))).hour
-
-
-def _no_price(bracket: dict) -> float:
-    return float(
-        bracket.get("ob_no_ask") or bracket.get("ob_no_bid")
-        or bracket.get("no_price") or 0.0
-    )
-
 
 def _bracket_floor(bracket: dict) -> Optional[float]:
     floor = bracket.get("floor")
@@ -221,22 +200,12 @@ def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
 
 
 if __name__ == "__main__":
-    import os, json
-    from pathlib import Path
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--paper", action="store_true")
     parser.add_argument("--city",  type=str, default=None)
     args = parser.parse_args()
 
-    config_file = Path("data/config.json")
-    if config_file.exists():
-        config = json.loads(config_file.read_text())
-        if config.get("key_id"):
-            os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
-        if config.get("key_file"):
-            os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
-        os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+    load_config_env()
 
     import trader
     client = trader.make_client()
