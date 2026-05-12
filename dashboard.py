@@ -678,10 +678,9 @@ button,select,input{font-family:var(--f)}
 .bal-v.r{color:var(--red)}
 
 /* ── City grid ── */
-#cgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:20px}
-@media(max-width:1200px){#cgrid{grid-template-columns:repeat(4,1fr)}}
-@media(max-width:900px){#cgrid{grid-template-columns:repeat(3,1fr)}}
-@media(max-width:600px){#cgrid{grid-template-columns:repeat(2,1fr)}}
+#cgrid{display:grid;grid-template-rows:repeat(4,1fr);grid-auto-flow:column;gap:8px;margin-bottom:20px}
+@media(max-width:900px){#cgrid{grid-template-rows:repeat(5,1fr)}}
+@media(max-width:600px){#cgrid{grid-template-rows:repeat(10,1fr)}}
 .cc{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);
   padding:12px 14px;cursor:pointer;transition:border-color .2s,background .2s}
 .cc:hover{border-color:var(--ter);background:var(--panel2)}
