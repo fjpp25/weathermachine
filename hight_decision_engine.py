@@ -53,6 +53,7 @@ except ImportError:
     _AW_AVAILABLE = False
 import cascade_engine
 from cities import CITIES as _CITY_REGISTRY
+from market_utils import no_price as _no_price
 
 # ---------------------------------------------------------------------------
 # Parameters — tune these as you gather data
@@ -84,12 +85,27 @@ BOUNDARY_BUFFER_FALLBACK      = 3.0   # °F
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
-NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
+NO_MIN_ENTRY_PRICE  = 0.80     # never pay less than this for a NO contract
                                # data: below 0.75 market is pricing in real uncertainty
-NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract
+NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract (main engine)
                                # data: 0.75–0.92 gives 86.5% WR across 37 trades
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = False  # top T brackets ("above X°F") now allowed with gates
+
+# ---------------------------------------------------------------------------
+# Per-city No minimum overrides
+# ---------------------------------------------------------------------------
+# These cities show sub-75% WR at No < 0.85 — higher temperature variance
+# means the market's residual uncertainty at lower prices is genuinely
+# informative. Raising the floor eliminates the losing tail.
+# Data: enriched_trade_log analysis, last 3 weeks.
+CITY_NO_MIN: dict[str, float] = {
+    "Miami":        0.85,
+    "Los Angeles":  0.85,
+    "New Orleans":  0.85,
+    "Boston":       0.85,
+    "Dallas":       0.85,
+}
 
 # Top T bracket gates (above X°F brackets — floor set, cap=None):
 # Backtest (147 signals, Apr 6-29):
@@ -393,6 +409,7 @@ def evaluate_bracket(
     city_bias:          float,
     dynamic_buffer:     float,
     corrected_forecast: float | None = None,
+    city_no_min:        float | None = None,
 ) -> dict:
     """
     Evaluate a single bracket for a NO trade signal.
@@ -581,9 +598,11 @@ def evaluate_bracket(
     # yes_ask already computed above.
     no_ask = bracket.get("ob_no_ask")
 
+    effective_no_min = city_no_min if city_no_min is not None else NO_MIN_ENTRY_PRICE
+
     if (
         no_ask is not None
-        and NO_MIN_ENTRY_PRICE <= no_ask <= NO_MAX_ENTRY_PRICE
+        and effective_no_min <= no_ask <= NO_MAX_ENTRY_PRICE
         and yes_ask is not None
         and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
         and no_depth >= MIN_DEPTH
@@ -677,6 +696,14 @@ def evaluate_city(
     result["corrected_forecast"]    = corrected_forecast
     result["accuweather_forecast"]  = aw_high
 
+    # obs_high override: if the observed high already exceeds the corrected
+    # forecast (e.g. overnight cold front, early spike), use the observation
+    # as the effective forecast. This prevents the engine from entering No
+    # on brackets the temperature has already passed through.
+    if observed_high is not None and observed_high > corrected_forecast:
+        corrected_forecast = observed_high
+        result["corrected_forecast"] = corrected_forecast
+
     # Log significant divergence between AccuWeather and NWS
     if aw_high is not None and abs(aw_high - nws_corrected) >= 2.0:
         import logging as _log_aw
@@ -687,6 +714,21 @@ def evaluate_city(
         )
 
     forecast_bracket   = get_forecast_bracket(corrected_forecast, brackets)
+
+    # Track NWS forecast shifts for this city.
+    # A significant downward shift (>= 1.5°F) means the forecast has moved
+    # away from the upper brackets — strengthens the case for No entries.
+    _high_shift = None
+    try:
+        from nws_feed import forecast_shift_tracker as _fst
+        _high_shift = _fst.update_high(city, forecast_high)
+        if _high_shift is not None:
+            log.info(
+                "%s: NWS forecast shift Δ%+.1f°F (corrected=%.1f°F)",
+                city, _high_shift, corrected_forecast,
+            )
+    except Exception:
+        pass
 
     result["city_bias"]      = city_bias
     result["dynamic_buffer"] = dyn_buffer
@@ -710,16 +752,25 @@ def evaluate_city(
         if is_forecast:
             continue
 
+        # If NWS forecast shifted down >= 1.5°F, bypass the window gate for
+        # brackets above the new corrected forecast — the shift itself is the signal.
+        effective_trade_start = trade_start
+        if (_high_shift is not None and _high_shift <= -1.5):
+            bracket_floor = bracket.get("floor")
+            if bracket_floor is not None and bracket_floor > corrected_forecast + 5.0:
+                effective_trade_start = 0  # bypass window gate for far-above brackets
+
         signal = evaluate_bracket(
             bracket             = bracket,
             forecast_high       = forecast_high,
             observed_high       = observed_high,
             city_local_hour     = city_local_hour,
-            trade_start_hour    = trade_start,
+            trade_start_hour    = effective_trade_start,
             trade_end_hour      = trade_end,
             city_bias           = city_bias,
             dynamic_buffer      = dyn_buffer,
             corrected_forecast  = corrected_forecast,
+            city_no_min         = CITY_NO_MIN.get(city),
         )
         if signal:
             result["signals"].append(signal)
@@ -792,7 +843,7 @@ def evaluate_city(
                         continue
                     target = b_brackets_sorted[target_idx]
                     t_ticker  = target.get("ticker", "")
-                    t_no_ask  = float(target.get("ob_no_ask") or target.get("no_price") or 0)
+                    t_no_ask  = _no_price(target)
                     t_floor   = target.get("floor")
 
                     if t_ticker in already_traded:
@@ -837,19 +888,39 @@ def evaluate_city(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]:
+def run(
+    city_filter:      str  = None,
+    paper:            bool = False,
+    kalshi_snapshot:  dict = None,
+    nws_snapshot:     dict = None,
+) -> tuple[list[dict], dict]:
     """
     Run the HIGH decision engine for all cities.
-    Returns (evaluations, nws_snapshot) — the snapshot is passed to the LOWT
-    engine to avoid a redundant full NWS fetch each poll cycle.
+
+    Args:
+        city_filter:     Optional city name to restrict to one city.
+        paper:           If True, log signals but do not place orders.
+        kalshi_snapshot: Pre-fetched kalshi_scanner.scan_all(market_type="high")
+                         result. If None, a fresh scan is performed.
+        nws_snapshot:    Pre-fetched nws_feed.snapshot() result.
+                         If None, a fresh fetch is performed.
+
+    Returns (evaluations, nws_results, kalshi_results) — snapshots are
+    returned so caller can pass them to other engines without re-fetching.
     """
     profiles = load_profiles()
 
-    print("Fetching NWS live data...")
-    nws_results = nws_feed.snapshot(city_filter)
+    if nws_snapshot is not None:
+        nws_results = nws_snapshot
+    else:
+        print("Fetching NWS live data...")
+        nws_results = nws_feed.snapshot(city_filter)
 
-    print("Scanning Kalshi markets...")
-    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
+    if kalshi_snapshot is not None:
+        kalshi_results = kalshi_snapshot
+    else:
+        print("Scanning Kalshi markets...")
+        kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
 
     print("\nEvaluating signals...\n")
     evaluations = []
@@ -860,10 +931,6 @@ def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]
         eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="high")
         evaluations.append(eval_result)
 
-    # ── Cascade tier — pure market-confirmation signals ───────────────────────
-    # Reuses kalshi_results already fetched above — no extra API calls.
-    # Passes nws_results so the cascade can use the corrected forecast to
-    # skip the forecast bracket (previously nws_data was always {}).
     cascade_evals = cascade_engine.run(kalshi_results, city_filter, nws_results=nws_results)
     evaluations.extend(cascade_evals)
 
@@ -960,9 +1027,6 @@ def display(evaluations: list[dict]):
     print(f"\n{'='*72}")
     if not any_signal:
         print("  No actionable signals at this time.")
-
-    # Show cascade signals separately
-    cascade_engine.display(evaluations)
 
 
 # ---------------------------------------------------------------------------

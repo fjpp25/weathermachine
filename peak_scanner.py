@@ -102,7 +102,7 @@ def log_config() -> None:
     )
 
 
-def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
+def run_scan(client, city_filter=None, paper=False, nws_snapshot=None, kalshi_snapshot=None):
     import trader as _trader
     import kalshi_scanner as _ks
 
@@ -120,7 +120,8 @@ def run_scan(client, city_filter=None, paper=False, nws_snapshot=None):
             nws_snapshot = {}
 
     try:
-        kalshi_results = _ks.scan_all(city_filter=city_filter, market_type="high")
+        kalshi_results = kalshi_snapshot if kalshi_snapshot is not None else \
+                         _ks.scan_all(city_filter=city_filter, market_type="high")
     except Exception as e:
         log.warning("peak_scanner: Kalshi scan failed: %s", e)
         return

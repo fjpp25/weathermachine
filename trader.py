@@ -1558,18 +1558,37 @@ def _ticker_city(ticker: str) -> str | None:
         return None
 
 
-def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
-    """Run HIGH and LOWT decision engines, then execute any actionable signals."""
+def run_pipeline(
+    client:          KalshiClient,
+    city_filter:     str  = None,
+    paper:           bool = False,
+    kalshi_high:     dict = None,
+    kalshi_lowt:     dict = None,
+    nws_snapshot:    dict = None,
+):
+    """Run HIGH and LOWT decision engines, then execute any actionable signals.
+
+    Args:
+        kalshi_high:  Pre-fetched kalshi_scanner.scan_all(market_type="high").
+                      If None, decision_engine.run() fetches its own.
+        kalshi_lowt:  Pre-fetched kalshi_scanner.scan_all(market_type="lowt").
+                      If None, a fresh LOWT scan is performed here.
+        nws_snapshot: Pre-fetched nws_feed.snapshot() result.
+                      If None, decision_engine.run() fetches its own.
+    """
     global _deployed_today, _deployed_cascade   # module-level trackers; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
-    # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
-    # to avoid a second full NWS sweep (60 API calls) each poll cycle.
-    evaluations, nws_snapshot, kalshi_results = decision_engine.run(city_filter=city_filter)
+    evaluations, nws_snapshot, kalshi_results = decision_engine.run(
+        city_filter     = city_filter,
+        kalshi_snapshot = kalshi_high,
+        nws_snapshot    = nws_snapshot,
+    )
     decision_engine.display(evaluations)
 
     # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
-        lowt_kalshi = kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
+        lowt_kalshi = kalshi_lowt if kalshi_lowt is not None else \
+                      kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
         lowt_evals = lowt_decision_engine.run(
             kalshi_results = lowt_kalshi,
             city_filter    = city_filter,
@@ -1671,7 +1690,7 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
 
             cost = price * contracts
 
-            # Engine capital check — session-scoped per engine type
+            # Engine capital check — day-scoped per engine type
             tier = signal.get("entry_tier", "")
             engine_key = "cascade" if tier.startswith("cascade") else "main"
             if engine_key == "cascade":
@@ -1680,9 +1699,12 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                               ticker, cost, get_cascade_deployable())
                     continue
             else:
-                if not cap.can_deploy("main", cost):
-                    log.debug("skip %s — main budget exhausted (cost=$%.2f)",
-                              ticker, cost)
+                # Use day-scoped _deployed_today so budget persists across polls
+                main_budget    = round(_day_open_balance * ENGINE_ALLOCATIONS["main"], 2)
+                main_remaining = max(0.0, round(main_budget - _deployed_today, 2))
+                if main_remaining < cost:
+                    log.debug("skip %s — main day budget exhausted (cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, main_remaining)
                     continue
 
             log.info("SIGNAL  %s  %s", city, ticker)
@@ -1710,9 +1732,9 @@ def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = Fa
                 cap.record(engine_key, cost)
                 deployed += cost
                 if engine_key == "cascade":
-                    _deployed_cascade += cost
+                    _deployed_cascade = round(_deployed_cascade + cost, 4)
                 else:
-                    _deployed_today += cost
+                    _deployed_today = round(_deployed_today + cost, 4)
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,

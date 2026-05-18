@@ -54,7 +54,7 @@ SETTLED_THRESHOLD     = 0.97   # max(yes, no) >= this → bracket is settled
 # Backtest: 100% WR on T bracket (n=56), 96.3% WR on adjacent B bracket.
 # Both brackets are entered on each signal.
 TOMORROW_CONTRACTS    = 3      # contracts per bracket (T and adj-B each get this)
-NO_MAX_ENTRY          = 0.92   # don't enter if No has already moved past this
+NO_MAX_ENTRY          = 0.94   # raised from 0.92 — 100% WR backtest on dismissed-T and gradient
 
 # ---------------------------------------------------------------------------
 # Sweep signal parameters
@@ -433,7 +433,7 @@ def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
 YES_DISMISSED         = 0.07
 YES_DISMISSED_T_OTHER = 0.10
 DISMISSED_NO_MIN      = 0.75
-DISMISSED_NO_MAX      = 0.92
+DISMISSED_NO_MAX      = 0.94
 DISMISSED_HOUR_MAX    = 18
 OPEN_LEAN_MIN         = 0.10
 

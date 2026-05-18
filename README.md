@@ -247,8 +247,9 @@ weathermachine/
 
 | Parameter | Value | Description |
 |---|---|---|
-| `NO_MIN_ENTRY_PRICE` | 0.75 | Minimum No price for entry |
-| `NO_MAX_ENTRY_PRICE` | 0.92 | Maximum No price for entry |
+| `NO_MIN_ENTRY_PRICE` | 0.80 | Minimum No price for entry |
+| `NO_MAX_ENTRY_PRICE` | 0.92 | Maximum No price for entry (main engine) |
+| `CITY_NO_MIN` | 0.85 for Miami, LA, New Orleans, Boston, Dallas | Per-city No minimum override for high-variance cities |
 | `MIN_SCORE` | 1 | Minimum signal score to enter |
 | `MAX_CONTRACTS` | 3 | Hard cap per position |
 | `MAX_NO_PER_CITY` | 2 | Max open HIGH positions per city |
@@ -269,7 +270,7 @@ weathermachine/
 |---|---|---|
 | `CONV_THRESHOLD` | 0.97 | No price at which a bracket is considered confirmed |
 | `NO_MIN_ENTRY` | 0.60 | Minimum No price for cascade entry |
-| `NO_MAX_ENTRY` | 0.90 | Maximum No price for HIGH cascade |
+| `NO_MAX_ENTRY` | 0.94 | Maximum No price for cascade entry |
 | `NO_MAX_ENTRY_TOPDOWN` | 0.85 | Maximum No price for top-down cascade |
 | `START_HOUR_CAP` | 15 | No new cascade starts at or after this local hour |
 | `LATE_HOUR` | 13 | Max 1 entry if trigger fires at or after this hour |
