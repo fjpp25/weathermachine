@@ -85,27 +85,45 @@ BOUNDARY_BUFFER_FALLBACK      = 3.0   # °F
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
-NO_MIN_ENTRY_PRICE  = 0.80     # never pay less than this for a NO contract
-                               # data: below 0.75 market is pricing in real uncertainty
-NO_MAX_ENTRY_PRICE  = 0.92     # never pay more than this for a NO contract (main engine)
-                               # data: 0.75–0.92 gives 86.5% WR across 37 trades
+NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
+NO_MAX_ENTRY_PRICE  = 0.95     # never pay more than this for a NO contract
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = False  # top T brackets ("above X°F") now allowed with gates
 
 # ---------------------------------------------------------------------------
-# Per-city No minimum overrides
+# Volume gate — primary entry filter (replaces scoring system)
 # ---------------------------------------------------------------------------
-# These cities show sub-75% WR at No < 0.85 — higher temperature variance
-# means the market's residual uncertainty at lower prices is genuinely
-# informative. Raising the floor eliminates the losing tail.
-# Data: enriched_trade_log analysis, last 3 weeks.
-CITY_NO_MIN: dict[str, float] = {
-    "Miami":        0.85,
-    "Los Angeles":  0.85,
-    "New Orleans":  0.85,
-    "Boston":       0.85,
-    "Dallas":       0.85,
+# Backtest (Apr 7 – May 20 2026, 44 days, same-day markets only):
+#   vol<=1500: n=1748  WR=92.6%  EV=+0.049  total_pnl=+$85.42  37/44 positive days
+# High volume = contested market = genuine uncertainty = lower WR
+# Low volume  = obvious outcome = market hasn't been fully arbitraged yet
+VOL_MAX_ENTRY       = 1500     # reject brackets with volume above this at entry
+
+# ---------------------------------------------------------------------------
+# Half-Kelly contract sizing by no_price band
+# ---------------------------------------------------------------------------
+# Empirical WR per band from 44-day backtest (same-day, vol<=1500).
+# Kelly = (p*b - (1-p)) / b  where b = (1-no_price)/no_price. Half applied.
+# Contracts = floor(half_kelly * bankroll / no_price), capped at MAX.
+# Falls back to KELLY_FALLBACK_CONTRACTS if bankroll unavailable.
+KELLY_HALF_FRACTIONS: dict = {
+    (0.75, 0.78): 0.050,   # WR=78.4%
+    (0.78, 0.80): 0.112,   # WR=83.3%
+    (0.80, 0.82): 0.229,   # WR=89.4%  (highest edge band)
+    (0.82, 0.84): 0.138,   # WR=87.4%
+    (0.84, 0.86): 0.224,   # WR=91.5%
+    (0.86, 0.88): 0.245,   # WR=93.1%
+    (0.88, 0.90): 0.162,   # WR=92.2%
+    (0.90, 0.92): 0.197,   # WR=94.2%
+    (0.92, 0.95): 0.252,   # WR=96.7%
 }
+KELLY_MAX_CONTRACTS      = 5   # hard cap regardless of bankroll size
+KELLY_FALLBACK_CONTRACTS = 2   # used when bankroll unavailable
+KELLY_MAX_PCT_PER_TRADE  = 0.03  # never more than 3% of bankroll on one trade
+
+# Near-cap signal uses flat sizing (not Kelly) — high conviction, small position
+NEAR_CAP_MAX_CONTRACTS   = 3   # separate from Kelly max
+
 
 # Top T bracket gates (above X°F brackets — floor set, cap=None):
 # Backtest (147 signals, Apr 6-29):
@@ -124,7 +142,7 @@ T_BRACKET_FORECAST_MIN_ABOVE = 1.0   # °F above T cap required
 MAX_CONTRACTS       = 3        # hard cap on contracts per position
                                # data: 3-contract losses average -$1.74 each, far worse than 1-2
 
-MIN_SCORE           = 1        # minimum score to enter a trade
+# MIN_SCORE retired — replaced by volume gate (VOL_MAX_ENTRY)
 
 # ---------------------------------------------------------------------------
 # Near-cap signal parameters
@@ -384,6 +402,33 @@ def score_momentum(candles: list[dict]) -> bool:
     return closes[-1] > closes[0]
 
 
+def kelly_contracts(no_price: float, bankroll: float | None) -> int:
+    """
+    Return the half-Kelly contract count for a given no_price and bankroll.
+
+    Uses empirical WR per price band from the 44-day backtest. Caps at
+    KELLY_MAX_CONTRACTS and KELLY_MAX_PCT_PER_TRADE * bankroll per trade.
+    Falls back to KELLY_FALLBACK_CONTRACTS if bankroll is unavailable.
+    """
+    # Find the matching band
+    half_k = None
+    for (lo, hi), frac in KELLY_HALF_FRACTIONS.items():
+        if lo <= no_price < hi:
+            half_k = frac
+            break
+
+    if half_k is None:
+        return KELLY_FALLBACK_CONTRACTS
+
+    if bankroll is None or bankroll <= 0:
+        return KELLY_FALLBACK_CONTRACTS
+
+    # Bet size: half-Kelly fraction of bankroll, capped at 3% per trade
+    bet = min(half_k * bankroll, KELLY_MAX_PCT_PER_TRADE * bankroll)
+    contracts = max(1, int(bet / no_price))
+    return min(contracts, KELLY_MAX_CONTRACTS)
+
+
 def is_forecast_inside_boundary(bracket: dict, forecast: float, buffer: float) -> bool:
     """Check forecast is at least `buffer`°F inside both bracket edges."""
     floor = bracket.get("floor")
@@ -409,7 +454,6 @@ def evaluate_bracket(
     city_bias:          float,
     dynamic_buffer:     float,
     corrected_forecast: float | None = None,
-    city_no_min:        float | None = None,
 ) -> dict:
     """
     Evaluate a single bracket for a NO trade signal.
@@ -554,72 +598,52 @@ def evaluate_bracket(
         )
         return signal
 
-    # --- Signal scoring ---
-    # Score range: −1 to +5.
-    # Temperature signals — derived from NWS obs, subject to bias uncertainty.
-    # Market signals — derived from live Kalshi prices, weighted more heavily
-    # since they aggregate all available information continuously.
-    score   = 0
-    details = []
+    # --- Entry gate: price + volume ---
+    # Replaces the old 6-component scoring system.
+    # Backtest (44 days, same-day, vol<=1500): WR=92.6%, EV=+0.049, 37/44 positive days.
+    # Volume is the primary discriminator: low-volume brackets are uncontested.
+    # High-volume brackets have genuine uncertainty on both sides.
+    no_ask  = _no_price(bracket)
+    yes_ask = bracket.get("ob_yes_ask") or bracket.get("yes_ask") or 0.0
+    volume  = bracket.get("volume") or 0
 
-    if observed_high is not None:
-        if cap is not None and observed_high >= cap:
-            score += 1
-            details.append("obs_eliminates_bracket")
-        elif floor is not None and observed_high < floor - dynamic_buffer:
-            score += 1
-            details.append("obs_below_floor")
-        elif floor is not None and cap is not None and floor <= observed_high < cap:
-            # Observed high is inside the bracket range — bracket may be resolving YES.
-            # Penalise rather than block: market price still determines whether
-            # we enter, but we require stronger market confirmation.
-            score -= 1
-            details.append("obs_inside_bracket")
+    # Price gate
+    if not (NO_MIN_ENTRY_PRICE <= no_ask < NO_MAX_ENTRY_PRICE):
+        signal["skip_reason"] = (
+            f"No price outside range (no={no_ask:.2f} "
+            f"range=[{NO_MIN_ENTRY_PRICE},{NO_MAX_ENTRY_PRICE}))"
+        )
+        return signal
 
-    if distances and min(distances) >= FORECAST_WELL_CLEAR:
-        score += 1
-        details.append("forecast_well_clear")
+    # Volume gate
+    if volume > VOL_MAX_ENTRY:
+        signal["skip_reason"] = (
+            f"Volume too high (vol={volume:,.0f} > max={VOL_MAX_ENTRY:,})"
+        )
+        return signal
 
-    candles = bracket.get("candles", [])
-    if not score_momentum(candles):
-        score += 1
-        details.append("momentum_flat_or_down")
+    # Compute Kelly contracts — fetch current bankroll from trader module
+    bankroll = None
+    try:
+        import trader as _trader_kelly
+        bankroll = _trader_kelly.get_balance_cached()
+    except Exception:
+        pass
 
-    # yes_ask computed early for scoring — reused in trade decision below.
-    yes_ask = bracket.get("ob_yes_ask")
-    if yes_ask is not None and 0 < yes_ask <= YES_HIGH_CONFIDENCE:
-        score += 1
-        details.append("yes_price_quality")
+    n_contracts = kelly_contracts(no_ask, bankroll)
 
-    signal["score"]        = score
-    signal["score_detail"] = details
-
-    # --- Trade type decision ---
-    # yes_ask already computed above.
-    no_ask = bracket.get("ob_no_ask")
-
-    effective_no_min = city_no_min if city_no_min is not None else NO_MIN_ENTRY_PRICE
-
-    if (
-        no_ask is not None
-        and effective_no_min <= no_ask <= NO_MAX_ENTRY_PRICE
-        and yes_ask is not None
-        and NO_MIN_YES_PRICE < yes_ask <= NO_MAX_YES_PRICE
-        and no_depth >= MIN_DEPTH
-    ):
-        # Score range is −1 to +5. Require score ≥ MIN_SCORE to trade.
-        # obs_inside_bracket penalty means a position with obs in range
-        # needs at least two positive signals to remain actionable.
-        if score < MIN_SCORE:
-            signal["skip_reason"] = (
-                f"Score {score} below minimum ({MIN_SCORE} required) — "
-                f"details: {details}"
-            )
-        else:
-            signal["trade_type"]    = "NO"
-            signal["entry_price"]   = no_ask
-            signal["stop_loss"]     = None
-            signal["max_contracts"] = MAX_CONTRACTS
+    # Score field kept for logging/compatibility — volume-gated entries score 3
+    signal["score"]        = 3
+    signal["score_detail"] = [
+        "volume_gate",
+        f"vol={volume}",
+        f"no={no_ask:.2f}",
+        f"kelly={n_contracts}c",
+    ]
+    signal["trade_type"]    = "NO"
+    signal["entry_price"]   = no_ask
+    signal["stop_loss"]     = None
+    signal["max_contracts"] = n_contracts
 
     return signal
 
@@ -698,26 +722,14 @@ def evaluate_city(
 
     # obs_high override: if the observed high already exceeds the corrected
     # forecast (e.g. overnight cold front, early spike), use the observation
-    # as the effective forecast. This prevents the engine from entering No
-    # on brackets the temperature has already passed through.
+    # as the effective forecast. Prevents entering No on brackets the
+    # temperature has already passed through.
     if observed_high is not None and observed_high > corrected_forecast:
         corrected_forecast = observed_high
         result["corrected_forecast"] = corrected_forecast
 
-    # Log significant divergence between AccuWeather and NWS
-    if aw_high is not None and abs(aw_high - nws_corrected) >= 2.0:
-        import logging as _log_aw
-        _log_aw.getLogger("hight_decision_engine").info(
-            "%s: AccuWeather=%.1f°F  NWS_corrected=%.1f°F  "
-            "divergence=%+.1f°F — using AccuWeather",
-            city, aw_high, nws_corrected, aw_high - nws_corrected
-        )
-
-    forecast_bracket   = get_forecast_bracket(corrected_forecast, brackets)
-
-    # Track NWS forecast shifts for this city.
-    # A significant downward shift (>= 1.5°F) means the forecast has moved
-    # away from the upper brackets — strengthens the case for No entries.
+    # Track NWS forecast shifts — a significant downward shift (>= 1.5°F)
+    # bypasses the timing window gate for far-above brackets.
     _high_shift = None
     try:
         from nws_feed import forecast_shift_tracker as _fst
@@ -729,6 +741,17 @@ def evaluate_city(
             )
     except Exception:
         pass
+
+    # Log significant divergence between AccuWeather and NWS
+    if aw_high is not None and abs(aw_high - nws_corrected) >= 2.0:
+        import logging as _log_aw
+        _log_aw.getLogger("hight_decision_engine").info(
+            "%s: AccuWeather=%.1f°F  NWS_corrected=%.1f°F  "
+            "divergence=%+.1f°F — using AccuWeather",
+            city, aw_high, nws_corrected, aw_high - nws_corrected
+        )
+
+    forecast_bracket   = get_forecast_bracket(corrected_forecast, brackets)
 
     result["city_bias"]      = city_bias
     result["dynamic_buffer"] = dyn_buffer
@@ -752,13 +775,13 @@ def evaluate_city(
         if is_forecast:
             continue
 
-        # If NWS forecast shifted down >= 1.5°F, bypass the window gate for
-        # brackets above the new corrected forecast — the shift itself is the signal.
+        # If NWS forecast shifted down >= 1.5°F, bypass the timing window gate
+        # for brackets far above the new corrected forecast.
         effective_trade_start = trade_start
-        if (_high_shift is not None and _high_shift <= -1.5):
+        if _high_shift is not None and _high_shift <= -1.5:
             bracket_floor = bracket.get("floor")
             if bracket_floor is not None and bracket_floor > corrected_forecast + 5.0:
-                effective_trade_start = 0  # bypass window gate for far-above brackets
+                effective_trade_start = 0
 
         signal = evaluate_bracket(
             bracket             = bracket,
@@ -770,7 +793,6 @@ def evaluate_city(
             city_bias           = city_bias,
             dynamic_buffer      = dyn_buffer,
             corrected_forecast  = corrected_forecast,
-            city_no_min         = CITY_NO_MIN.get(city),
         )
         if signal:
             result["signals"].append(signal)
@@ -843,7 +865,7 @@ def evaluate_city(
                         continue
                     target = b_brackets_sorted[target_idx]
                     t_ticker  = target.get("ticker", "")
-                    t_no_ask  = _no_price(target)
+                    t_no_ask  = float(target.get("ob_no_ask") or target.get("no_price") or 0)
                     t_floor   = target.get("floor")
 
                     if t_ticker in already_traded:
@@ -877,7 +899,7 @@ def evaluate_city(
                         "entry_price":   t_no_ask,
                         "entry_tier":    "near_cap",
                         "market_type":   "high",
-                        "max_contracts": MAX_CONTRACTS,
+                        "max_contracts": NEAR_CAP_MAX_CONTRACTS,
                         "skip_reason":   None,
                     })
 
@@ -888,39 +910,19 @@ def evaluate_city(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(
-    city_filter:      str  = None,
-    paper:            bool = False,
-    kalshi_snapshot:  dict = None,
-    nws_snapshot:     dict = None,
-) -> tuple[list[dict], dict]:
+def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]:
     """
     Run the HIGH decision engine for all cities.
-
-    Args:
-        city_filter:     Optional city name to restrict to one city.
-        paper:           If True, log signals but do not place orders.
-        kalshi_snapshot: Pre-fetched kalshi_scanner.scan_all(market_type="high")
-                         result. If None, a fresh scan is performed.
-        nws_snapshot:    Pre-fetched nws_feed.snapshot() result.
-                         If None, a fresh fetch is performed.
-
-    Returns (evaluations, nws_results, kalshi_results) — snapshots are
-    returned so caller can pass them to other engines without re-fetching.
+    Returns (evaluations, nws_snapshot) — the snapshot is passed to the LOWT
+    engine to avoid a redundant full NWS fetch each poll cycle.
     """
     profiles = load_profiles()
 
-    if nws_snapshot is not None:
-        nws_results = nws_snapshot
-    else:
-        print("Fetching NWS live data...")
-        nws_results = nws_feed.snapshot(city_filter)
+    print("Fetching NWS live data...")
+    nws_results = nws_feed.snapshot(city_filter)
 
-    if kalshi_snapshot is not None:
-        kalshi_results = kalshi_snapshot
-    else:
-        print("Scanning Kalshi markets...")
-        kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
+    print("Scanning Kalshi markets...")
+    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
 
     print("\nEvaluating signals...\n")
     evaluations = []
@@ -931,6 +933,10 @@ def run(
         eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="high")
         evaluations.append(eval_result)
 
+    # ── Cascade tier — pure market-confirmation signals ───────────────────────
+    # Reuses kalshi_results already fetched above — no extra API calls.
+    # Passes nws_results so the cascade can use the corrected forecast to
+    # skip the forecast bracket (previously nws_data was always {}).
     cascade_evals = cascade_engine.run(kalshi_results, city_filter, nws_results=nws_results)
     evaluations.extend(cascade_evals)
 

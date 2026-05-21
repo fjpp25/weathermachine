@@ -405,6 +405,20 @@ def get_balance(client: KalshiClient) -> float:
     return balance / 100   # Kalshi returns cents
 
 
+# Module-level balance cache — updated by run_pipeline each poll,
+# read by hight_decision_engine.kelly_contracts() without extra API calls.
+_cached_balance: float | None = None
+
+def get_balance_cached() -> float | None:
+    """Return the most recently fetched balance, or None if not yet set."""
+    return _cached_balance
+
+def set_balance_cached(balance: float) -> None:
+    """Called by run_pipeline after each balance fetch to keep the cache fresh."""
+    global _cached_balance
+    _cached_balance = balance
+
+
 def get_positions(client: KalshiClient) -> list[dict]:
     """Returns all open market positions from Kalshi."""
     data = client.get("portfolio/positions", params={"count_filter": "position"})
@@ -1559,12 +1573,12 @@ def _ticker_city(ticker: str) -> str | None:
 
 
 def run_pipeline(
-    client:          KalshiClient,
-    city_filter:     str  = None,
-    paper:           bool = False,
-    kalshi_high:     dict = None,
-    kalshi_lowt:     dict = None,
-    nws_snapshot:    dict = None,
+    client:       KalshiClient,
+    city_filter:  str  = None,
+    paper:        bool = False,
+    kalshi_high:  dict = None,
+    kalshi_lowt:  dict = None,
+    nws_snapshot: dict = None,
 ):
     """Run HIGH and LOWT decision engines, then execute any actionable signals.
 
@@ -1604,6 +1618,7 @@ def run_pipeline(
     try:
         balance                      = get_balance(client)
         deployable, cascade_reserve  = _update_day_snapshot(balance)
+        set_balance_cached(balance)
         log.info("balance: $%.2f  |  deployable: $%.2f  |  cascade_reserve: $%.2f",
                  balance, deployable, cascade_reserve)
     except Exception as e:
@@ -1690,7 +1705,7 @@ def run_pipeline(
 
             cost = price * contracts
 
-            # Engine capital check — day-scoped per engine type
+            # Engine capital check — session-scoped per engine type
             tier = signal.get("entry_tier", "")
             engine_key = "cascade" if tier.startswith("cascade") else "main"
             if engine_key == "cascade":
@@ -1699,12 +1714,9 @@ def run_pipeline(
                               ticker, cost, get_cascade_deployable())
                     continue
             else:
-                # Use day-scoped _deployed_today so budget persists across polls
-                main_budget    = round(_day_open_balance * ENGINE_ALLOCATIONS["main"], 2)
-                main_remaining = max(0.0, round(main_budget - _deployed_today, 2))
-                if main_remaining < cost:
-                    log.debug("skip %s — main day budget exhausted (cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, main_remaining)
+                if not cap.can_deploy("main", cost):
+                    log.debug("skip %s — main budget exhausted (cost=$%.2f)",
+                              ticker, cost)
                     continue
 
             log.info("SIGNAL  %s  %s", city, ticker)
@@ -1732,9 +1744,9 @@ def run_pipeline(
                 cap.record(engine_key, cost)
                 deployed += cost
                 if engine_key == "cascade":
-                    _deployed_cascade = round(_deployed_cascade + cost, 4)
+                    _deployed_cascade += cost
                 else:
-                    _deployed_today = round(_deployed_today + cost, 4)
+                    _deployed_today += cost
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,

@@ -89,7 +89,7 @@ from market_utils import (
 
 CONV_THRESHOLD       = 0.97
 NO_MIN_ENTRY         = 0.60
-NO_MAX_ENTRY         = 0.90
+NO_MAX_ENTRY         = 0.94   # raised from 0.90 — cascade has structural confirmation edge
 MAX_RANK_FROM_BOTTOM = 2     # only enter the 3 lowest B brackets (ranks 0,1,2)
                               # prevents entries near the forecast zone in spring
 START_HOUR_CAP       = 15

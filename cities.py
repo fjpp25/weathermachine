@@ -60,8 +60,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: conv@14:00, fcst unstable overnight
-        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)        # observe-only — not yet calibrated
     },
@@ -78,8 +78,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 3 days: sharp fcst revision at 07:00–08:00 local
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -93,11 +93,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012839",
         "high_series":      "KXHIGHMIA",
         "lowt_series":      "KXLOWTMIA",
-        "trading_high":  False ,
+        "trading_high":  True,             # RE-ENABLED: volume filter replaces scoring gate
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: conv@13:00, no forecast instability
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
@@ -111,11 +111,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00013904",
         "high_series":      "KXHIGHAUS",
         "lowt_series":      "KXLOWTAUS",
-        "trading_high":  False ,
+        "trading_high":  True,             # RE-ENABLED: 91.5% WR on vol<=1500 backtest
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: conv@17:00, overnight instability clears by 09:00
-        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_high": 0,
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -129,11 +129,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023174",
         "high_series":      "KXHIGHLAX",
         "lowt_series":      "KXLOWTLAX",
-        "trading_high":  False ,        # RE-ENABLED: avg NO 0.94, 100% conv, 4 days obs
+        "trading_high":  True,             # RE-ENABLED: 89.5% WR on vol<=1500 backtest
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 4 days: conv@12:00, best signal quality in dataset
-        "trade_end_high":    15,          # conv@13:00 median, no edge after
+        "trade_start_high": 0,
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
@@ -151,8 +151,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,
         "trading_lowt":  False,
         "observe":          True,
-        "trade_start_high": 10,          # 2 days: non-convergence risk (marine layer), provisional
-        "trade_end_high":    20,          # conv@18:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
@@ -169,8 +169,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: conv@16:00, no significant instability
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
     },
@@ -187,8 +187,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # RE-ENABLED: 100% conv rate, 4 days obs
         "trading_lowt":  False,
         "observe":          True,
-        "trade_start_high": 9,           # 4 days: conv@16:30, same pattern as New York
-        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
@@ -210,8 +210,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 2 days: conv@17:00, stable NO from ~08:00
-        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
@@ -228,8 +228,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 2 days: conv@16:00, stable NO from ~08:00
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
@@ -246,8 +246,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
     },
@@ -264,8 +264,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 2 days: conv@16:00, later start for safety
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -279,11 +279,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023183",
         "high_series":      "KXHIGHTPHX",
         "lowt_series":      "KXLOWTPHX",
-        "trading_high":  False ,        # ENABLED: 50% conv, 2 days — cautious
+        "trading_high":  True,             # RE-ENABLED: 93.3% WR on vol<=1500 backtest
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 2 days: conv@14:00, non-conv risk
-        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_high": 0,
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
     },
@@ -297,11 +297,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00023169",
         "high_series":      "KXHIGHTLV",
         "lowt_series":      "KXLOWTLV",
-        "trading_high":  True ,       # PAUSED: 0% convergence over 2 days
+        "trading_high":  True,             # RE-ENABLED: 95.6% WR on vol<=1500 backtest
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": None,        # non-converging — keep paused
-        "trade_end_high":    None,        # paused — no close needed
+        "trade_start_high": 0,
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
@@ -318,8 +318,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 2 days: conv@15:30, tight spreads
-        "trade_end_high":    18,          # conv@16:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -333,7 +333,7 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00012921",
         "high_series":      "KXHIGHTSATX",
         "lowt_series":      "KXLOWTSATX",
-        "trading_high":  False,       # PAUSED: 50% conv, wider spreads
+        "trading_high":  False,       # PAUSED: 85.6% WR but near-zero EV on vol<=1500 — insufficient edge
         "trading_lowt":  True ,
         "observe":          True,
         "trade_start_high": None,        # insufficient data
@@ -351,11 +351,11 @@ CITIES: dict[str, dict] = {
         "station_id":       "USW00024233",
         "high_series":      "KXHIGHTSEA",
         "lowt_series":      "KXLOWTSEA",
-        "trading_high":  True ,       # PAUSED: 0% convergence over 2 days
+        "trading_high":  True,             # RE-ENABLED: 95.0% WR on vol<=1500 backtest
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": None,        # non-converging
-        "trade_end_high":    None,        # paused — no close needed
+        "trade_start_high": 0,
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
     },
@@ -372,8 +372,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 50% conv, 2 days — cautious
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 10,          # 2 days: conv@14:00, later start for safety
-        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -390,8 +390,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 100% conv, 2 days obs
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 2 days: conv@14:00, strong early NO quality
-        "trade_end_high":    17,          # conv@15:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },
@@ -408,8 +408,8 @@ CITIES: dict[str, dict] = {
         "trading_high":  True ,        # ENABLED: 100% conv, 3 days obs
         "trading_lowt":  True ,
         "observe":          True,
-        "trade_start_high": 9,           # 3 days: conv@17:00, 80% pct_80 at peak
-        "trade_end_high":    19,          # conv@17:00 median, no edge after
+        "trade_start_high": 0,            # time windows retired — volume filter handles timing
+        "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
     },

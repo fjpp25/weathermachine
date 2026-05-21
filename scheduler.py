@@ -39,6 +39,9 @@ import hight_decision_engine as decision_engine
 import tomorrow_scanner
 import peak_scanner
 import last_bracket
+import evening_convergence
+import nws_feed
+import kalshi_scanner
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
@@ -131,6 +134,7 @@ def run_scheduler(
 
     peak_scanner.log_config()
     last_bracket.log_config()
+    evening_convergence.log_config()
 
     poll_count = 0
 
@@ -148,37 +152,86 @@ def run_scheduler(
         log.info("poll #%d  |  interval=%dmin  |  local=%s",
                  poll_count, interval_secs // 60, fmt_local())
 
+        # ── Pre-fetch shared snapshots ────────────────────────────────────
+        # Fetch NWS + Kalshi HIGH + LOWT once per poll and share across all
+        # engines. Reduces ~150 HTTP calls to ~60 per poll (60% reduction).
+        t_fetch = time.monotonic()
+        try:
+            _nws    = nws_feed.snapshot(city_filter)
+            _k_high = kalshi_scanner.scan_all(city_filter, market_type="high")
+            _k_lowt = kalshi_scanner.scan_all(city_filter, market_type="lowt")
+            log.info("[fetch] NWS + Kalshi HIGH + LOWT done  (%.1fs)",
+                     time.monotonic() - t_fetch)
+        except Exception as e:
+            log.error("[fetch] snapshot failed: %s — engines will fetch independently", e)
+            _nws = _k_high = _k_lowt = None
+
         # ── Parallel tasks ────────────────────────────────────────────────
         def _run_pipeline():
             t0 = time.monotonic()
             log.info("[pipeline] starting")
-            trader.run_pipeline(client=client, city_filter=city_filter, paper=paper)
+            trader.run_pipeline(
+                client       = client,
+                city_filter  = city_filter,
+                paper        = paper,
+                kalshi_high  = _k_high,
+                kalshi_lowt  = _k_lowt,
+                nws_snapshot = _nws,
+            )
             log.info("[pipeline] done  (%.1fs)", time.monotonic() - t0)
 
         def _run_scan():
             t0 = time.monotonic()
             log.debug("[next_market_scan] starting")
-            tomorrow_scanner.run_scan(client=client, city_filter=city_filter, paper=paper)
+            tomorrow_scanner.run_scan(
+                client          = client,
+                city_filter     = city_filter,
+                paper           = paper,
+                kalshi_snapshot = _k_high,
+            )
             log.debug("[next_market_scan] done  (%.1fs)", time.monotonic() - t0)
 
         def _run_peak():
             t0 = time.monotonic()
             log.debug("[peak_scan] starting")
-            peak_scanner.run_scan(client=client, city_filter=city_filter, paper=paper)
+            peak_scanner.run_scan(
+                client          = client,
+                city_filter     = city_filter,
+                paper           = paper,
+                nws_snapshot    = _nws,
+                kalshi_snapshot = _k_high,
+            )
             log.debug("[peak_scan] done  (%.1fs)", time.monotonic() - t0)
 
         def _run_last_bracket():
             t0 = time.monotonic()
             log.debug("[last_bracket] starting")
-            last_bracket.run_scan(client=client, city_filter=city_filter, paper=paper)
+            last_bracket.run_scan(
+                client          = client,
+                city_filter     = city_filter,
+                paper           = paper,
+                kalshi_snapshot = _k_high,
+            )
             log.debug("[last_bracket] done  (%.1fs)", time.monotonic() - t0)
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        def _run_econv():
+            t0 = time.monotonic()
+            log.debug("[evening_convergence] starting")
+            evening_convergence.run_scan(
+                client          = client,
+                city_filter     = city_filter,
+                paper           = paper,
+                kalshi_snapshot = _k_high,
+            )
+            log.debug("[evening_convergence] done  (%.1fs)", time.monotonic() - t0)
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
                 pool.submit(_run_pipeline):      "pipeline",
                 pool.submit(_run_scan):          "next_market_scan",
                 pool.submit(_run_peak):          "peak_scan",
                 pool.submit(_run_last_bracket):  "last_bracket",
+                pool.submit(_run_econv):         "evening_convergence",
             }
             for fut in as_completed(futures):
                 name = futures[fut]
