@@ -910,19 +910,34 @@ def evaluate_city(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]:
+def run(
+    city_filter:     str  = None,
+    paper:           bool = False,
+    kalshi_snapshot: dict = None,
+    nws_snapshot:    dict = None,
+) -> tuple[list[dict], dict]:
     """
     Run the HIGH decision engine for all cities.
-    Returns (evaluations, nws_snapshot) — the snapshot is passed to the LOWT
-    engine to avoid a redundant full NWS fetch each poll cycle.
+
+    Args:
+        kalshi_snapshot: Pre-fetched kalshi_scanner.scan_all(market_type="high").
+                         If None, a fresh scan is performed.
+        nws_snapshot:    Pre-fetched nws_feed.snapshot() result.
+                         If None, a fresh fetch is performed.
     """
     profiles = load_profiles()
 
-    print("Fetching NWS live data...")
-    nws_results = nws_feed.snapshot(city_filter)
+    if nws_snapshot is not None:
+        nws_results = nws_snapshot
+    else:
+        print("Fetching NWS live data...")
+        nws_results = nws_feed.snapshot(city_filter)
 
-    print("Scanning Kalshi markets...")
-    kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
+    if kalshi_snapshot is not None:
+        kalshi_results = kalshi_snapshot
+    else:
+        print("Scanning Kalshi markets...")
+        kalshi_results = kalshi_scanner.scan_all(city_filter, market_type="high")
 
     print("\nEvaluating signals...\n")
     evaluations = []
@@ -933,10 +948,6 @@ def run(city_filter: str = None, paper: bool = False) -> tuple[list[dict], dict]
         eval_result = evaluate_city(city, nws_data, scan_data, profiles, market_type="high")
         evaluations.append(eval_result)
 
-    # ── Cascade tier — pure market-confirmation signals ───────────────────────
-    # Reuses kalshi_results already fetched above — no extra API calls.
-    # Passes nws_results so the cascade can use the corrected forecast to
-    # skip the forecast bracket (previously nws_data was always {}).
     cascade_evals = cascade_engine.run(kalshi_results, city_filter, nws_results=nws_results)
     evaluations.extend(cascade_evals)
 
