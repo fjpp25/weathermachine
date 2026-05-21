@@ -1174,6 +1174,152 @@ def _post_exit_scan(
         log.error("post_exit_scan error for %s: %s", exited_ticker, e)
 
 
+# ---------------------------------------------------------------------------
+# Open order management
+# ---------------------------------------------------------------------------
+
+def manage_open_orders(
+    client:          KalshiClient,
+    kalshi_snapshot: dict = None,
+    no_min:          float = 0.75,
+    no_max:          float = 0.95,
+    paper:           bool  = False,
+) -> None:
+    """
+    Amend or cancel resting (unfilled) orders each poll cycle.
+
+    For each open limit order on a temperature market:
+      - Fetch the current No price from kalshi_snapshot
+      - If price is still in [no_min, no_max): amend the order to the
+        current market price so it stays competitive
+      - If price has moved outside range: cancel the order — the signal
+        condition no longer holds
+
+    This prevents order accumulation (the same bracket getting re-entered
+    every poll because the previous order is still resting unfilled).
+
+    Args:
+        kalshi_snapshot: Pre-fetched HIGH market scan from scheduler.
+                         Used to look up current No prices without extra
+                         API calls. Falls back to individual market fetch
+                         if not provided.
+        no_min / no_max: Price range gates — same as main engine.
+        paper:           If True, log actions but do not amend/cancel.
+    """
+    try:
+        resp = client.get("portfolio/orders", params={
+            "status": "resting",
+            "limit":  200,
+        })
+    except Exception as e:
+        log.warning("manage_open_orders: failed to fetch open orders: %s", e)
+        return
+
+    orders = resp.get("orders", [])
+    temp_orders = [
+        o for o in orders
+        if ("HIGH" in o.get("ticker", "").upper() or
+            "LOWT" in o.get("ticker", "").upper())
+        and o.get("action") == "buy"
+    ]
+
+    if not temp_orders:
+        return
+
+    log.info("manage_open_orders: %d resting temperature orders", len(temp_orders))
+
+    amended  = 0
+    cancelled = 0
+
+    for order in temp_orders:
+        order_id = order.get("order_id", "")
+        ticker   = order.get("ticker", "")
+        side     = order.get("side", "no").lower()
+        resting  = int(order.get("remaining_count") or order.get("resting_contracts_count") or 0)
+
+        if resting <= 0:
+            continue
+
+        # ── Get current No price ──────────────────────────────────────────
+        current_no = None
+
+        # Try snapshot first (no extra API call)
+        if kalshi_snapshot:
+            for city_data in kalshi_snapshot.values():
+                for bracket in city_data.get("brackets", []):
+                    if bracket.get("ticker") == ticker:
+                        from market_utils import no_price as _no_price
+                        current_no = _no_price(bracket)
+                        break
+                if current_no is not None:
+                    break
+
+        # Fallback: fetch directly
+        if current_no is None:
+            try:
+                mkt = client.get(f"markets/{ticker}")
+                from market_utils import no_price as _no_price
+                current_no = _no_price(mkt.get("market", {}))
+            except Exception as e:
+                log.debug("manage_open_orders: price fetch failed for %s: %s",
+                          ticker, e)
+                continue
+
+        if current_no is None or current_no <= 0:
+            continue
+
+        # ── Decide: amend or cancel ───────────────────────────────────────
+        if no_min <= current_no < no_max:
+            # Price still in range — amend to current price
+            current_no_cents = round(current_no * 100)
+            order_no_cents   = int(order.get("no_price") or
+                                   round((1 - float(order.get("yes_price", 0) or 0)) * 100))
+
+            if current_no_cents == order_no_cents:
+                continue  # already at current price — nothing to do
+
+            log.info(
+                "manage_open_orders: AMEND %s  %dc  no: %d¢ → %d¢",
+                ticker, resting, order_no_cents, current_no_cents,
+            )
+
+            if not paper:
+                try:
+                    client.post(
+                        f"portfolio/orders/{order_id}/amend",
+                        {
+                            "ticker":    ticker,
+                            "side":      side,
+                            "action":    "buy",
+                            "no_price":  current_no_cents,
+                            "count":     resting,
+                        }
+                    )
+                    amended += 1
+                except Exception as e:
+                    log.warning("manage_open_orders: amend failed %s: %s",
+                                ticker, e)
+
+        else:
+            # Price outside range — cancel
+            log.info(
+                "manage_open_orders: CANCEL %s  no=%.2f outside [%.2f, %.2f)",
+                ticker, current_no, no_min, no_max,
+            )
+
+            if not paper:
+                try:
+                    client.delete(f"portfolio/orders/{order_id}")
+                    cancelled += 1
+                except Exception as e:
+                    log.warning("manage_open_orders: cancel failed %s: %s",
+                                ticker, e)
+
+    if amended or cancelled:
+        log.info("manage_open_orders: %d amended  %d cancelled",
+                 amended, cancelled)
+
+
 def check_exits(
     client:         KalshiClient,
     paper:          bool  = False,
@@ -1572,37 +1718,18 @@ def _ticker_city(ticker: str) -> str | None:
         return None
 
 
-def run_pipeline(
-    client:       KalshiClient,
-    city_filter:  str  = None,
-    paper:        bool = False,
-    kalshi_high:  dict = None,
-    kalshi_lowt:  dict = None,
-    nws_snapshot: dict = None,
-):
-    """Run HIGH and LOWT decision engines, then execute any actionable signals.
-
-    Args:
-        kalshi_high:  Pre-fetched kalshi_scanner.scan_all(market_type="high").
-                      If None, decision_engine.run() fetches its own.
-        kalshi_lowt:  Pre-fetched kalshi_scanner.scan_all(market_type="lowt").
-                      If None, a fresh LOWT scan is performed here.
-        nws_snapshot: Pre-fetched nws_feed.snapshot() result.
-                      If None, decision_engine.run() fetches its own.
-    """
+def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
+    """Run HIGH and LOWT decision engines, then execute any actionable signals."""
     global _deployed_today, _deployed_cascade   # module-level trackers; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
-    evaluations, nws_snapshot, kalshi_results = decision_engine.run(
-        city_filter     = city_filter,
-        kalshi_snapshot = kalshi_high,
-        nws_snapshot    = nws_snapshot,
-    )
+    # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
+    # to avoid a second full NWS sweep (60 API calls) each poll cycle.
+    evaluations, nws_snapshot, kalshi_results = decision_engine.run(city_filter=city_filter)
     decision_engine.display(evaluations)
 
     # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
-        lowt_kalshi = kalshi_lowt if kalshi_lowt is not None else \
-                      kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
+        lowt_kalshi = kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
         lowt_evals = lowt_decision_engine.run(
             kalshi_results = lowt_kalshi,
             city_filter    = city_filter,
