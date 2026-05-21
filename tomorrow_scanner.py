@@ -257,10 +257,17 @@ def initialise(client, city_filter: str = None) -> None:
 # Core scanner
 # ---------------------------------------------------------------------------
 
-def run_scan(client, city_filter: str = None, paper: bool = False) -> None:
+def run_scan(client, city_filter: str = None, paper: bool = False,
+             kalshi_snapshot: dict = None) -> None:
     """
     Check each city's next market for a T-bracket signal.
     Called every poll cycle — runs in parallel with run_pipeline().
+
+    Args:
+        kalshi_snapshot: Pre-fetched kalshi_scanner.scan_all results.
+                         Accepted for interface compatibility with scheduler
+                         pre-fetch pattern but not used here — tomorrow_scanner
+                         fetches specific next-date markets via _fetch_markets().
 
     For each city:
       1. Fetch today's market. If newly converged, advance next_date.
