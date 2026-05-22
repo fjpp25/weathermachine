@@ -935,7 +935,7 @@ def record_peak_deployed(cost: float) -> None:
               cost, _deployed_peak, get_peak_deployable())
 
 
-def get_tomorrow_deployable() -> float:
+def get_tomorrow_deployable(ticker: str = None) -> float:
     """Remaining tomorrow scanner budget for this session."""
     budget = round(_day_open_balance * ENGINE_ALLOCATIONS["tomorrow"], 2)
     return max(0.0, round(budget - _deployed_tomorrow, 2))
@@ -1718,18 +1718,28 @@ def _ticker_city(ticker: str) -> str | None:
         return None
 
 
-def run_pipeline(client: KalshiClient, city_filter: str = None, paper: bool = False):
+def run_pipeline(
+    client:       KalshiClient,
+    city_filter:  str  = None,
+    paper:        bool = False,
+    kalshi_high:  dict = None,
+    kalshi_lowt:  dict = None,
+    nws_snapshot: dict = None,
+):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
     global _deployed_today, _deployed_cascade   # module-level trackers; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
-    # run() returns (evaluations, nws_snapshot) — snapshot reused by LOWT
-    # to avoid a second full NWS sweep (60 API calls) each poll cycle.
-    evaluations, nws_snapshot, kalshi_results = decision_engine.run(city_filter=city_filter)
+    evaluations, nws_snapshot, kalshi_results = decision_engine.run(
+        city_filter     = city_filter,
+        kalshi_snapshot = kalshi_high,
+        nws_snapshot    = nws_snapshot,
+    )
     decision_engine.display(evaluations)
 
     # ── LOWT markets ─────────────────────────────────────────────────────────
     try:
-        lowt_kalshi = kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
+        lowt_kalshi = kalshi_lowt if kalshi_lowt is not None else \
+                      kalshi_scanner.scan_all(city_filter=city_filter, market_type="lowt")
         lowt_evals = lowt_decision_engine.run(
             kalshi_results = lowt_kalshi,
             city_filter    = city_filter,
