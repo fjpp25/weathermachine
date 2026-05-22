@@ -240,6 +240,18 @@ def run_scheduler(
                 except Exception as e:
                     log.error("[%s] unhandled error: %s", name, e, exc_info=True)
 
+        # ── Open order management ─────────────────────────────────────────
+        try:
+            t0 = time.monotonic()
+            trader.manage_open_orders(
+                client          = client,
+                kalshi_snapshot = _k_high,
+                paper           = paper,
+            )
+            log.debug("open order management done  (%.1fs)", time.monotonic() - t0)
+        except Exception as e:
+            log.error("open order management failed: %s", e, exc_info=True)
+
         # ── Exit check ────────────────────────────────────────────────────
         try:
             t0             = time.monotonic()
