@@ -941,7 +941,7 @@ def get_tomorrow_deployable(ticker: str = None) -> float:
     return max(0.0, round(budget - _deployed_tomorrow, 2))
 
 
-def record_tomorrow_deployed(cost: float) -> None:
+def record_tomorrow_deployed(cost: float, ticker: str = None) -> None:
     """Record capital deployed by the tomorrow scanner."""
     global _deployed_tomorrow
     _deployed_tomorrow = round(_deployed_tomorrow + cost, 4)
