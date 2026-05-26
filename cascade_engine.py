@@ -272,7 +272,7 @@ def _corrected_forecast(city: str, nws_data: dict) -> float | None:
         return None
     try:
         from hight_decision_engine import _city_bias as _get_bias
-        return fcst + _get_bias(city)
+        return fcst - _get_bias(city)
     except Exception:
         return fcst
 
@@ -1126,7 +1126,7 @@ def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
     return result
 
 
-def evaluate_city_cascade(city: str, scan_data: dict) -> dict:
+def evaluate_city_cascade(city: str, scan_data: dict, nws_data: dict = None) -> dict:
     result = {
         "city":         city,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
@@ -1144,7 +1144,8 @@ def evaluate_city_cascade(city: str, scan_data: dict) -> dict:
         return result
 
     brackets   = scan_data.get("brackets", [])
-    nws_data   = scan_data.get("nws_data", {})
+    if nws_data is None:
+        nws_data = scan_data.get("nws_data", {})
     local_hour = _local_hour(city)
 
     # Overnight distance engine — fires 22:00–09:00 on N+2+ brackets
@@ -1182,7 +1183,8 @@ def run(kalshi_results: dict, city_filter: str = None, nws_results: dict = None)
     for city, scan_data in kalshi_results.items():
         if city_filter and city.lower() != city_filter.lower():
             continue
-        evaluations.append(evaluate_city_cascade(city, scan_data))
+        nws_city = (nws_results or {}).get(city, {})
+        evaluations.append(evaluate_city_cascade(city, scan_data, nws_data=nws_city))
     return evaluations
 
 
