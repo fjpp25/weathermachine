@@ -132,10 +132,19 @@ TREND_FLAT_THRESHOLD = 0.03   # YES moves of < 3¢ across lookback window = flat
 # HTTP helper
 # ---------------------------------------------------------------------------
 
+# Global semaphore — caps concurrent Kalshi API calls across all threads.
+# Without this, nested ThreadPoolExecutors (scan_all × _scan_brackets × 2
+# market types) can fire 40-50 simultaneous requests, triggering 429s.
+# 10 concurrent calls gives ~33 req/s at typical 300ms latency — well within
+# Kalshi's rate limit while still completing a full 20-city scan in ~20s.
+_api_semaphore = threading.Semaphore(10)
+
+
 def get(url: str, params: dict = None, timeout: int = 15) -> dict:
-    resp = requests.get(url, params=params, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
+    with _api_semaphore:
+        resp = requests.get(url, params=params, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
 
 # ---------------------------------------------------------------------------
