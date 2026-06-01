@@ -85,9 +85,11 @@ BOUNDARY_BUFFER_FALLBACK      = 3.0   # °F
 # NO trade parameters
 NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
-NO_MIN_ENTRY_PRICE  = 0.75     # never pay less than this for a NO contract
+NO_MIN_ENTRY_PRICE  = 0.85     # never pay less than this for a NO contract
+                               # live data (May 21 – Jun 1): [0.75,0.85) WR=55% → raised from 0.75
 NO_MAX_ENTRY_PRICE  = 0.95     # never pay more than this for a NO contract
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
+NO_BAN_ABOVE_BRACKETS = False  # top T brackets ("above X°F") now allowed with gates
 
 # ---------------------------------------------------------------------------
 # Volume gate — primary entry filter (replaces scoring system)
@@ -156,6 +158,10 @@ NEAR_CAP_NO_MIN     = 0.75    # minimum No price (same as main engine floor)
 NEAR_CAP_NO_MAX     = 0.95    # slightly wider than main engine — these are high-confidence
                                # score=0 has 100% settled WR — gate kept at 1 as minimal
                                # sanity check only (requires at least one positive signal)
+
+# Momentum detection
+MIN_CANDLES_FOR_MOMENTUM = 3   # need at least this many candles to score momentum
+MOMENTUM_LOOKBACK        = 3   # look at last N candles for direction
 
 # Global NWS forecast bias fallback (used when data/forecast_bias.json has no entry for city)
 # Overridden per city by data/forecast_bias.json when available.
@@ -380,6 +386,21 @@ def get_forecast_bracket(forecast_high: float, brackets: list[dict],
             if forecast_high < cap:
                 return bracket
     return None
+
+
+def score_momentum(candles: list[dict]) -> bool:
+    """
+    Returns True if price is moving upward (toward YES) over recent candles.
+    Uses close prices from the last MOMENTUM_LOOKBACK candles.
+    Returns False (no momentum) if there are fewer than MIN_CANDLES_FOR_MOMENTUM candles.
+    """
+    if len(candles) < MIN_CANDLES_FOR_MOMENTUM:
+        return False
+    recent = candles[-MOMENTUM_LOOKBACK:]
+    closes = [c.get("yes_price_close") or c.get("close") or 0 for c in recent]
+    if len(closes) < 2:
+        return False
+    return closes[-1] > closes[0]
 
 
 def kelly_contracts(no_price: float, bankroll: float | None) -> int:
@@ -895,7 +916,7 @@ def run(
     paper:           bool = False,
     kalshi_snapshot: dict = None,
     nws_snapshot:    dict = None,
-) -> tuple[list[dict], dict, dict]:
+) -> tuple[list[dict], dict]:
     """
     Run the HIGH decision engine for all cities.
 

@@ -1768,6 +1768,22 @@ def run_pipeline(
         live_positions = sync_from_kalshi(client)
         # Track contracts held per ticker (for per-bracket headroom check)
         open_contracts = {p["ticker"]: p["contracts"] for p in live_positions}
+        # Also include resting (unfilled) orders — these count against headroom
+        # to prevent the accumulation bug where the engine re-enters the same
+        # bracket every poll because the previous order hasn't filled yet.
+        try:
+            resting = client.get("portfolio/orders", params={
+                "status": "resting", "limit": 200
+            }).get("orders", [])
+            for o in resting:
+                t = o.get("ticker", "")
+                if not t: continue
+                n = int(o.get("remaining_count") or
+                        o.get("resting_contracts_count") or 0)
+                if n > 0:
+                    open_contracts[t] = open_contracts.get(t, 0) + n
+        except Exception as e:
+            log.debug("run_pipeline: resting orders fetch failed (non-fatal): %s", e)
         # Track positions held per city, split by market type so HIGH and LOWT
         # positions don't consume each other's per-city cap.
         from cities import SERIES_TO_CITY as _SERIES_TO_CITY
@@ -1896,7 +1912,7 @@ def run_pipeline(
                     "contracts":    contracts,
                     "placed_at":    datetime.now(timezone.utc).isoformat(),
                     "paper":        paper,
-                    "entry_tier":   signal.get("entry_tier", ""),
+                    "entry_tier":   signal.get("entry_tier", "") or "main",
                 })
 
             except Exception as e:
