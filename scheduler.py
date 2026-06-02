@@ -40,12 +40,19 @@ import tomorrow_scanner
 import peak_scanner
 import last_bracket
 import evening_convergence
-import dead_sweep
 import nws_feed
 import kalshi_scanner
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+ACTIVITY_START_HOUR = 0
+ACTIVITY_END_HOUR   = 23
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -128,7 +135,6 @@ def run_scheduler(
     peak_scanner.log_config()
     last_bracket.log_config()
     evening_convergence.log_config()
-    dead_sweep.log_config()
 
     poll_count = 0
 
@@ -152,8 +158,11 @@ def run_scheduler(
         t_fetch = time.monotonic()
         try:
             _nws    = nws_feed.snapshot(city_filter)
-            _k_high = kalshi_scanner.scan_all(city_filter, market_type="high")
-            _k_lowt = kalshi_scanner.scan_all(city_filter, market_type="lowt")
+            _k_high = kalshi_scanner.scan_all(city_filter, market_type="high",
+                                               max_workers=2)
+            time.sleep(1.0)   # pause between HIGH and LOWT scans to avoid 429s
+            _k_lowt = kalshi_scanner.scan_all(city_filter, market_type="lowt",
+                                               max_workers=2)
             log.info("[fetch] NWS + Kalshi HIGH + LOWT done  (%.1fs)",
                      time.monotonic() - t_fetch)
         except Exception as e:
@@ -219,26 +228,13 @@ def run_scheduler(
             )
             log.debug("[evening_convergence] done  (%.1fs)", time.monotonic() - t0)
 
-        def _run_dead_sweep():
-            t0 = time.monotonic()
-            log.debug("[dead_sweep] starting")
-            dead_sweep.run_scan(
-                client          = client,
-                city_filter     = city_filter,
-                paper           = paper,
-                kalshi_snapshot = _k_high,
-                nws_snapshot    = _nws,
-            )
-            log.debug("[dead_sweep] done  (%.1fs)", time.monotonic() - t0)
-
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             futures = {
                 pool.submit(_run_pipeline):      "pipeline",
                 pool.submit(_run_scan):          "next_market_scan",
                 pool.submit(_run_peak):          "peak_scan",
                 pool.submit(_run_last_bracket):  "last_bracket",
                 pool.submit(_run_econv):         "evening_convergence",
-                pool.submit(_run_dead_sweep):    "dead_sweep",
             }
             for fut in as_completed(futures):
                 name = futures[fut]
