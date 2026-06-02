@@ -1186,26 +1186,19 @@ def manage_open_orders(
     paper:           bool  = False,
 ) -> None:
     """
-    Amend or cancel resting (unfilled) orders each poll cycle.
+    Manage resting (unfilled) orders each poll cycle.
 
     For each open limit order on a temperature market:
-      - Fetch the current No price from kalshi_snapshot
-      - If price is still in [no_min, no_max): amend the order to the
-        current market price so it stays competitive
-      - If price has moved outside range: cancel the order — the signal
-        condition no longer holds
+      - If price moved >= 1¢ from order price: cancel + re-place at current price
+      - If order has been resting > MAX_ORDER_AGE_POLLS polls: cancel, do not replace
+      - If price moved outside [no_min, no_max): cancel, do not replace
 
-    This prevents order accumulation (the same bracket getting re-entered
-    every poll because the previous order is still resting unfilled).
-
-    Args:
-        kalshi_snapshot: Pre-fetched HIGH market scan from scheduler.
-                         Used to look up current No prices without extra
-                         API calls. Falls back to individual market fetch
-                         if not provided.
-        no_min / no_max: Price range gates — same as main engine.
-        paper:           If True, log actions but do not amend/cancel.
+    This prevents:
+      1. Orders stuck at prices the market has moved past (never fill)
+      2. Accumulation — engine re-entering same bracket each poll
     """
+    MAX_ORDER_AGE_POLLS = 3    # cancel after this many polls unfilled (~15 min)
+
     try:
         resp = client.get("portfolio/orders", params={
             "status": "resting",
@@ -1228,22 +1221,21 @@ def manage_open_orders(
 
     log.info("manage_open_orders: %d resting temperature orders", len(temp_orders))
 
-    amended  = 0
+    replaced  = 0
     cancelled = 0
 
     for order in temp_orders:
         order_id = order.get("order_id", "")
         ticker   = order.get("ticker", "")
         side     = order.get("side", "no").lower()
-        resting  = int(order.get("remaining_count") or order.get("resting_contracts_count") or 0)
+        resting  = int(order.get("remaining_count") or
+                       order.get("resting_contracts_count") or 0)
 
         if resting <= 0:
             continue
 
         # ── Get current No price ──────────────────────────────────────────
         current_no = None
-
-        # Try snapshot first (no extra API call)
         if kalshi_snapshot:
             for city_data in kalshi_snapshot.values():
                 for bracket in city_data.get("brackets", []):
@@ -1254,7 +1246,6 @@ def manage_open_orders(
                 if current_no is not None:
                     break
 
-        # Fallback: fetch directly
         if current_no is None:
             try:
                 mkt = client.get(f"markets/{ticker}")
@@ -1268,56 +1259,73 @@ def manage_open_orders(
         if current_no is None or current_no <= 0:
             continue
 
-        # ── Decide: amend or cancel ───────────────────────────────────────
-        if no_min <= current_no < no_max:
-            # Price still in range — amend to current price
-            current_no_cents = round(current_no * 100)
-            order_no_cents   = int(order.get("no_price") or
-                                   round((1 - float(order.get("yes_price", 0) or 0)) * 100))
+        # ── Track order age ───────────────────────────────────────────────
+        _order_age[order_id] = _order_age.get(order_id, 0) + 1
+        age = _order_age[order_id]
 
-            if current_no_cents == order_no_cents:
-                continue  # already at current price — nothing to do
-
-            log.info(
-                "manage_open_orders: AMEND %s  %dc  no: %d¢ → %d¢",
-                ticker, resting, order_no_cents, current_no_cents,
-            )
-
-            if not paper:
-                try:
-                    client.post(
-                        f"portfolio/orders/{order_id}/amend",
-                        {
-                            "ticker":    ticker,
-                            "side":      side,
-                            "action":    "buy",
-                            "no_price":  current_no_cents,
-                            "count":     resting,
-                        }
-                    )
-                    amended += 1
-                except Exception as e:
-                    log.warning("manage_open_orders: amend failed %s: %s",
-                                ticker, e)
-
+        # ── Get order's current limit price ──────────────────────────────
+        raw_no = order.get("no_price")
+        if raw_no is not None:
+            order_no_price = float(raw_no) / 100 if float(raw_no) > 1 else float(raw_no)
         else:
-            # Price outside range — cancel
+            order_no_price = 1.0 - float(order.get("yes_price", 0) or 0)
+
+        # ── Decide ────────────────────────────────────────────────────────
+        if current_no < no_min or current_no >= no_max:
             log.info(
                 "manage_open_orders: CANCEL %s  no=%.2f outside [%.2f, %.2f)",
                 ticker, current_no, no_min, no_max,
             )
-
             if not paper:
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
                     cancelled += 1
+                    _order_age.pop(order_id, None)
                 except Exception as e:
-                    log.warning("manage_open_orders: cancel failed %s: %s",
-                                ticker, e)
+                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
 
-    if amended or cancelled:
-        log.info("manage_open_orders: %d amended  %d cancelled",
-                 amended, cancelled)
+        elif age > MAX_ORDER_AGE_POLLS:
+            log.info(
+                "manage_open_orders: CANCEL (stale) %s  age=%d polls  no=%.2f",
+                ticker, age, current_no,
+            )
+            if not paper:
+                try:
+                    client.delete(f"portfolio/orders/{order_id}")
+                    cancelled += 1
+                    _order_age.pop(order_id, None)
+                except Exception as e:
+                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
+
+        elif abs(current_no - order_no_price) >= 0.01:
+            log.info(
+                "manage_open_orders: REPLACE %s  %dc  %.2f → %.2f",
+                ticker, resting, order_no_price, current_no,
+            )
+            if not paper:
+                try:
+                    client.delete(f"portfolio/orders/{order_id}")
+                    _order_age.pop(order_id, None)
+                    place_order(
+                        client        = client,
+                        ticker        = ticker,
+                        side          = side,
+                        price_dollars = current_no,
+                        contracts     = resting,
+                        paper         = False,
+                    )
+                    replaced += 1
+                except Exception as e:
+                    log.warning("manage_open_orders: replace failed %s: %s", ticker, e)
+        # else: price unchanged and within age limit — leave it
+
+    if replaced or cancelled:
+        log.info("manage_open_orders: %d replaced  %d cancelled",
+                 replaced, cancelled)
+
+
+# Module-level order age tracker — persists across polls, resets on restart
+_order_age: dict[str, int] = {}
 
 
 def check_exits(
