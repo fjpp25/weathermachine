@@ -112,7 +112,7 @@ def _fetch_hourly_forecast(location_key: str, api_key: str,
             return val
     try:
         resp = requests.get(
-            f"{accuweather_feed.BASE_URL}/forecasts/v1/hourly/12hour/{location_key}",
+            f"http://dataservice.accuweather.com/forecasts/v1/hourly/12hour/{location_key}",
             params={"apikey": api_key, "details": "false", "metric": "false"},
             timeout=REQUEST_TIMEOUT,
         )
@@ -236,14 +236,16 @@ def run_scan(
 
     forecast_f = _fetch_hourly_forecast(location_key, api_key, market_hour)
     if forecast_f is None:
-        log.debug("hourly_nyc: no forecast for hour %d — skipping", market_hour)
+        log.info("hourly_nyc: no forecast for hour %d EDT — skipping", market_hour)
         return
 
     # ── Kalshi brackets ───────────────────────────────────────────────────
     brackets = _fetch_brackets(evt_ticker)
     if not brackets:
-        log.debug("hourly_nyc: no open brackets for %s", evt_ticker)
+        log.info("hourly_nyc: no open brackets for %s", evt_ticker)
         return
+    log.info("hourly_nyc: %s  %d brackets  forecast=%.1f°F  %dmin_left",
+             evt_ticker, len(brackets), forecast_f, mins_to_close)
 
     # ── Evaluate each bracket ─────────────────────────────────────────────
     signals_fired = 0

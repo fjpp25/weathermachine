@@ -138,12 +138,19 @@ def _fmt_bracket(bracket: str, mtype: str = "HIGH",
     Format a bracket code for display.
 
     B62.5 → "63–64°"  (Kalshi floor-0.5 convention)
-    T61   → "≤60°"    (bottom T in HIGH market — resolves YES if temp < 61°F)
-    T69   → "≥69°"    (top T in HIGH market — resolves YES if temp ≥ 69°F)
+    T61   → "≤60°"    (bottom T in HIGH market)
+    T69   → "≥69°"    (top T in HIGH market)
+
+    Kalshi's T bracket naming is inconsistent across markets — sometimes
+    the top T ticker equals last_B_hi, sometimes last_B_hi+1. The only
+    reliable source is the B bracket range:
+
+      bottom T display = ≤(first_B_lo - 1)°
+      top T    display = ≥(last_B_hi  + 1)°
 
     all_brackets: list of all bracket codes in the same market (e.g.
-    ["T60","B60.5","B62.5","B64.5","B66.5","T69"]) — used to determine
-    whether a T bracket is the bottom or top of the market.
+    ["T61","B60.5","B62.5","B64.5","B66.5","T69"]) — required to compute
+    the correct display for T brackets.
     """
     if not bracket:
         return bracket
@@ -159,22 +166,37 @@ def _fmt_bracket(bracket: str, mtype: str = "HIGH",
             v = float(bracket[1:])
             if mtype == "LOW":
                 return f"<{v:.0f}°"
-            # HIGH market: determine if this is the bottom or top T bracket
-            # Bottom T: resolves YES if temp < v  → display as "≤(v-1)°"
-            # Top T:    resolves YES if temp ≥ v  → display as "≥v°"
+
             if all_brackets:
+                # Separate T and B brackets
                 t_vals = sorted([
                     float(b[1:]) for b in all_brackets
                     if b and b.startswith("T") and b[1:].replace(".","").isdigit()
                 ])
-                if len(t_vals) >= 2:
-                    if v == t_vals[0]:            # lowest T value = bottom bracket
+                b_floors = [
+                    float(b[1:]) for b in all_brackets
+                    if b and b.startswith("B") and b[1:].replace(".","").isdigit()
+                ]
+
+                if b_floors and len(t_vals) >= 2:
+                    # first B bracket lo = int(min_floor + 0.5)
+                    # last  B bracket hi = int(max_floor + 0.5) + 1
+                    first_b_lo = int(min(b_floors) + 0.5)
+                    last_b_hi  = int(max(b_floors) + 0.5) + 1
+
+                    if v == t_vals[0]:   # bottom T
+                        return f"≤{first_b_lo - 1}°"
+                    else:                # top T
+                        return f"≥{last_b_hi + 1}°"
+
+                elif len(t_vals) >= 2:
+                    # No B brackets available — fall back to v-based heuristic
+                    if v == t_vals[0]:
                         return f"≤{v-1:.0f}°"
-                    else:                          # highest T value = top bracket
-                        return f"≥{v:.0f}°"
-                elif len(t_vals) == 1:
-                    return f"≥{v:.0f}°"           # single T = top bracket
-            # Fallback when no context available
+                    else:
+                        return f"≥{v+1:.0f}°"
+
+            # Fallback: no context at all
             return f"≥{v:.0f}°"
     except ValueError:
         pass
