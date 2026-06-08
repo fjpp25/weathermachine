@@ -406,11 +406,25 @@ def api_status():
     bal = get_balance(); pos = get_positions()
     unr = sum(p.get("unrealised_pnl",0) for p in pos)
     cur = sum(p.get("current_price",0)*p.get("contracts",1) for p in pos)
+    # Per-engine capital breakdown from EngineCapital singleton
+    engines = {}
+    available = 0.0
+    try:
+        cap = trader.get_engine_capital()
+        for e in trader.ENGINE_ALLOCATIONS:
+            rem = round(cap.remaining(e), 2)
+            bud = round(cap.budget(e), 2)
+            engines[e] = {"remaining": rem, "budget": bud}
+            available += rem
+    except Exception:
+        available = 0.0
     return jsonify({
-        "balance":    bal, "deployable": round(bal*0.70,2),
+        "balance":    bal,
+        "available":  round(available, 2),
         "portfolio":  round(bal+cur,2),  "unrealised": round(unr,2),
         "mode":       "LIVE" if os.environ.get("KALSHI_DEMO","true")=="false" else "DEMO",
         "open":       len(pos),
+        "engines":    engines,
     })
 
 # ---------------------------------------------------------------------------
@@ -859,7 +873,7 @@ td.center{text-align:center}
 <!-- Balance bar -->
 <div id="bal-bar">
   <div class="bal-item"><div class="bal-k">Balance</div><div class="bal-v" id="b-bal">—</div></div>
-  <div class="bal-item"><div class="bal-k">Deployable</div><div class="bal-v" id="b-dep">—</div></div>
+  <div class="bal-item"><div class="bal-k">Available</div><div class="bal-v" id="b-dep">—</div></div>
   <div class="bal-item"><div class="bal-k">Portfolio</div><div class="bal-v" id="b-prt">—</div></div>
   <div class="bal-item"><div class="bal-k">Unrealised</div><div class="bal-v" id="b-unr">—</div></div>
   <div class="bal-item"><div class="bal-k">Open</div><div class="bal-v" id="b-open">—</div></div>
@@ -878,6 +892,8 @@ td.center{text-align:center}
 
 <!-- ── HOME ── -->
 <div class="tab on" id="tab-home">
+  <div class="sh">ENGINE BUDGETS</div>
+  <div id="eng-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:16px"></div>
   <div class="sh">CITY STATUS</div>
   <div id="cgrid"></div>
 </div>
@@ -1008,8 +1024,24 @@ async function loadStatus() {
   try {
     const d = await fetch('/api/status').then(r => r.json());
     document.getElementById('b-bal').textContent  = fmt$(d.balance);
-    document.getElementById('b-dep').textContent  = fmt$(d.deployable);
+    document.getElementById('b-dep').textContent  = fmt$(d.available ?? 0);
     document.getElementById('b-prt').textContent  = fmt$(d.portfolio);
+    // Engine budget cards
+    const eg = document.getElementById('eng-grid');
+    if (eg && d.engines) {
+      eg.innerHTML = Object.entries(d.engines).map(([name, v]) => {
+        const pct = v.budget > 0 ? Math.round((v.remaining / v.budget) * 100) : 0;
+        const col = pct > 50 ? 'var(--ac)' : pct > 20 ? 'var(--pri)' : 'var(--red)';
+        return `<div style="background:var(--s2);border-radius:6px;padding:8px 10px">
+          <div style="font-size:10px;color:var(--sec);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">${name}</div>
+          <div style="font-size:15px;font-weight:600;color:${col}">${fmt$(v.remaining)}</div>
+          <div style="font-size:10px;color:var(--sec);margin-top:2px">of ${fmt$(v.budget)}</div>
+          <div style="height:3px;background:var(--s1);border-radius:2px;margin-top:6px">
+            <div style="height:100%;width:${pct}%;background:${col};border-radius:2px;transition:width .3s"></div>
+          </div>
+        </div>`;
+      }).join('');
+    }
     document.getElementById('b-open').textContent = d.open ?? '—';
     const unr = d.unrealised ?? 0;
     const uEl = document.getElementById('b-unr');
