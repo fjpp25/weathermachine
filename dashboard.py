@@ -132,16 +132,50 @@ def _entry_tier(ticker: str) -> str:
             return (e.get("entry_tier", "") or "")
     return ""
 
-def _fmt_bracket(bracket: str, mtype: str = "HIGH") -> str:
+def _fmt_bracket(bracket: str, mtype: str = "HIGH",
+                 all_brackets: list = None) -> str:
+    """
+    Format a bracket code for display.
+
+    B62.5 → "63–64°"  (Kalshi floor-0.5 convention)
+    T61   → "≤60°"    (bottom T in HIGH market — resolves YES if temp < 61°F)
+    T69   → "≥69°"    (top T in HIGH market — resolves YES if temp ≥ 69°F)
+
+    all_brackets: list of all bracket codes in the same market (e.g.
+    ["T60","B60.5","B62.5","B64.5","B66.5","T69"]) — used to determine
+    whether a T bracket is the bottom or top of the market.
+    """
     if not bracket:
         return bracket
     try:
         if bracket.startswith("B"):
             f = float(bracket[1:])
-            return f"{f:.0f}–{f+2:.0f}°"
+            # Kalshi convention: B62.5 covers 62.5–64.4°F, displayed as 63–64°
+            lo = int(f + 0.5)   # 62.5 → 63
+            hi = lo + 1
+            return f"{lo}–{hi}°"
+
         elif bracket.startswith("T"):
             v = float(bracket[1:])
-            return f"<{v:.0f}°" if mtype == "LOW" else f">{v:.0f}°"
+            if mtype == "LOW":
+                return f"<{v:.0f}°"
+            # HIGH market: determine if this is the bottom or top T bracket
+            # Bottom T: resolves YES if temp < v  → display as "≤(v-1)°"
+            # Top T:    resolves YES if temp ≥ v  → display as "≥v°"
+            if all_brackets:
+                t_vals = sorted([
+                    float(b[1:]) for b in all_brackets
+                    if b and b.startswith("T") and b[1:].replace(".","").isdigit()
+                ])
+                if len(t_vals) >= 2:
+                    if v == t_vals[0]:            # lowest T value = bottom bracket
+                        return f"≤{v-1:.0f}°"
+                    else:                          # highest T value = top bracket
+                        return f"≥{v:.0f}°"
+                elif len(t_vals) == 1:
+                    return f"≥{v:.0f}°"           # single T = top bracket
+            # Fallback when no context available
+            return f"≥{v:.0f}°"
     except ValueError:
         pass
     return bracket
@@ -330,6 +364,21 @@ logging.getLogger().addHandler(_lb)
 # ---------------------------------------------------------------------------
 # API — /api/status
 # ---------------------------------------------------------------------------
+def _market_brackets_map(tickers: list[str]) -> dict[str, list[str]]:
+    """
+    Build {market_key: [bracket_codes]} from a list of tickers.
+    market_key = first two dash-separated parts, e.g. "KXHIGHTSEA-26JUN07"
+    """
+    m: dict[str, list[str]] = {}
+    for tk in tickers:
+        parts = str(tk).split("-")
+        if len(parts) >= 3:
+            key = "-".join(parts[:2])
+            br  = parts[-1]
+            m.setdefault(key, []).append(br)
+    return m
+
+
 @app.route("/api/status")
 def api_status():
     bal = get_balance(); pos = get_positions()
@@ -348,14 +397,17 @@ def api_status():
 @app.route("/api/positions")
 def api_positions():
     out = []
-    for p in get_positions():
+    positions = get_positions()
+    _bmap = _market_brackets_map([p.get("ticker","") for p in positions])
+    for p in positions:
         tk = p.get("ticker",""); mt = "HIGH" if "HIGH" in tk else "LOW"
         br = tk.split("-")[-1] if "-" in tk else tk
         ti = _entry_tier(tk)
         eg = "CASCADE" if "cascade" in ti.lower() else ("MAIN" if not ti else ti.upper())
+        _mkey = "-".join(tk.split("-")[:2]) if "-" in tk else tk
         out.append({"ticker":tk,"market":_city_from_ticker(tk) or tk,
             "city":_city_from_ticker(tk,bare=True) or tk,"market_type":mt,
-            "bracket":_fmt_bracket(br,mt),"engine":eg,"side":p.get("side","").upper(),
+            "bracket":_fmt_bracket(br,mt,_bmap.get(_mkey)),"engine":eg,"side":p.get("side","").upper(),
             "contracts":p.get("contracts",1),"avg_cost":round(p.get("avg_cost",0),2),
             "current_price":round(p.get("current_price",0),2),
             "unrealised":round(p.get("unrealised_pnl",0),2),
@@ -389,6 +441,7 @@ def api_session():
     positions = get_positions(); trades = _load_trade_log()
     tlog = {t.get("ticker",""): t for t in reversed(trades)}
     entries = []
+    _bmap2 = _market_brackets_map([p.get("ticker","") for p in positions])
     for p in positions:
         tk = p.get("ticker",""); t = tlog.get(tk,{})
         ti = (t.get("entry_tier","") or "").lower()
@@ -396,9 +449,10 @@ def api_session():
         sc = t.get("score",0); mt = "HIGH" if "HIGH" in tk else "LOW"
         br = tk.split("-")[-1] if "-" in tk else tk
         pa = t.get("placed_at","")
+        _mkey2 = "-".join(tk.split("-")[:2]) if "-" in tk else tk
         entries.append({"ticker":tk,"market":_city_from_ticker(tk) or tk,
             "city":_city_from_ticker(tk,bare=True) or tk,"market_type":mt,
-            "bracket":_fmt_bracket(br,mt),"engine":eg,"side":p.get("side","").upper(),
+            "bracket":_fmt_bracket(br,mt,_bmap2.get(_mkey2)),"engine":eg,"side":p.get("side","").upper(),
             "contracts":p.get("contracts",1),"avg_cost":round(p.get("avg_cost",0),2),
             "unrealised":round(p.get("unrealised_pnl",0),2),
             "score":f"{sc}/5" if not ti else "—",
@@ -566,6 +620,7 @@ def api_city(city: str):
 
     omap={"win":("WON ✓","green"),"loss":("LOST ✗","red"),
           "exit":("EXIT ↩","yellow"),"open":("OPEN","dim")}
+    _bmap3 = _market_brackets_map([i.get("ticker","") for i in all_items])
     pos_list=[]
     for i in all_items:
         tk=i.get("ticker","") or ""; br=tk.split("-")[-1] if "-" in tk else tk
@@ -578,8 +633,9 @@ def api_city(city: str):
             f"${ep+pnl/max(i.get('contracts',1),1):.2f}" if out=="exit" else
             "$1.00" if i.get("won") else "$0.00")
         ol,oc=omap.get(out,(out.upper(),"dim"))
+        _mkey3 = "-".join(tk.split("-")[:2]) if "-" in tk else tk
         pos_list.append({"date":(i.get("placed_at") or i.get("date") or "")[:10],
-            "bracket":_fmt_bracket(br,mt),"market_type":mt,"engine":eg,
+            "bracket":_fmt_bracket(br,mt,_bmap3.get(_mkey3)),"market_type":mt,"engine":eg,
             "side":(i.get("side","NO") or "NO").upper(),
             "entry":f"${ep:.2f}","exit":xs,"pnl":round(pnl,2),
             "contracts":i.get("contracts",1),"outcome":out,

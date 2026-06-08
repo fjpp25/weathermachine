@@ -443,6 +443,33 @@ def load_observations() -> list[dict]:
     return []
 
 
+def _migrate_csv_header() -> None:
+    """
+    If the CSV exists with an old header (fewer columns than CSV_FIELDS),
+    rewrite the header row in-place so new rows align correctly.
+    Called once at startup.
+    """
+    if not OUTPUT_CSV.exists():
+        return
+    with open(OUTPUT_CSV, "r", encoding="utf-8") as f:
+        first_line = f.readline()
+    existing_fields = [c.strip() for c in first_line.split(",")]
+    if existing_fields == CSV_FIELDS:
+        return  # already up to date
+    # Header is stale — rewrite with current CSV_FIELDS
+    log.info("hourly_nyc_observer: migrating CSV header (%d → %d fields)",
+             len(existing_fields), len(CSV_FIELDS))
+    import shutil, tempfile
+    with open(OUTPUT_CSV, "r", encoding="utf-8") as src,          tempfile.NamedTemporaryFile("w", delete=False,
+                                     encoding="utf-8", newline="") as tmp:
+        src.readline()  # skip old header
+        tmp.write(",".join(CSV_FIELDS) + "\n")
+        shutil.copyfileobj(src, tmp)
+        tmp_path = tmp.name
+    shutil.move(tmp_path, OUTPUT_CSV)
+    log.info("hourly_nyc_observer: CSV header migrated")
+
+
 def _append_csv_rows(rows: list[dict]) -> None:
     """Append new rows to the CSV file, writing the header if the file is new."""
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -622,6 +649,9 @@ def main(poll_interval_sec: int = POLL_INTERVAL_SEC) -> None:
 
     log.info("AccuWeather: api_key=%s...  nyc_key=%s",
              api_key[:6], location_key)
+
+    # ── Migrate CSV header if needed ─────────────────────────────────────
+    _migrate_csv_header()
 
     # ── Load history ──────────────────────────────────────────────────────
     observations = load_observations()

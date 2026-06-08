@@ -859,12 +859,13 @@ _deployed_econv:   float      = 0.0   # evening convergence — persists across 
 # Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
 ENGINE_ALLOCATIONS: dict[str, float] = {
-    "main":     0.30,   # 30% — primary discovery engine
-    "cascade":  0.35,   # 35% — highest proven EV (LOWT cascade dominates)
-    "topup":    0.10,   # 10% — augments existing positions (trimmed from 15%)
+    "main":     0.28,   # 30% → 28% to make room for hourly
+    "cascade":  0.33,   # 35% → 33%
+    "topup":    0.10,   # 10% — augments existing positions
     "peak":     0.08,   # 8%  — intraday peak confirmation
     "tomorrow": 0.12,   # 12% — 100% WR, overnight capital efficiency
-    "econv":    0.05,   # 5%  — evening convergence (3-active, hr>=19, B non-forecast)
+    "econv":    0.05,   # 5%  — evening convergence
+    "hourly":   0.04,   # 4%  — NYC hourly temperature markets (new)
 }
 
 # Legacy constants retained for backward compat
@@ -1181,7 +1182,7 @@ def _post_exit_scan(
 def manage_open_orders(
     client:          KalshiClient,
     kalshi_snapshot: dict = None,
-    no_min:          float = 0.75,
+    no_min:          float = 0.85,   # must match NO_MIN_ENTRY_PRICE in hight_decision_engine
     no_max:          float = 0.95,
     paper:           bool  = False,
 ) -> None:
@@ -1190,14 +1191,21 @@ def manage_open_orders(
 
     For each open limit order on a temperature market:
       - If price moved >= 1¢ from order price: cancel + re-place at current price
-      - If order has been resting > MAX_ORDER_AGE_POLLS polls: cancel, do not replace
+        BUT only if the order has been resting < MAX_ORDER_AGE_SECS — prevents
+        infinite replace chains where the price keeps drifting
+      - If order has been resting > MAX_ORDER_AGE_SECS: cancel, do not replace
       - If price moved outside [no_min, no_max): cancel, do not replace
+
+    Age is tracked via wall-clock time (not poll count) so service restarts
+    don't reset the clock on long-resting orders.
 
     This prevents:
       1. Orders stuck at prices the market has moved past (never fill)
       2. Accumulation — engine re-entering same bracket each poll
+      3. Infinite replace chains on drifting prices
     """
-    MAX_ORDER_AGE_POLLS = 3    # cancel after this many polls unfilled (~15 min)
+    MAX_ORDER_AGE_SECS = 900   # 15 minutes — cancel if unfilled after this long
+    MAX_REPLACE_SECS   = 600   # 10 minutes — stop replacing after this long, just cancel
 
     try:
         resp = client.get("portfolio/orders", params={
@@ -1259,9 +1267,11 @@ def manage_open_orders(
         if current_no is None or current_no <= 0:
             continue
 
-        # ── Track order age ───────────────────────────────────────────────
-        _order_age[order_id] = _order_age.get(order_id, 0) + 1
-        age = _order_age[order_id]
+        # ── Track order age (wall-clock) ─────────────────────────────────
+        now = _time.monotonic()
+        if order_id not in _order_first_seen:
+            _order_first_seen[order_id] = now
+        age_secs = now - _order_first_seen[order_id]
 
         # ── Get order's current limit price ──────────────────────────────
         raw_no = order.get("no_price")
@@ -1280,32 +1290,33 @@ def manage_open_orders(
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
                     cancelled += 1
-                    _order_age.pop(order_id, None)
+                    _order_first_seen.pop(order_id, None)
                 except Exception as e:
                     log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
 
-        elif age > MAX_ORDER_AGE_POLLS:
+        elif age_secs > MAX_ORDER_AGE_SECS:
             log.info(
-                "manage_open_orders: CANCEL (stale) %s  age=%d polls  no=%.2f",
-                ticker, age, current_no,
+                "manage_open_orders: CANCEL (stale) %s  age=%.0fs  no=%.2f",
+                ticker, age_secs, current_no,
             )
             if not paper:
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
                     cancelled += 1
-                    _order_age.pop(order_id, None)
+                    _order_first_seen.pop(order_id, None)
                 except Exception as e:
                     log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
 
-        elif abs(current_no - order_no_price) >= 0.01:
+        elif abs(current_no - order_no_price) >= 0.01 and age_secs < MAX_REPLACE_SECS:
+            # Price moved and order is young enough — replace at current price
             log.info(
-                "manage_open_orders: REPLACE %s  %dc  %.2f → %.2f",
-                ticker, resting, order_no_price, current_no,
+                "manage_open_orders: REPLACE %s  %dc  %.2f → %.2f  (age=%.0fs)",
+                ticker, resting, order_no_price, current_no, age_secs,
             )
             if not paper:
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
-                    _order_age.pop(order_id, None)
+                    _order_first_seen.pop(order_id, None)
                     place_order(
                         client        = client,
                         ticker        = ticker,
@@ -1317,6 +1328,20 @@ def manage_open_orders(
                     replaced += 1
                 except Exception as e:
                     log.warning("manage_open_orders: replace failed %s: %s", ticker, e)
+
+        elif abs(current_no - order_no_price) >= 0.01 and age_secs >= MAX_REPLACE_SECS:
+            # Price moved but order is too old to replace — cancel without replacing
+            log.info(
+                "manage_open_orders: CANCEL (old+moved) %s  %.2f → %.2f  age=%.0fs",
+                ticker, order_no_price, current_no, age_secs,
+            )
+            if not paper:
+                try:
+                    client.delete(f"portfolio/orders/{order_id}")
+                    cancelled += 1
+                    _order_first_seen.pop(order_id, None)
+                except Exception as e:
+                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
         # else: price unchanged and within age limit — leave it
 
     if replaced or cancelled:
@@ -1324,8 +1349,11 @@ def manage_open_orders(
                  replaced, cancelled)
 
 
-# Module-level order age tracker — persists across polls, resets on restart
-_order_age: dict[str, int] = {}
+# Order first-seen timestamps — persists across polls, resets on restart.
+# Keyed by order_id; value is the UTC timestamp when we first saw the order.
+# Using wall-clock time rather than poll count so restarts don't reset the clock.
+import time as _time
+_order_first_seen: dict[str, float] = {}
 
 
 def check_exits(

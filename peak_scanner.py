@@ -13,7 +13,7 @@ For each poll:
   2. Find any B bracket whose floor is within 0.5F below obs_high
      (temperature is right at the floor — about to break through)
   3. Check: local hour < city P90 peak hour (still before typical peak)
-  4. Check: No price >= NO_MIN_ENTRY (0.80)
+  4. Check: No price >= NO_MIN_ENTRY (0.85)
   5. Enter No
 
 Backtest (Apr 7-27, 2026 — 10 clean cities):
@@ -40,7 +40,7 @@ from market_utils import (
 
 log = get_logger(__name__)
 
-NO_MIN_ENTRY  = 0.80
+NO_MIN_ENTRY  = 0.85   # raised from 0.80 — live data showed [0.80,0.85) WR=33% (3 trades)
 NO_MAX_ENTRY  = 0.92
 MAX_CONTRACTS = 3
 OBS_FLOOR_GAP = 0.5   # obs_high must be within this of bracket floor

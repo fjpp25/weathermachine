@@ -3,11 +3,16 @@ dead_sweep.py
 -------------
 Dead-bracket sweep engine for HIGH temperature markets.
 
-Targets rank-5 brackets (farthest from the NWS forecast across all 6
-brackets in a market) that are priced at No >= 0.97 at the time of
-observation. Based on analysis of 1,464 dead-at-open rank-5 observations
-(Apr–May 2026), these have a 99.93% win rate — 2 genuine failures, both
-in the same city+month combination (Houston May, San Francisco May).
+Targets rank-4 and rank-5 brackets (two farthest from the NWS forecast
+across all 6 brackets in a market) that are priced at No >= 0.97 at the
+time of observation.
+
+Backtest (Apr–Jun 2026):
+  Rank-5: 451 obs, 99.33% WR (3 losses — all top-T in caution city/month)
+  Rank-4:  90 obs, 100.0% WR (0 losses across all cities and months)
+
+Rank-3 was explicitly tested and rejected: 96.83% WR with 4 losses —
+below the break-even threshold. Do not extend below rank-4.
 
 Relationship to tomorrow_scanner sweep
 ---------------------------------------
@@ -18,8 +23,8 @@ complementary with no overlap (SWEEP_CEILING = 0.97 in tomorrow_scanner).
 Signal conditions
 -----------------
   1. No price >= 0.97 (bracket is dead)
-  2. Bracket is rank-5 across the 6-bracket market (farthest from NWS
-     forecast by absolute distance)
+  2. Bracket is rank-4 or rank-5 across the 6-bracket market (two
+     farthest from NWS forecast by absolute distance)
   3. Passes the city + bracket-type safety filter
 
 Safety filter (from forecast error analysis)
@@ -55,13 +60,11 @@ Uses the 'tomorrow' budget (shared with tomorrow_scanner). Dead-sweep
 cost per entry is ~$4.90 (5c × $0.98), payout ~$0.09. Negligible
 impact on the tomorrow budget.
 
-Backtest summary (safe cities, rank-5, No >= 0.97)
----------------------------------------------------
-  Observations : 1,464
-  Win rate     : 99.93%  (2 genuine failures, both top-T in bad month)
-  Avg payout   : 1.68¢ per contract
-  EV           : +1.67¢ per contract
-  Break-even   : failure rate must stay below ~1.7% to remain +EV
+Backtest summary (safe cities, rank-4 + rank-5, No >= 0.97)
+------------------------------------------------------------
+  Rank-5: 451 obs, 99.33% WR, 3 losses (top-T in caution city/month)
+  Rank-4:  90 obs, 100.0% WR, 0 losses (all cities, all months)
+  Combined break-even: failure rate must stay below ~1.7% to remain +EV
 """
 
 from __future__ import annotations
@@ -279,8 +282,11 @@ def _check_city(
         if not ticker:
             continue
 
-        # Only rank-5 (farthest from forecast)
-        if rank_map.get(ticker) != 5:
+        # Only rank-4 and rank-5 (two farthest from forecast)
+        # Rank-4: 90 obs, 100% WR. Rank-5: 451 obs, 99.33% WR.
+        # Rank-3 rejected: 96.83% WR with 4 losses — below break-even.
+        bracket_rank = rank_map.get(ticker, -1)
+        if bracket_rank not in (4, 5):
             continue
 
         # Must be dead and within fillable range
@@ -313,8 +319,8 @@ def _check_city(
                    "top_T"    if bracket_code.startswith("T") else "B")
 
         log.info(
-            "DEAD_SWEEP  %s  %s  No=%.3f  rank=5  type=%s  fcst=%.1f°F  %dc",
-            city, ticker, no_p, btype, fcst_high, MAX_CONTRACTS,
+            "DEAD_SWEEP  %s  %s  No=%.3f  rank=%d  type=%s  fcst=%.1f°F  %dc",
+            city, ticker, no_p, bracket_rank, btype, fcst_high, MAX_CONTRACTS,
         )
 
         # Capital check — uses tomorrow budget
@@ -352,7 +358,7 @@ def _check_city(
                     "score":        5,
                     "score_detail": [
                         "dead_sweep",
-                        f"rank=5",
+                        f"rank={bracket_rank}",
                         f"type={btype}",
                         f"no_price={no_p:.3f}",
                         f"fcst={fcst_high:.1f}",
@@ -380,7 +386,7 @@ def _check_city(
 
 def log_config() -> None:
     log.info(
-        "dead_sweep: No=[%.3f, %.3f]  contracts=%d  safe=%s  caution=%s",
+        "dead_sweep: No=[%.3f, %.3f]  contracts=%d  ranks=[4,5]  safe=%s  caution=%s",
         NO_DEAD_FLOOR, NO_DEAD_CEILING, MAX_CONTRACTS,
         sorted(_SAFE_ALWAYS),
         {c: list(m) for c, m in _CAUTION_SKIP.items()},

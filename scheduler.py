@@ -42,6 +42,7 @@ import last_bracket
 import evening_convergence
 import nws_feed
 import kalshi_scanner
+import hourly_nyc_engine
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
@@ -135,6 +136,7 @@ def run_scheduler(
     peak_scanner.log_config()
     last_bracket.log_config()
     evening_convergence.log_config()
+    hourly_nyc_engine.log_config()
 
     poll_count = 0
 
@@ -228,13 +230,23 @@ def run_scheduler(
             )
             log.debug("[evening_convergence] done  (%.1fs)", time.monotonic() - t0)
 
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        def _run_hourly_nyc():
+            t0 = time.monotonic()
+            log.debug("[hourly_nyc] starting")
+            hourly_nyc_engine.run_scan(
+                client = client,
+                paper  = paper,
+            )
+            log.debug("[hourly_nyc] done  (%.1fs)", time.monotonic() - t0)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {
                 pool.submit(_run_pipeline):      "pipeline",
                 pool.submit(_run_scan):          "next_market_scan",
                 pool.submit(_run_peak):          "peak_scan",
                 pool.submit(_run_last_bracket):  "last_bracket",
                 pool.submit(_run_econv):         "evening_convergence",
+                pool.submit(_run_hourly_nyc):    "hourly_nyc",
             }
             for fut in as_completed(futures):
                 name = futures[fut]
