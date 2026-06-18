@@ -109,6 +109,8 @@ CONTRACT_TIERS = [
 # Backtest: max=0.85, 2/4c -> $14.26 total, 3 bad days, worst -$2.65
 NO_MAX_ENTRY_TOPDOWN   = 0.85
 MAX_RANK_FROM_TOP      = 2     # only enter the 3 highest B brackets
+TOPDOWN_MIN_UTC_HOUR   = 12    # all 5 losses were at 4-12h UTC (overnight NWS revision
+                                # that doesn't materialise); only trade daytime signals
 CONTRACT_TIERS_TOPDOWN = [
     (0.60, 0.70, 2),
     (0.71, 0.85, 4),
@@ -116,9 +118,11 @@ CONTRACT_TIERS_TOPDOWN = [
 
 # Afternoon tier parameters (retained)
 CONFIRM_THRESHOLD = 0.98
-AFTERNOON_START   = 14
-AFTERNOON_END     = 15
-AFTERNOON_MAX_YES = 0.15
+AFTERNOON_START       = 14
+AFTERNOON_END         = 15
+AFTERNOON_MAX_YES     = 0.15
+AFTERNOON_MAX_UTC     = 20   # don't fire after 20h UTC — western cities still rising
+                              # 21h UTC = 14h PDT (Phoenix/LV/Seattle/SF): losses dominate
 
 # ---------------------------------------------------------------------------
 # RATCHET parameters
@@ -457,6 +461,11 @@ def _afternoon_signal(city: str, brackets: list[dict],
                       local_hour: int) -> list[dict]:
     if not (AFTERNOON_START <= local_hour <= AFTERNOON_END):
         return []
+    # Don't fire after 20h UTC — at 21h UTC, Pacific/desert cities are mid-afternoon
+    # and temperatures haven't peaked; cascade fires correctly but bracket resolves Yes
+    utc_hour = datetime.now(timezone.utc).hour
+    if utc_hour > AFTERNOON_MAX_UTC:
+        return []
 
     sample_ticker = next((b["ticker"] for b in brackets if b.get("ticker")), "")
     market_date   = _market_date(sample_ticker)
@@ -561,6 +570,11 @@ def _topdown_signals(city: str, brackets: list[dict],
     and vice versa (enforced by shared _direction_locked dict).
     """
     if not brackets or len(brackets) < 3:
+        return []
+
+    # All 5 losses occurred at 4-12h UTC (overnight NWS revisions that don't materialise).
+    # Only fire during daytime hours when there is actual temperature observation support.
+    if datetime.now(timezone.utc).hour < TOPDOWN_MIN_UTC_HOUR:
         return []
 
     sample_ticker = next((b["ticker"] for b in brackets if b.get("ticker")), "")

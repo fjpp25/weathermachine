@@ -84,7 +84,8 @@ MONITOR_INTERVAL = 30
 # Trade log — persists signal metadata for post-hoc score analysis
 # ---------------------------------------------------------------------------
 
-TRADE_LOG_FILE = Path("data/trade_log.json")
+TRADE_LOG_FILE     = Path("data/trade_log.json")
+ENGINE_CAPITAL_FILE = Path("data/engine_capital_deployed.json")
 
 
 def _append_trade_log(entry: dict):
@@ -317,8 +318,8 @@ class EngineCapital:
             for engine, share in ENGINE_ALLOCATIONS.items()
         }
 
-        # Per-engine deployed this session (resets with each new instance)
-        self._deployed: dict[str, float] = {e: 0.0 for e in ENGINE_ALLOCATIONS}
+        # Per-engine deployed today — loaded from disk so restarts don't reset budget
+        self._deployed: dict[str, float] = self._load_deployed()
 
         log.debug(
             "EngineCapital: balance=$%.2f  "
@@ -362,11 +363,40 @@ class EngineCapital:
             )
         return ok
 
+    @staticmethod
+    def _load_deployed() -> dict[str, float]:
+        """Load today's deployed amounts from disk. Returns zeros if file absent or stale."""
+        from datetime import date as _date
+        try:
+            ENGINE_CAPITAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            if ENGINE_CAPITAL_FILE.exists():
+                data = json.loads(ENGINE_CAPITAL_FILE.read_text())
+                if data.get("date") == str(_date.today()):
+                    deployed = data.get("deployed", {})
+                    log.debug("EngineCapital: loaded deployed from disk: %s", deployed)
+                    return {e: float(deployed.get(e, 0.0)) for e in ENGINE_ALLOCATIONS}
+        except Exception as e:
+            log.warning("EngineCapital: could not load deployed from disk: %s", e)
+        return {e: 0.0 for e in ENGINE_ALLOCATIONS}
+
+    def _save_deployed(self) -> None:
+        """Persist today's deployed amounts to disk."""
+        from datetime import date as _date
+        try:
+            ENGINE_CAPITAL_FILE.parent.mkdir(parents=True, exist_ok=True)
+            ENGINE_CAPITAL_FILE.write_text(json.dumps({
+                "date":     str(_date.today()),
+                "deployed": self._deployed,
+            }))
+        except Exception as e:
+            log.warning("EngineCapital: could not save deployed to disk: %s", e)
+
     def record(self, engine: str, cost: float) -> None:
-        """Record capital deployed by an engine."""
+        """Record capital deployed by an engine and persist to disk."""
         if engine not in self._deployed:
             self._deployed[engine] = 0.0
         self._deployed[engine] = round(self._deployed[engine] + cost, 4)
+        self._save_deployed()
         log.debug(
             "EngineCapital: %s deployed $%.2f  "
             "(total_deployed=$%.2f  remaining=$%.2f)",
@@ -384,18 +414,52 @@ class EngineCapital:
         return "  ".join(parts)
 
 
-# Module-level instance — recreated each poll cycle by run_pipeline()
+# Module-level singleton — persists across polls, resets at midnight.
+# _deployed is preserved; only _balance and _budget are refreshed each poll.
 _engine_capital: EngineCapital | None = None
+_engine_capital_date: object = None   # tracks last reset date
 
 
 def get_engine_capital(client=None) -> EngineCapital:
     """
-    Return the current EngineCapital instance.
-    Creates a new one (fetching live balance) if none exists or client given.
+    Return the persistent EngineCapital singleton.
+
+    On each call:
+      - If the date has changed (midnight), reset deployed tracking
+      - If a client is provided, refresh balance and recompute budgets
+        WITHOUT resetting the deployed amounts (so spending accumulates)
+      - If no client and instance exists, return existing instance as-is
     """
-    global _engine_capital
-    if client is not None or _engine_capital is None:
+    from datetime import date as _date
+    global _engine_capital, _engine_capital_date
+
+    today = _date.today()
+
+    # Midnight reset — new day, fresh deployed counters
+    if _engine_capital_date != today:
+        _engine_capital = None
+        _engine_capital_date = today
+
+    if _engine_capital is None:
+        # First call of the day — create fresh instance
         _engine_capital = EngineCapital(client=client)
+        return _engine_capital
+
+    if client is not None:
+        # Refresh balance and budgets, but preserve deployed amounts
+        try:
+            new_balance = get_balance(client)
+        except Exception as e:
+            log.warning("EngineCapital: balance refresh failed: %s", e)
+            return _engine_capital
+
+        _engine_capital._balance = new_balance
+        _engine_capital._budget = {
+            engine: round(new_balance * share, 4)
+            for engine, share in ENGINE_ALLOCATIONS.items()
+        }
+        # Note: _deployed is NOT reset — spending accumulates across polls
+
     return _engine_capital
 
 def get_balance(client: KalshiClient) -> float:
@@ -850,7 +914,6 @@ from datetime import date as _date
 
 _day_open_balance: float      = 0.0
 _day_open_date:    _date|None = None
-_deployed_today:   float      = 0.0   # main engine    — persists across polls, resets midnight
 _deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
 _deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
 _deployed_tomorrow: float     = 0.0   # tomorrow scanner — persists across polls, resets midnight
@@ -868,9 +931,8 @@ ENGINE_ALLOCATIONS: dict[str, float] = {
     "hourly":   0.04,   # 4%  — NYC hourly temperature markets (new)
 }
 
-# Legacy constants retained for backward compat
+# Legacy constant retained for backward compat
 CASCADE_RESERVE:   float      = 30.00
-MAIN_BUDGET_PCT:   float      = 0.70
 
 
 def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
@@ -881,31 +943,29 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     All per-engine _deployed_* trackers reset at midnight so budgets are
     based on day-open balance — not disturbed by intraday winning settlements.
     """
-    global _day_open_balance, _day_open_date, _deployed_today, \
+    global _day_open_balance, _day_open_date, \
            _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
         _day_open_balance   = current_balance
         _day_open_date      = today
-        _deployed_today     = 0.0
         _deployed_cascade   = 0.0
         _deployed_peak      = 0.0
         _deployed_tomorrow  = 0.0
         _deployed_econv     = 0.0
         log.info(
             "day snapshot: $%.2f  "
-            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f)",
+            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f)",
             current_balance,
             round(current_balance * ENGINE_ALLOCATIONS["main"],     2),
             round(current_balance * ENGINE_ALLOCATIONS["cascade"],  2),
             round(current_balance * ENGINE_ALLOCATIONS["peak"],     2),
             round(current_balance * ENGINE_ALLOCATIONS["tomorrow"], 2),
             round(current_balance * ENGINE_ALLOCATIONS["econv"],    2),
+            round(current_balance * ENGINE_ALLOCATIONS["hourly"],   2),
         )
 
-    main_budget     = round(_day_open_balance * MAIN_BUDGET_PCT, 2)
-    main_deployable = max(0.0, round(main_budget - _deployed_today, 2))
-    return main_deployable, CASCADE_RESERVE
+    return 0.0, CASCADE_RESERVE   # main_deployable no longer used — EngineCapital governs
 
 
 def get_cascade_deployable() -> float:
@@ -1763,7 +1823,7 @@ def run_pipeline(
     nws_snapshot: dict = None,
 ):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
-    global _deployed_today, _deployed_cascade   # module-level trackers; += requires explicit global
+    global _deployed_cascade   # module-level tracker; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
     evaluations, nws_snapshot, kalshi_results = decision_engine.run(
         city_filter     = city_filter,
@@ -1790,14 +1850,22 @@ def run_pipeline(
 
     try:
         balance                      = get_balance(client)
-        deployable, cascade_reserve  = _update_day_snapshot(balance)
+        _, cascade_reserve           = _update_day_snapshot(balance)
         set_balance_cached(balance)
-        log.info("balance: $%.2f  |  deployable: $%.2f  |  cascade_reserve: $%.2f",
-                 balance, deployable, cascade_reserve)
+        cap = get_engine_capital(client)
+        log.info(
+            "balance: $%.2f  |  main=$%.2f  cascade=$%.2f  "
+            "tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f",
+            balance,
+            cap.remaining("main"),
+            cap.remaining("cascade"),
+            cap.remaining("tomorrow"),
+            cap.remaining("econv"),
+            cap.remaining("hourly"),
+        )
     except Exception as e:
         log.warning("balance fetch failed: %s — using $0 cap", e)
         balance          = 0.0
-        deployable       = 0.0
         cascade_reserve  = 0.0
 
     try:
@@ -1934,8 +2002,6 @@ def run_pipeline(
                 deployed += cost
                 if engine_key == "cascade":
                     _deployed_cascade += cost
-                else:
-                    _deployed_today += cost
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,
@@ -1969,7 +2035,6 @@ def run_pipeline(
             balance        = balance,
             deployable     = deployable,
         )
-        _deployed_today += topup_deployed   # keep budget tracker current across poll cycles
     except Exception as e:
         log.warning("top-up check error (non-fatal): %s", e)
 

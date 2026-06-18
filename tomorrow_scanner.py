@@ -206,8 +206,8 @@ def initialise(client, city_filter: str = None) -> None:
     covered: set[str] = set()   # cities whose state is already resolved
     try:
         import trader as _trader
-        live_positions = _trader.sync_from_kalshi(client) or {}
-        for pos in live_positions.values():
+        live_positions = _trader.sync_from_kalshi(client) or []
+        for pos in live_positions:
             ticker = pos.get("ticker", "")
             if "KXHIGH" not in ticker.upper():
                 continue

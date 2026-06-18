@@ -62,6 +62,11 @@ RESOLVED_THRESHOLD = 0.95    # above this → bracket is resolved
 MIN_LOCAL_HOUR     = 16      # only fire if 2-bracket phase first seen at >= this hour
 MAX_CONTRACTS      = 3       # contracts per order
 
+# Desert/extreme-heat cities where temperature continues rising into evening —
+# the "last bracket" pattern is unreliable because the actual last bracket keeps
+# shifting upward. Jun 8-17 data: Phoenix 1W/2L, Las Vegas 0W/1L.
+EXCLUDED_CITIES = {"Phoenix", "Las Vegas"}
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -169,6 +174,9 @@ def _check_city(
     Evaluate one city's brackets for a Last Bracket setup.
     Mutates _fired and _two_bracket_first_seen session state.
     """
+    if city in EXCLUDED_CITIES:
+        return
+
     local_hour = _local_hour(city)
     mkey       = _market_key(city, brackets)
     if not mkey:

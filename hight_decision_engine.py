@@ -87,7 +87,7 @@ NO_MIN_YES_PRICE    = 0.02     # skip if YES is basically zero (already dead)
 NO_MAX_YES_PRICE    = 0.25     # never enter NO if YES is above this
 NO_MIN_ENTRY_PRICE  = 0.85     # never pay less than this for a NO contract
                                # live data (May 21 – Jun 1): [0.75,0.85) WR=55% → raised from 0.75
-NO_MAX_ENTRY_PRICE  = 0.95     # never pay more than this for a NO contract
+NO_MAX_ENTRY_PRICE  = 0.94   # lowered from 0.95 — [0.94,0.95) WR=78% at balance $46 (Jun 8-17 data)     # never pay more than this for a NO contract
 MAX_NO_PER_CITY     = 2        # max NO positions to open per city per day
 NO_BAN_ABOVE_BRACKETS = False  # top T brackets ("above X°F") now allowed with gates
 
