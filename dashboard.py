@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import math
 import threading
 import time
 from collections import defaultdict, deque
@@ -133,32 +134,41 @@ def _entry_tier(ticker: str) -> str:
     return ""
 
 def _fmt_bracket(bracket: str, mtype: str = "HIGH",
-                 all_brackets: list = None) -> str:
+                 bmap_entry: dict = None) -> str:
     """
-    Format a bracket code for display.
+    Format a bracket code for display using floor_strike from the Kalshi API
+    when available (most accurate), falling back to ticker-code heuristics.
 
-    B62.5 → "63–64°"  (Kalshi floor-0.5 convention)
-    T61   → "≤60°"    (bottom T in HIGH market)
-    T69   → "≥69°"    (top T in HIGH market)
+    bmap_entry: one entry from _market_brackets_map, i.e.
+        {"codes": [all bracket codes in the market], "floors": {code: floor_strike}}
 
-    Kalshi's T bracket naming is inconsistent across markets — sometimes
-    the top T ticker equals last_B_hi, sometimes last_B_hi+1. The only
-    reliable source is the B bracket range:
+    For B brackets, floor_strike from the API is the actual lower temperature
+    boundary. Kalshi's B ticker naming is inconsistent across markets — the
+    ticker value can be either the floor or the midpoint of the range. Using
+    math.ceil(floor_strike) always gives the correct first whole-degree temp.
 
-      bottom T display = ≤(first_B_lo - 1)°
-      top T    display = ≥(last_B_hi  + 1)°
-
-    all_brackets: list of all bracket codes in the same market (e.g.
-    ["T61","B60.5","B62.5","B64.5","B66.5","T69"]) — required to compute
-    the correct display for T brackets.
+    For T brackets, the display is derived from the adjacent B brackets:
+      bottom T: ≤(first_B_lo - 1)°
+      top T:    ≥(last_B_hi  + 1)°
+    where B_lo values are themselves derived from floor_strike when available.
     """
     if not bracket:
         return bracket
     try:
+        codes  = (bmap_entry or {}).get("codes", [])
+        floors = (bmap_entry or {}).get("floors", {})
+
         if bracket.startswith("B"):
-            f = float(bracket[1:])
-            # Kalshi convention: B62.5 covers 62.5–64.4°F, displayed as 63–64°
-            lo = int(f + 0.5)   # 62.5 → 63
+            if bracket in floors:
+                # Use actual floor_strike from API — most reliable
+                lo = math.ceil(floors[bracket])
+            else:
+                # Fallback: Kalshi usually stores the range midpoint as ticker
+                # so ticker 66.5 → range [65.5, 67.5) → lo = ceil(65.5) = 66
+                # But some markets use floor as ticker (Boston B71.5 → lo=72)
+                # Without floor_strike we can't distinguish — use ticker+0.5 heuristic
+                f  = float(bracket[1:])
+                lo = int(f + 0.5)
             hi = lo + 1
             return f"{lo}–{hi}°"
 
@@ -167,38 +177,41 @@ def _fmt_bracket(bracket: str, mtype: str = "HIGH",
             if mtype == "LOW":
                 return f"<{v:.0f}°"
 
-            if all_brackets:
-                # Separate T and B brackets
-                t_vals = sorted([
-                    float(b[1:]) for b in all_brackets
-                    if b and b.startswith("T") and b[1:].replace(".","").isdigit()
-                ])
-                b_floors = [
-                    float(b[1:]) for b in all_brackets
-                    if b and b.startswith("B") and b[1:].replace(".","").isdigit()
-                ]
+            b_codes = [b for b in codes if b.startswith("B")
+                       and b[1:].replace(".","").isdigit()]
 
-                if b_floors and len(t_vals) >= 2:
-                    # first B bracket lo = int(min_floor + 0.5)
-                    # last  B bracket hi = int(max_floor + 0.5) + 1
-                    first_b_lo = int(min(b_floors) + 0.5)
-                    last_b_hi  = int(max(b_floors) + 0.5) + 1
+            if b_codes:
+                # Compute lo for each B bracket using floor_strike when available
+                b_los = []
+                for bc in b_codes:
+                    if bc in floors:
+                        b_los.append(math.ceil(floors[bc]))
+                    else:
+                        b_los.append(int(float(bc[1:]) + 0.5))
 
+                first_b_lo = min(b_los)
+                last_b_hi  = max(b_los) + 1
+
+                t_codes = [b for b in codes if b.startswith("T")
+                           and b[1:].replace(".","").isdigit()]
+                t_vals  = sorted([float(b[1:]) for b in t_codes])
+
+                if len(t_vals) >= 2:
                     if v == t_vals[0]:   # bottom T
                         return f"≤{first_b_lo - 1}°"
                     else:                # top T
                         return f"≥{last_b_hi + 1}°"
+                elif len(t_vals) == 1:
+                    # Only one T in context — use position relative to B range
+                    if v < first_b_lo:   # below B range = bottom T
+                        return f"≤{first_b_lo - 1}°"
+                    else:                # above B range = top T
+                        return f"≥{last_b_hi + 1}°"
 
-                elif len(t_vals) >= 2:
-                    # No B brackets available — fall back to v-based heuristic
-                    if v == t_vals[0]:
-                        return f"≤{v-1:.0f}°"
-                    else:
-                        return f"≥{v+1:.0f}°"
-
-            # Fallback: no context at all
+            # Final fallback — no bracket context at all
             return f"≥{v:.0f}°"
-    except ValueError:
+
+    except (ValueError, TypeError):
         pass
     return bracket
 
@@ -386,19 +399,66 @@ logging.getLogger().addHandler(_lb)
 # ---------------------------------------------------------------------------
 # API — /api/status
 # ---------------------------------------------------------------------------
-def _market_brackets_map(tickers: list[str]) -> dict[str, list[str]]:
+def _market_brackets_map(tickers: list[str]) -> dict[str, dict]:
     """
-    Build {market_key: [bracket_codes]} from a list of tickers.
+    Build {market_key: {"codes": [str], "floors": {code: float}}} by fetching
+    ALL brackets for each unique market from the Kalshi API.
+
+    Falls back to extracting bracket codes from the provided tickers only
+    if the API call fails, in which case "floors" will be empty.
+
     market_key = first two dash-separated parts, e.g. "KXHIGHTSEA-26JUN07"
     """
-    m: dict[str, list[str]] = {}
+    # Collect unique market keys from the provided tickers
+    keys: set[str] = set()
+    for tk in tickers:
+        parts = str(tk).split("-")
+        if len(parts) >= 3:
+            keys.add("-".join(parts[:2]))
+
+    result: dict[str, dict] = {}
+
+    try:
+        client = get_client()
+        for event_key in keys:
+            try:
+                resp = client.get("/markets", params={
+                    "event_ticker": event_key,
+                    "status":       "open",
+                    "limit":        25,
+                })
+                markets = resp.get("markets", [])
+                codes: list[str] = []
+                floors: dict[str, float] = {}
+                for m in markets:
+                    tk = m.get("ticker", "")
+                    br = tk.split("-")[-1] if "-" in tk else tk
+                    if br:
+                        codes.append(br)
+                        fs = m.get("floor_strike")
+                        if fs is not None:
+                            try:
+                                floors[br] = float(fs)
+                            except (TypeError, ValueError):
+                                pass
+                result[event_key] = {"codes": codes, "floors": floors}
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Fallback: populate from provided tickers for any keys not already fetched
     for tk in tickers:
         parts = str(tk).split("-")
         if len(parts) >= 3:
             key = "-".join(parts[:2])
             br  = parts[-1]
-            m.setdefault(key, []).append(br)
-    return m
+            if key not in result:
+                result.setdefault(key, {"codes": [], "floors": {}})
+                if br not in result[key]["codes"]:
+                    result[key]["codes"].append(br)
+
+    return result
 
 
 @app.route("/api/status")

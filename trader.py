@@ -631,6 +631,12 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
         if position_fp == 0:
             continue
 
+        # Skip settled/finalized markets — Kalshi keeps positions indefinitely
+        # in portfolio/positions even after resolution. Only show live markets.
+        market_status = (prices.get(ticker, {}).get("status") or "").lower()
+        if market_status and market_status not in ("active", "initialized"):
+            continue
+
         side      = "yes" if position_fp > 0 else "no"
         contracts = int(abs(position_fp))
 
