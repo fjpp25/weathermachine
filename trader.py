@@ -723,16 +723,27 @@ def place_order(
             "sell" to close an existing position (exit trades must use this)
     price:  limit price in dollars ($0.01-$0.99)
     """
-    price_cents = int(round(price_dollars * 100))
+    # ── Kalshi v2 order API ─────────────────────────────────────────────────
+    # Everything is quoted from the YES side:
+    #   bid = buy YES  (holding YES position)
+    #   ask = sell YES (holding NO position — economically equiv to buying NO)
+    # Price is YES price in dollars (string).
+    yes_price = price_dollars if side == "yes" else (1.0 - price_dollars)
+
+    if action == "buy":
+        v2_side = "bid" if side == "yes" else "ask"
+    else:  # sell / exit
+        v2_side = "ask" if side == "yes" else "bid"
 
     order = {
-        "ticker":          ticker,
-        "action":          action,
-        "side":            side,
-        "type":            "limit",
-        "count":           contracts,
-        "yes_price":       price_cents if side == "yes" else (100 - price_cents),
-        "client_order_id": f"kw-exit-{uuid.uuid4().hex[:8]}" if action == "sell" else f"kw-{uuid.uuid4().hex[:12]}",
+        "ticker":                    ticker,
+        "client_order_id":           f"kw-exit-{uuid.uuid4().hex[:8]}" if action == "sell"
+                                     else f"kw-{uuid.uuid4().hex[:12]}",
+        "side":                      v2_side,
+        "count":                     f"{contracts:.2f}",
+        "price":                     f"{yes_price:.4f}",
+        "time_in_force":             "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
     }
 
     if paper:
@@ -740,8 +751,12 @@ def place_order(
         return {"paper": True, "order": order}
 
     try:
-        result = client.post("portfolio/orders", order)
-        return result
+        raw = client.post("portfolio/events/orders", order)
+        # v2 response is flat {order_id, fill_count, remaining_count, ...}
+        # Wrap in {"order": ...} for backwards compatibility with callers
+        if "order_id" in raw and "order" not in raw:
+            return {"order": raw}
+        return raw
     except requests.exceptions.HTTPError as e:
         try:
             detail = e.response.json()
@@ -787,17 +802,17 @@ def test_order(client: KalshiClient):
 
     log.info("test step 1: placing YES limit @ $0.01...")
     order_body = {
-        "ticker":          ticker,
-        "action":          "buy",
-        "side":            "yes",
-        "type":            "limit",
-        "count":           1,
-        "yes_price":       1,
-        "client_order_id": f"kw-test-{uuid.uuid4().hex[:8]}",
+        "ticker":                    ticker,
+        "client_order_id":           f"kw-test-{uuid.uuid4().hex[:8]}",
+        "side":                      "bid",
+        "count":                     "1.00",
+        "price":                     "0.0100",
+        "time_in_force":             "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
     }
 
     try:
-        result   = client.post("portfolio/orders", order_body)
+        result   = client.post("portfolio/events/orders", order_body)
         order    = result.get("order", {})
         order_id = order.get("order_id") or order.get("id")
 
@@ -2041,7 +2056,6 @@ def run_pipeline(
             paper          = paper,
             live_positions = live_positions_post,
             balance        = balance,
-            deployable     = deployable,
         )
     except Exception as e:
         log.warning("top-up check error (non-fatal): %s", e)
