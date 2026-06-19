@@ -1304,7 +1304,8 @@ def manage_open_orders(
         o for o in orders
         if ("HIGH" in o.get("ticker", "").upper() or
             "LOWT" in o.get("ticker", "").upper())
-        and o.get("action") == "buy"
+        # v1: action=buy side=no  |  v2: action=sell side=yes (sell-YES = buy-NO)
+        # Filter by ticker only — all our temperature orders are NO positions
     ]
 
     if not temp_orders:
@@ -1357,11 +1358,18 @@ def manage_open_orders(
         age_secs = now - _order_first_seen[order_id]
 
         # ── Get order's current limit price ──────────────────────────────
-        raw_no = order.get("no_price")
-        if raw_no is not None:
-            order_no_price = float(raw_no) / 100 if float(raw_no) > 1 else float(raw_no)
+        # v2 API returns YES price as dollar string in "price" field
+        # v1 API returns no_price or yes_price (cents int or dollar float)
+        if order.get("price") is not None:
+            # v2: price = YES price in dollars (string)
+            order_no_price = round(1.0 - float(order["price"]), 4)
+        elif order.get("no_price") is not None:
+            raw_no = float(order["no_price"])
+            order_no_price = raw_no / 100 if raw_no > 1 else raw_no
         else:
-            order_no_price = 1.0 - float(order.get("yes_price", 0) or 0)
+            raw_yes = float(order.get("yes_price", 0) or 0)
+            yes_p   = raw_yes / 100 if raw_yes > 1 else raw_yes
+            order_no_price = round(1.0 - yes_p, 4)
 
         # ── Decide ────────────────────────────────────────────────────────
         if current_no < no_min or current_no >= no_max:
@@ -1403,7 +1411,7 @@ def manage_open_orders(
                     place_order(
                         client        = client,
                         ticker        = ticker,
-                        side          = side,
+                        side          = "no",   # always NO — all temp orders are NO positions
                         price_dollars = current_no,
                         contracts     = resting,
                         paper         = False,
