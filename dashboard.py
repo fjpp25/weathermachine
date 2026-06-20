@@ -780,15 +780,31 @@ def api_city(city: str):
 # ---------------------------------------------------------------------------
 @app.route("/api/log")
 def api_log():
+    n = min(int(request.args.get("n", 200)), 500)
+    # Try journalctl first — gives exact same output as the command line
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["journalctl", "-u", "weathermachine", f"-n{n}", "--no-pager",
+             "--output=short-iso"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.splitlines()
+            return jsonify({"lines": lines, "source": "journalctl"})
+    except Exception:
+        pass
+    # Fallback: log file or in-process buffer
     lp = os.environ.get("LOG_FILE") or _config.get("log_file")
     if lp:
         p = Path(lp)
         if p.exists():
             try:
-                lines = p.read_text(encoding="utf-8",errors="replace").splitlines()
-                return jsonify({"lines":lines[-250:],"source":str(p)})
-            except Exception: pass
-    return jsonify({"lines":_lb.tail(250),"source":"in-process"})
+                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                return jsonify({"lines": lines[-n:], "source": str(p)})
+            except Exception:
+                pass
+    return jsonify({"lines": _lb.tail(n), "source": "in-process"})
 
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1029,12 @@ td.center{text-align:center}
   <div class="refresh-bar">
     <button class="btn" onclick="loadLog()">↻ Refresh</button>
     <button class="btn" id="log-follow-btn" onclick="toggleFollow()" title="Auto-scroll to bottom">Follow</button>
+    <select id="log-lines" onchange="loadLog()" style="background:var(--s2);color:var(--pri);border:1px solid var(--s3);border-radius:4px;padding:4px 8px;font-size:12px;cursor:pointer">
+      <option value="100">100 lines</option>
+      <option value="200" selected>200 lines</option>
+      <option value="500">500 lines</option>
+    </select>
+    <span id="log-refresh-cd" style="font-size:11px;color:var(--sec);margin-left:8px"></span>
   </div>
   <pre id="log-out">Loading...</pre>
 </div>
@@ -1072,9 +1094,10 @@ function switchTab(id, btn) {
   document.querySelectorAll('.tb').forEach(b => b.classList.remove('on'));
   document.getElementById('tab-' + id).classList.add('on');
   btn.classList.add('on');
-  if (id === 'session') loadSession();
-  if (id === 'log')     loadLog();
-  if (id === 'perf')    loadPerf();
+  if (id === 'session') { stopLogRefresh(); loadSession(); }
+  if (id === 'log')     { loadLog(); startLogRefresh(); }
+  if (id === 'perf')    { stopLogRefresh(); loadPerf(); }
+  if (id === 'home')    { stopLogRefresh(); }
 }
 
 function switchSess(filt, btn) {
@@ -1223,22 +1246,45 @@ function renderSessTable(filt) {
 }
 
 // ── Log ────────────────────────────────────────────────────────────────────
+let _logRefreshInt = null;
+let _logRefreshSecs = 0;
+
 async function loadLog() {
   try {
-    const d = await fetch('/api/log').then(r => r.json());
+    const n = document.getElementById('log-lines')?.value || 200;
+    const d = await fetch(`/api/log?n=${n}`).then(r => r.json());
     const el = document.getElementById('log-out');
-    const lines = (d.lines || []).join('\n');
-    // Colour-code log lines
-    el.innerHTML = lines.split('\n').map(line => {
+    el.innerHTML = (d.lines || []).map(line => {
       let cls = 'log-info';
-      if (/WARNING|WARN/.test(line))  cls = 'log-warn';
-      if (/ERROR|FAIL/.test(line))    cls = 'log-err';
-      if (/★|SIGNAL|NEAR_CAP|GRAD/.test(line)) cls = 'log-sig';
-      if (/order|placed|BUY|SELL/.test(line))  cls = 'log-trade';
+      if (/WARNING|WARN/.test(line))                  cls = 'log-warn';
+      if (/ERROR|FAIL|order failed/.test(line))        cls = 'log-err';
+      if (/★|SIGNAL|NEAR_CAP|GRADIENT/.test(line))    cls = 'log-sig';
+      if (/order.*placed|SWEEP|DISMISSED/.test(line))  cls = 'log-trade';
+      if (/INFO.*placed|orders placed/.test(line))     cls = 'log-trade';
       return `<span class="${cls}">${escHtml(line)}</span>`;
     }).join('\n');
     if (_logFollow) el.scrollTop = el.scrollHeight;
   } catch(e) { console.warn('log', e); }
+}
+
+function startLogRefresh() {
+  stopLogRefresh();
+  _logRefreshSecs = 15;
+  _logRefreshInt = setInterval(() => {
+    _logRefreshSecs--;
+    const cd = document.getElementById('log-refresh-cd');
+    if (cd) cd.textContent = `auto-refresh in ${_logRefreshSecs}s`;
+    if (_logRefreshSecs <= 0) {
+      loadLog();
+      _logRefreshSecs = 15;
+    }
+  }, 1000);
+}
+
+function stopLogRefresh() {
+  if (_logRefreshInt) { clearInterval(_logRefreshInt); _logRefreshInt = null; }
+  const cd = document.getElementById('log-refresh-cd');
+  if (cd) cd.textContent = '';
 }
 
 function toggleFollow() {
