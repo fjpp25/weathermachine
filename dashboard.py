@@ -911,6 +911,8 @@ button,select,input{font-family:var(--f)}
   text-transform:uppercase;line-height:1}
 .chip-now{font-size:13px;font-weight:700;color:var(--ac);line-height:1.3}
 .chip-fcst{font-size:9px;color:#7a90b8;line-height:1}
+/* chip-now = observed high so far today (big teal)  */
+/* chip-fcst = forecast high (small blue, ▲ prefix)  */
 .chip-dot{width:5px;height:5px;border-radius:50%;background:var(--acd);
   display:inline-block;margin-right:3px;vertical-align:middle}
 
@@ -1284,18 +1286,19 @@ async function loadCities() {
       const top   = (py * scaleY + nudge[1]) + 'px';
 
       const ha  = d.high_active, la = d.lowt_active;
-      const now = d.now   != null ? Number(d.now).toFixed(0)   + '°' : '—';
-      const fcsH= d.fcst_hi != null ? Number(d.fcst_hi).toFixed(0) + '°' : '—';
-      const dot = (ha || la) ? '<span class="chip-dot"></span>' : '';
+      const obsH = d.obs_hi  != null ? Number(d.obs_hi).toFixed(0)  + '°' : '—';
+      const fcsH = d.fcst_hi != null ? Number(d.fcst_hi).toFixed(0) + '°' : '—';
+      const now  = d.now     != null ? Number(d.now).toFixed(0)     + '°' : '—';
+      const dot  = (ha || la) ? '<span class="chip-dot"></span>' : '';
 
       const chip = document.createElement('div');
       chip.className = 'map-chip'
         + (ha && la ? ' active-both' : ha ? ' active-hi' : la ? ' active-lo' : '');
       chip.style.cssText = `left:${left};top:${top}`;
-      chip.title = `${city}\nnow: ${now}  hi fcst: ${fcsH}`;
+      chip.title = `${city}\nnow: ${now}  obs hi: ${obsH}  fcst hi: ${fcsH}`;
       chip.innerHTML =
         `<div class="chip-name">${dot}${CITY_ABB[city]||city}</div>` +
-        `<div class="chip-now">${now}</div>` +
+        `<div class="chip-now">${obsH}</div>` +
         `<div class="chip-fcst">▲${fcsH}</div>`;
       chip.onclick = () => openCityModal(city);
       wrap.appendChild(chip);

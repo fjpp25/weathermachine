@@ -1266,29 +1266,22 @@ def manage_open_orders(
     client:          KalshiClient,
     kalshi_snapshot: dict = None,
     no_min:          float = 0.85,   # must match NO_MIN_ENTRY_PRICE in hight_decision_engine
-    no_max:          float = 0.95,
+    no_max:          float = 0.94,   # must match NO_MAX_ENTRY_PRICE in hight_decision_engine
     paper:           bool  = False,
 ) -> None:
     """
     Manage resting (unfilled) orders each poll cycle.
 
-    For each open limit order on a temperature market:
-      - If price moved >= 1¢ from order price: cancel + re-place at current price
-        BUT only if the order has been resting < MAX_ORDER_AGE_SECS — prevents
-        infinite replace chains where the price keeps drifting
-      - If order has been resting > MAX_ORDER_AGE_SECS: cancel, do not replace
-      - If price moved outside [no_min, no_max): cancel, do not replace
+    For each open temperature limit order:
+      1. Fetch current NO ask price for that bracket
+      2. If current NO ask is within [no_min, no_max): cancel + replace at
+         current ask price (chase the market, always stay at the best price)
+      3. If current NO ask is outside [no_min, no_max): cancel, do not replace
 
-    Age is tracked via wall-clock time (not poll count) so service restarts
-    don't reset the clock on long-resting orders.
-
-    This prevents:
-      1. Orders stuck at prices the market has moved past (never fill)
-      2. Accumulation — engine re-entering same bracket each poll
-      3. Infinite replace chains on drifting prices
+    Simple and aggressive — no age-based complexity. Every poll, resting orders
+    are either repriced to the live market or cancelled. This eliminates hung
+    orders caused by the market moving past our limit price.
     """
-    MAX_ORDER_AGE_SECS = 900   # 15 minutes — cancel if unfilled after this long
-    MAX_REPLACE_SECS   = 600   # 10 minutes — stop replacing after this long, just cancel
 
     try:
         resp = client.get("portfolio/orders", params={
@@ -1304,8 +1297,6 @@ def manage_open_orders(
         o for o in orders
         if ("HIGH" in o.get("ticker", "").upper() or
             "LOWT" in o.get("ticker", "").upper())
-        # v1: action=buy side=no  |  v2: action=sell side=yes (sell-YES = buy-NO)
-        # Filter by ticker only — all our temperature orders are NO positions
     ]
 
     if not temp_orders:
@@ -1319,14 +1310,20 @@ def manage_open_orders(
     for order in temp_orders:
         order_id = order.get("order_id", "")
         ticker   = order.get("ticker", "")
-        side     = order.get("side", "no").lower()
-        resting  = int(order.get("remaining_count") or
-                       order.get("resting_contracts_count") or 0)
 
+        # ── Contract count — handle both v1 and v2 field names ───────────
+        resting = (order.get("remaining_count")
+                   or order.get("resting_contracts_count")
+                   or order.get("count")
+                   or 0)
+        try:
+            resting = int(float(str(resting)))
+        except (TypeError, ValueError):
+            resting = 0
         if resting <= 0:
             continue
 
-        # ── Get current No price ──────────────────────────────────────────
+        # ── Current NO ask price ─────────────────────────────────────────
         current_no = None
         if kalshi_snapshot:
             for city_data in kalshi_snapshot.values():
@@ -1342,109 +1339,73 @@ def manage_open_orders(
             try:
                 mkt = client.get(f"markets/{ticker}")
                 from market_utils import no_price as _no_price
-                current_no = _no_price(mkt.get("market", {}))
+                current_no = _no_price(mkt.get("market", mkt))
             except Exception as e:
                 log.debug("manage_open_orders: price fetch failed for %s: %s",
                           ticker, e)
                 continue
 
-        if current_no is None or current_no <= 0:
+        if not current_no or current_no <= 0:
             continue
 
-        # ── Track order age (wall-clock) ─────────────────────────────────
-        now = _time.monotonic()
-        if order_id not in _order_first_seen:
-            _order_first_seen[order_id] = now
-        age_secs = now - _order_first_seen[order_id]
-
-        # ── Get order's current limit price ──────────────────────────────
-        # v2 API returns YES price as dollar string in "price" field
-        # v1 API returns no_price or yes_price (cents int or dollar float)
+        # ── Order's placed NO price (v2: YES price string → convert) ─────
         if order.get("price") is not None:
-            # v2: price = YES price in dollars (string)
             order_no_price = round(1.0 - float(order["price"]), 4)
         elif order.get("no_price") is not None:
-            raw_no = float(order["no_price"])
-            order_no_price = raw_no / 100 if raw_no > 1 else raw_no
+            raw = float(order["no_price"])
+            order_no_price = raw / 100 if raw > 1 else raw
         else:
-            raw_yes = float(order.get("yes_price", 0) or 0)
-            yes_p   = raw_yes / 100 if raw_yes > 1 else raw_yes
+            raw = float(order.get("yes_price", 0) or 0)
+            yes_p = raw / 100 if raw > 1 else raw
             order_no_price = round(1.0 - yes_p, 4)
 
-        # ── Decide ────────────────────────────────────────────────────────
-        if current_no < no_min or current_no >= no_max:
+        # ── Decision ─────────────────────────────────────────────────────
+        out_of_range = (current_no < no_min or current_no >= no_max)
+        price_moved  = abs(current_no - order_no_price) >= 0.01
+
+        if out_of_range:
+            # Current price outside our entry criteria → cancel, do not replace
             log.info(
-                "manage_open_orders: CANCEL %s  no=%.2f outside [%.2f, %.2f)",
+                "manage_open_orders: CANCEL %s  no=%.2f outside [%.2f,%.2f)",
                 ticker, current_no, no_min, no_max,
             )
             if not paper:
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
                     cancelled += 1
-                    _order_first_seen.pop(order_id, None)
                 except Exception as e:
-                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
+                    log.warning("manage_open_orders: cancel failed %s: %s",
+                                ticker, e)
 
-        elif age_secs > MAX_ORDER_AGE_SECS:
+        elif price_moved:
+            # Price has shifted → cancel and replace at current ask
             log.info(
-                "manage_open_orders: CANCEL (stale) %s  age=%.0fs  no=%.2f",
-                ticker, age_secs, current_no,
+                "manage_open_orders: REPRICE %s  %dc  %.2f→%.2f",
+                ticker, resting, order_no_price, current_no,
             )
             if not paper:
                 try:
                     client.delete(f"portfolio/orders/{order_id}")
-                    cancelled += 1
-                    _order_first_seen.pop(order_id, None)
-                except Exception as e:
-                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
-
-        elif abs(current_no - order_no_price) >= 0.01 and age_secs < MAX_REPLACE_SECS:
-            # Price moved and order is young enough — replace at current price
-            log.info(
-                "manage_open_orders: REPLACE %s  %dc  %.2f → %.2f  (age=%.0fs)",
-                ticker, resting, order_no_price, current_no, age_secs,
-            )
-            if not paper:
-                try:
-                    client.delete(f"portfolio/orders/{order_id}")
-                    _order_first_seen.pop(order_id, None)
                     place_order(
                         client        = client,
                         ticker        = ticker,
-                        side          = "no",   # always NO — all temp orders are NO positions
+                        side          = "no",
                         price_dollars = current_no,
                         contracts     = resting,
                         paper         = False,
                     )
                     replaced += 1
                 except Exception as e:
-                    log.warning("manage_open_orders: replace failed %s: %s", ticker, e)
-
-        elif abs(current_no - order_no_price) >= 0.01 and age_secs >= MAX_REPLACE_SECS:
-            # Price moved but order is too old to replace — cancel without replacing
-            log.info(
-                "manage_open_orders: CANCEL (old+moved) %s  %.2f → %.2f  age=%.0fs",
-                ticker, order_no_price, current_no, age_secs,
-            )
-            if not paper:
-                try:
-                    client.delete(f"portfolio/orders/{order_id}")
-                    cancelled += 1
-                    _order_first_seen.pop(order_id, None)
-                except Exception as e:
-                    log.warning("manage_open_orders: cancel failed %s: %s", ticker, e)
-        # else: price unchanged and within age limit — leave it
+                    log.warning("manage_open_orders: reprice failed %s: %s",
+                                ticker, e)
+        # else: price unchanged and within range — leave the order resting
 
     if replaced or cancelled:
-        log.info("manage_open_orders: %d replaced  %d cancelled",
+        log.info("manage_open_orders: %d repriced  %d cancelled",
                  replaced, cancelled)
 
 
-# Order first-seen timestamps — persists across polls, resets on restart.
-# Keyed by order_id; value is the UTC timestamp when we first saw the order.
-# Using wall-clock time rather than poll count so restarts don't reset the clock.
-import time as _time
-_order_first_seen: dict[str, float] = {}
+# ---------------------------------------------------------------------------
 
 
 def check_exits(
