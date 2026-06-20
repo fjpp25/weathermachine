@@ -819,6 +819,8 @@ _HTML = r"""<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -886,13 +888,31 @@ button,select,input{font-family:var(--f)}
   padding:12px 14px;cursor:pointer;transition:border-color .2s,background .2s}
 .cc:hover{border-color:var(--ter);background:var(--panel2)}
 .cc.ha{border-color:var(--acd)}.cc.la{border-color:#2a4a88}
-.cn{color:var(--sec);font-size:9px;letter-spacing:1.5px;text-transform:uppercase}
+.cn{color:#a8c4e0;font-size:12px;font-weight:600;letter-spacing:.4px;text-transform:uppercase}
 .ctime{color:var(--pri);font-size:11px;font-weight:500;margin:4px 0 2px}
 .cnow{color:var(--ac);font-size:12px;font-weight:600}
 .chi{color:var(--ac);font-size:11px}
-.clo{color:var(--sec);font-size:11px}
+.clo{color:#7a90b8;font-size:11px}
 .cwin{font-size:10px;margin-top:4px;color:var(--sec)}
 .cwin.ha{color:var(--ac)}.cwin.la{color:var(--blu)}
+/* ── Map styles ── */
+#map-wrap{position:relative;width:100%;margin-bottom:20px;user-select:none}
+#us-svg{width:100%;display:block;border-radius:8px}
+.map-state{fill:#161a24;stroke:#252d42;stroke-width:.5}
+.map-chip{position:absolute;transform:translate(-50%,-50%);cursor:pointer;
+  background:rgba(15,18,28,.88);border:1px solid #252d42;border-radius:6px;
+  padding:4px 6px;min-width:54px;text-align:center;
+  transition:border-color .15s,background .15s;backdrop-filter:blur(4px)}
+.map-chip:hover{border-color:var(--ac);background:rgba(22,26,38,.96);z-index:10}
+.map-chip.active-hi{border-color:var(--acd)}
+.map-chip.active-lo{border-color:#2a4a88}
+.map-chip.active-both{border-color:var(--ac)}
+.chip-name{font-size:9px;font-weight:700;letter-spacing:.8px;color:#a8c4e0;
+  text-transform:uppercase;line-height:1}
+.chip-now{font-size:13px;font-weight:700;color:var(--ac);line-height:1.3}
+.chip-fcst{font-size:9px;color:#7a90b8;line-height:1}
+.chip-dot{width:5px;height:5px;border-radius:50%;background:var(--acd);
+  display:inline-block;margin-right:3px;vertical-align:middle}
 
 /* ── Positions table ── */
 .tbl-wrap{overflow-x:auto;border:1px solid var(--bdr);border-radius:var(--r2);margin-bottom:20px}
@@ -1004,7 +1024,10 @@ td.center{text-align:center}
   <div class="sh">ENGINE BUDGETS</div>
   <div id="eng-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px;margin-bottom:16px"></div>
   <div class="sh">CITY STATUS</div>
-  <div id="cgrid"></div>
+  <div id="map-wrap">
+    <svg id="us-svg" viewBox="0 0 960 580"></svg>
+  </div>
+  <div id="cgrid" style="display:none"></div>
 </div>
 
 <!-- ── SESSION ── -->
@@ -1121,6 +1144,13 @@ function startCountdown() {
   }, 1000);
 }
 
+// Reposition map chips when the SVG container resizes
+const _mapObs = new ResizeObserver(() => loadCities());
+document.addEventListener('DOMContentLoaded', () => {
+  const svgEl = document.getElementById('us-svg');
+  if (svgEl) _mapObs.observe(svgEl);
+});
+
 function refreshAll() {
   setStatus('Refreshing...');
   Promise.all([loadStatus(), loadCities(), loadSession()]).then(() => {
@@ -1169,33 +1199,106 @@ async function loadStatus() {
   } catch(e) { console.warn('status', e); }
 }
 
+// ── City coordinates (Albers USA — lat/lon for D3 projection) ──────────────
+const CITY_LL = {
+  'New York':      [40.71,-74.01], 'Chicago':      [41.88,-87.63],
+  'Miami':         [25.77,-80.19], 'Austin':       [30.27,-97.74],
+  'Los Angeles':   [34.05,-118.24],'San Francisco': [37.77,-122.42],
+  'Denver':        [39.74,-104.98],'Philadelphia':  [39.95,-75.17],
+  'Atlanta':       [33.75,-84.39], 'Houston':       [29.76,-95.37],
+  'Phoenix':       [33.45,-112.07],'Las Vegas':     [36.17,-115.14],
+  'Dallas':        [32.78,-96.80], 'Boston':        [42.36,-71.06],
+  'Washington DC': [38.91,-77.04], 'Seattle':       [47.61,-122.33],
+  'Minneapolis':   [44.98,-93.27], 'Oklahoma City': [35.47,-97.52],
+  'New Orleans':   [29.95,-90.07], 'San Antonio':   [29.42,-98.49],
+};
+// Pixel nudges for crowded northeast and other overlapping cities
+const CITY_NUDGE = {
+  'Boston':        [-14,-14], 'New York':      [10, 6],
+  'Philadelphia':  [14, 10],  'Washington DC': [14,-4],
+  'New Orleans':   [-6, 10],  'San Antonio':   [-8, 8],
+  'Houston':       [8,  8],   'Dallas':        [6, -8],
+};
+// Short abbreviation for map chip
+const CITY_ABB = {
+  'New York':'NYC','Chicago':'CHI','Miami':'MIA','Austin':'AUS',
+  'Los Angeles':'LAX','San Francisco':'SFO','Denver':'DEN',
+  'Philadelphia':'PHL','Atlanta':'ATL','Houston':'HOU','Phoenix':'PHX',
+  'Las Vegas':'LAS','Dallas':'DAL','Boston':'BOS','Washington DC':'DCA',
+  'Seattle':'SEA','Minneapolis':'MSP','Oklahoma City':'OKC',
+  'New Orleans':'MSY','San Antonio':'SAT',
+};
+
+let _mapReady = false;
+let _mapProj  = null;
+
+async function initMap() {
+  if (_mapReady) return;
+  try {
+    const svg = d3.select('#us-svg');
+    // Albers USA projection scaled to viewBox 960×580
+    _mapProj = d3.geoAlbersUsa().scale(1280).translate([480,290]);
+    const path = d3.geoPath().projection(_mapProj);
+    const us = await d3.json(
+      'https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json');
+    svg.append('g').selectAll('path')
+      .data(topojson.feature(us, us.objects.states).features)
+      .join('path').attr('class','map-state').attr('d', path);
+    // Subtle border between states
+    svg.append('path')
+      .datum(topojson.mesh(us, us.objects.states, (a,b) => a !== b))
+      .attr('fill','none').attr('stroke','#1e2535')
+      .attr('stroke-width',.8).attr('d', path);
+    _mapReady = true;
+  } catch(e) { console.warn('map init', e); }
+}
+
 // ── Cities ─────────────────────────────────────────────────────────────────
 async function loadCities() {
   try {
+    await initMap();
     const cities = await fetch('/api/cities').then(r => r.json());
-    const grid = document.getElementById('cgrid');
-    grid.innerHTML = '';
+    const wrap = document.getElementById('map-wrap');
+    // Remove old chips
+    wrap.querySelectorAll('.map-chip').forEach(el => el.remove());
+
+    const svgEl  = document.getElementById('us-svg');
+    const svgW   = svgEl.viewBox.baseVal.width  || 960;
+    const svgH   = svgEl.viewBox.baseVal.height || 580;
+    const rect   = svgEl.getBoundingClientRect();
+    const scaleX = rect.width  / svgW;
+    const scaleY = rect.height / svgH;
+
     for (const d of cities) {
       const city = d.city;
-      const div = document.createElement('div');
-      const ha = d.high_active, la = d.lowt_active;
-      div.className = 'cc' + (ha ? ' ha' : '') + (la ? ' la' : '');
-      div.onclick = () => openCityModal(city);
-      const now  = d.now  != null ? Number(d.now).toFixed(0)  + '°' : '—';
-      const obsH = d.obs_hi  != null ? Number(d.obs_hi).toFixed(0)  + '°' : '--°';
-      const fcsH = d.fcst_hi != null ? Number(d.fcst_hi).toFixed(0) + '°' : '--°';
-      const obsL = d.obs_lo  != null ? Number(d.obs_lo).toFixed(0)  + '°' : '--°';
-      const fcsL = d.fcst_lo != null ? Number(d.fcst_lo).toFixed(0) + '°' : '--°';
-      const win  = d.window || 'between windows';
-      const winCls = ha && la ? 'ba' : ha ? 'ha' : la ? 'la' : '';
-      div.innerHTML = `
-        <div class="cn">${city}</div>
-        <div class="ctime">${d.local_time || '--:--'} ${d.tz_abbr || ''}</div>
-        <div class="cnow">now: ${now}</div>
-        <div class="chi">hi: ${obsH}&nbsp; fcst: ${fcsH}</div>
-        <div class="clo">lo: ${obsL}&nbsp; fcst: ${fcsL}</div>
-        <div class="cwin ${winCls}">${win}</div>`;
-      grid.appendChild(div);
+      const ll   = CITY_LL[city];
+      if (!ll || !_mapProj) continue;
+
+      const proj = _mapProj(ll.slice().reverse()); // D3 wants [lon,lat]
+      if (!proj) continue;
+      const [px, py] = proj;
+
+      // Apply nudge
+      const nudge = CITY_NUDGE[city] || [0,0];
+      const left  = (px * scaleX + nudge[0]) + 'px';
+      const top   = (py * scaleY + nudge[1]) + 'px';
+
+      const ha  = d.high_active, la = d.lowt_active;
+      const now = d.now   != null ? Number(d.now).toFixed(0)   + '°' : '—';
+      const fcsH= d.fcst_hi != null ? Number(d.fcst_hi).toFixed(0) + '°' : '—';
+      const dot = (ha || la) ? '<span class="chip-dot"></span>' : '';
+
+      const chip = document.createElement('div');
+      chip.className = 'map-chip'
+        + (ha && la ? ' active-both' : ha ? ' active-hi' : la ? ' active-lo' : '');
+      chip.style.cssText = `left:${left};top:${top}`;
+      chip.title = `${city}\nnow: ${now}  hi fcst: ${fcsH}`;
+      chip.innerHTML =
+        `<div class="chip-name">${dot}${CITY_ABB[city]||city}</div>` +
+        `<div class="chip-now">${now}</div>` +
+        `<div class="chip-fcst">▲${fcsH}</div>`;
+      chip.onclick = () => openCityModal(city);
+      wrap.appendChild(chip);
     }
   } catch(e) { console.warn('cities', e); }
 }
