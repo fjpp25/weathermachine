@@ -483,11 +483,10 @@ def scan_city(city: str, market_type: str = "high") -> dict:
 # ---------------------------------------------------------------------------
 
 def scan_all(city_filter: str = None, market_type: str = "high",
-             max_workers: int = 4) -> dict:
+             max_workers: int = 2) -> dict:
     """
     Scan all cities in parallel using ThreadPoolExecutor.
-    Each city's scan is independent so we can run them concurrently.
-    max_workers=8 balances throughput vs API politeness.
+    max_workers=2 with 1s stagger keeps us well under Kalshi rate limits.
     """
     cities = list(CITY_SERIES.keys())
     if city_filter:
@@ -510,7 +509,7 @@ def scan_all(city_filter: str = None, market_type: str = "high",
         futures = {}
         for city in cities:
             futures[executor.submit(_scan_and_log, city)] = city
-            time.sleep(0.5)   # stagger submissions to avoid 429s — raised from 0.3s
+            time.sleep(1.0)   # stagger submissions — 1s keeps us under Kalshi rate limits
         for future in as_completed(futures):
             try:
                 city, result = future.result(timeout=60)

@@ -31,6 +31,7 @@ import os
 import sys
 import math
 import threading
+import time as _time
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -85,6 +86,13 @@ os.environ["KALSHI_DEMO"] = "false" if _config.get("live_mode") else "true"
 
 _client      = None
 _client_lock = threading.Lock()
+
+# Bracket map cache — avoids hammering Kalshi API on every dashboard refresh
+# Cache TTL: 10 minutes (bracket structures rarely change intraday)
+_bmap_cache:      dict = {}
+_bmap_cache_ts:   float = 0.0
+_bmap_cache_lock: threading.Lock = threading.Lock()
+_BMAP_CACHE_TTL:  float = 600.0  # seconds
 
 def get_client():
     global _client
@@ -404,11 +412,14 @@ def _market_brackets_map(tickers: list[str]) -> dict[str, dict]:
     Build {market_key: {"codes": [str], "floors": {code: float}}} by fetching
     ALL brackets for each unique market from the Kalshi API.
 
-    Falls back to extracting bracket codes from the provided tickers only
-    if the API call fails, in which case "floors" will be empty.
+    Results are cached for 10 minutes to avoid contributing to rate limiting.
+    Falls back to extracting bracket codes from the provided tickers if the
+    API call fails, in which case "floors" will be empty.
 
     market_key = first two dash-separated parts, e.g. "KXHIGHTSEA-26JUN07"
     """
+    global _bmap_cache, _bmap_cache_ts
+
     # Collect unique market keys from the provided tickers
     keys: set[str] = set()
     for tk in tickers:
@@ -416,11 +427,26 @@ def _market_brackets_map(tickers: list[str]) -> dict[str, dict]:
         if len(parts) >= 3:
             keys.add("-".join(parts[:2]))
 
+    now = _time.monotonic()
+
+    with _bmap_cache_lock:
+        # Return cached result if fresh and covers all requested keys
+        if (now - _bmap_cache_ts < _BMAP_CACHE_TTL
+                and keys.issubset(_bmap_cache.keys())):
+            return {k: _bmap_cache[k] for k in keys if k in _bmap_cache}
+
+        # Fetch only the keys not already in cache (or if cache is stale)
+        if now - _bmap_cache_ts >= _BMAP_CACHE_TTL:
+            _bmap_cache = {}
+            _bmap_cache_ts = now
+
+        keys_to_fetch = keys - _bmap_cache.keys()
+
     result: dict[str, dict] = {}
 
     try:
         client = get_client()
-        for event_key in keys:
+        for event_key in keys_to_fetch:
             try:
                 resp = client.get("/markets", params={
                     "event_ticker": event_key,
@@ -458,7 +484,14 @@ def _market_brackets_map(tickers: list[str]) -> dict[str, dict]:
                 if br not in result[key]["codes"]:
                     result[key]["codes"].append(br)
 
-    return result
+    # Merge new results into cache
+    with _bmap_cache_lock:
+        _bmap_cache.update(result)
+
+    # Return combined result from cache + new fetches
+    with _bmap_cache_lock:
+        return {k: _bmap_cache.get(k, result.get(k, {"codes": [], "floors": {}}))
+                for k in keys}
 
 
 @app.route("/api/status")
