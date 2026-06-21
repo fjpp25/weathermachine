@@ -1083,19 +1083,18 @@ class CityDetailDialog(QDialog):
     def _load_stats(self):
         """Fetch settlements + fills for this city and compute stats."""
         try:
-            # Fetch all settlements (unbounded — coerce "" cursor to None to avoid
-            # premature loop exit if Kalshi returns an empty-string cursor)
+            # Fetch all settlements
             all_settlements = []
             cursor = None
-            while True:
+            for _ in range(10):
                 params = {"limit": 200, "settlement_status": "settled"}
                 if cursor:
                     params["cursor"] = cursor
                 data  = self._client.get("portfolio/settlements", params=params)
                 batch = data.get("settlements", [])
                 all_settlements.extend(batch)
-                cursor = data.get("cursor") or None  # coerce "" → None
-                if not cursor or not batch:
+                cursor = data.get("cursor")
+                if not cursor or len(batch) < 200:
                     break
 
             # Filter to this city's temperature markets
@@ -1113,20 +1112,19 @@ class CityDetailDialog(QDialog):
                 )
                 return
 
-            # Fetch fills for these tickers only (pass ticker filter to reduce
-            # page count; falls back gracefully if endpoint ignores the param)
+            # Fetch fills for these tickers
             tickers = list({s.get("ticker") for s in city_settlements})
             all_fills = []
             cursor = None
-            while True:
+            for _ in range(10):
                 params = {"limit": 200}
                 if cursor:
                     params["cursor"] = cursor
                 data  = self._client.get("portfolio/fills", params=params)
                 batch = data.get("fills", [])
                 all_fills.extend(batch)
-                cursor = data.get("cursor") or None  # coerce "" → None
-                if not cursor or not batch:
+                cursor = data.get("cursor")
+                if not cursor or len(batch) < 200:
                     break
 
             fills_by_ticker = {}
@@ -1944,8 +1942,10 @@ class PnLTab(QWidget):
         client = self._client
 
         def fetch():
-            # Fetch settlements (coerce "" cursor → None to prevent premature exit
-            # if Kalshi returns an empty-string cursor on the last page)
+            from collections import defaultdict
+            import requests as _req
+
+            # ── Settlements (full history; no cutoff on this endpoint) ────────
             all_settlements = []
             cursor = None
             while True:
@@ -1955,7 +1955,7 @@ class PnLTab(QWidget):
                 data   = client.get("portfolio/settlements", params=params)
                 batch  = data.get("settlements", [])
                 all_settlements.extend(batch)
-                cursor = data.get("cursor") or None  # coerce "" → None
+                cursor = data.get("cursor") or None   # coerce "" → None
                 if not cursor or not batch:
                     break
 
@@ -1966,9 +1966,14 @@ class PnLTab(QWidget):
             ]
             settled_tickers = {s["ticker"] for s in temp}
 
-            # Fetch fills for accurate entry prices + early exit detection.
-            # Fetches all fills (no ticker filter) then filters below — cursor
-            # coercion ensures we don't stop early on empty-string cursors.
+            # ── Live fills (post-cutoff only; needed for early-exit detection) ─
+            # Kalshi partitions fills into a live tier (/portfolio/fills, covers
+            # only recent fills after a rolling cutoff) and a historical tier
+            # (/historical/fills on external-api.kalshi.com).  We fetch both so
+            # that early-exit detection works across the full trade history.
+            # _populate no longer uses fills to compute cost/side for settled
+            # positions — it reads settlement fields directly — so fills are
+            # only needed here for entry-date refinement and early-exit detection.
             all_fills = []
             cursor = None
             while True:
@@ -1978,9 +1983,34 @@ class PnLTab(QWidget):
                 data  = client.get("portfolio/fills", params=params)
                 batch = data.get("fills", [])
                 all_fills.extend(batch)
-                cursor = data.get("cursor") or None  # coerce "" → None
+                cursor = data.get("cursor") or None   # coerce "" → None
                 if not cursor or not batch:
                     break
+
+            # ── Historical fills (pre-cutoff; different base URL) ─────────────
+            try:
+                HIST_BASE = "https://external-api.kalshi.com/trade-api/v2"
+                cursor = None
+                while True:
+                    params = {"limit": 200}
+                    if cursor:
+                        params["cursor"] = cursor
+                    path    = "/trade-api/v2/historical/fills"
+                    headers = client._headers("GET", path)
+                    resp    = _req.get(HIST_BASE + "/historical/fills",
+                                       headers=headers, params=params, timeout=15)
+                    resp.raise_for_status()
+                    hdata  = resp.json()
+                    hbatch = hdata.get("fills", [])
+                    all_fills.extend(hbatch)
+                    cursor = hdata.get("cursor") or None
+                    if not cursor or not hbatch:
+                        break
+            except Exception as _he:
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "historical/fills fetch failed (early-exit data may be incomplete): %s", _he
+                )
 
             # Filter fills to temperature markets only
             temp_fills = [
@@ -1990,7 +2020,6 @@ class PnLTab(QWidget):
             ]
 
             # Index fills by ticker
-            from collections import defaultdict
             fills_by_ticker = defaultdict(list)
             for f in temp_fills:
                 fills_by_ticker[f.get("ticker", "")].append(f)
@@ -2141,48 +2170,50 @@ class PnLTab(QWidget):
             except Exception:
                 settled_ts = raw_ts[:16].replace("T", " ") if raw_ts else ""
 
-            # Determine our side and cost purely from fills
-            # Settlement fields for cost are unreliable — they reflect both sides
-            if not fills_by_ticker or ticker not in fills_by_ticker:
-                continue   # skip if no fill data available
+            # ── Side and cost from settlement fields ──────────────────
+            # settlement.yes_total_cost_dollars / no_total_cost_dollars are
+            # per-side and available for ALL settled trades regardless of the
+            # fills historical cutoff.  Previous fills-based approach silently
+            # dropped any trade whose fills had rolled off the live endpoint.
+            yes_contracts = float(s.get("yes_count_fp") or 0)
+            no_contracts  = float(s.get("no_count_fp")  or 0)
+            yes_cost      = float(s.get("yes_total_cost_dollars") or 0)
+            no_cost       = float(s.get("no_total_cost_dollars")  or 0)
 
-            buy_fills = [f for f in fills_by_ticker[ticker]
-                         if f.get("action") == "buy"]
-            if not buy_fills:
-                continue
-
-            # Use entry date (earliest buy fill) so that settled wins and early
-            # exits from the same trading day land on the same row in the By Day
-            # table. Using settled_time caused wins to appear a day after their
-            # corresponding stops (settlement runs overnight after market close).
-            entry_date = sorted(buy_fills,
-                                key=lambda f: f.get("created_time", ""))[0].get(
-                                    "created_time", "")[:10]
-
-            # Our side = what we bought
-            sides = [f.get("side") for f in buy_fills]
-            our_side = max(set(sides), key=sides.count)
-
-            our_fills = [f for f in buy_fills if f.get("side") == our_side]
-            contracts = int(sum(float(f.get("count_fp") or 0) for f in our_fills))
-
-            cost = round(sum(
-                (float(f.get("yes_price_dollars") or 0) if our_side == "yes"
-                 else (1.0 - float(f.get("yes_price_dollars") or 0)))
-                * float(f.get("count_fp") or 0)
-                for f in our_fills
-            ), 4)
+            if yes_contracts > 0 and no_contracts == 0:
+                our_side  = "yes"
+                contracts = int(yes_contracts)
+                cost      = round(yes_cost, 4)
+            elif no_contracts > 0 and yes_contracts == 0:
+                our_side  = "no"
+                contracts = int(no_contracts)
+                cost      = round(no_cost, 4)
+            elif yes_contracts > 0 and no_contracts > 0:
+                # Both sides non-zero — take the larger (should be rare)
+                if yes_contracts >= no_contracts:
+                    our_side, contracts, cost = "yes", int(yes_contracts), round(yes_cost, 4)
+                else:
+                    our_side, contracts, cost = "no",  int(no_contracts),  round(no_cost, 4)
+            else:
+                continue   # no position data at all
 
             if contracts == 0 or cost == 0:
                 continue
 
-            won    = (result == our_side)
+            won = (result == our_side)
 
-            # Payout: if we won, we receive $1.00 per contract minus fee
-            # revenue from API is unreliable (sometimes 0 even for wins)
+            # ── Entry date: prefer earliest buy fill, fall back to settled_time ─
+            entry_date = raw_ts[:10]   # settled_time fallback
+            if fills_by_ticker and ticker in fills_by_ticker:
+                buy_fills = [f for f in fills_by_ticker[ticker]
+                             if f.get("action") == "buy"]
+                if buy_fills:
+                    entry_date = sorted(buy_fills,
+                                        key=lambda f: f.get("created_time", ""))[0].get(
+                                            "created_time", "")[:10]
+
             if won:
-                payout  = contracts * 1.0
-                net_pnl = round(payout - cost - fee, 4)
+                net_pnl = round(contracts * 1.0 - cost - fee, 4)
             else:
                 net_pnl = round(-cost - fee, 4)
 
