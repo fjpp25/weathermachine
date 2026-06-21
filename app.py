@@ -1083,18 +1083,19 @@ class CityDetailDialog(QDialog):
     def _load_stats(self):
         """Fetch settlements + fills for this city and compute stats."""
         try:
-            # Fetch all settlements
+            # Fetch all settlements (unbounded — coerce "" cursor to None to avoid
+            # premature loop exit if Kalshi returns an empty-string cursor)
             all_settlements = []
             cursor = None
-            for _ in range(10):
+            while True:
                 params = {"limit": 200, "settlement_status": "settled"}
                 if cursor:
                     params["cursor"] = cursor
                 data  = self._client.get("portfolio/settlements", params=params)
                 batch = data.get("settlements", [])
                 all_settlements.extend(batch)
-                cursor = data.get("cursor")
-                if not cursor or len(batch) < 200:
+                cursor = data.get("cursor") or None  # coerce "" → None
+                if not cursor or not batch:
                     break
 
             # Filter to this city's temperature markets
@@ -1112,19 +1113,20 @@ class CityDetailDialog(QDialog):
                 )
                 return
 
-            # Fetch fills for these tickers
+            # Fetch fills for these tickers only (pass ticker filter to reduce
+            # page count; falls back gracefully if endpoint ignores the param)
             tickers = list({s.get("ticker") for s in city_settlements})
             all_fills = []
             cursor = None
-            for _ in range(10):
+            while True:
                 params = {"limit": 200}
                 if cursor:
                     params["cursor"] = cursor
                 data  = self._client.get("portfolio/fills", params=params)
                 batch = data.get("fills", [])
                 all_fills.extend(batch)
-                cursor = data.get("cursor")
-                if not cursor or len(batch) < 200:
+                cursor = data.get("cursor") or None  # coerce "" → None
+                if not cursor or not batch:
                     break
 
             fills_by_ticker = {}
@@ -1942,7 +1944,8 @@ class PnLTab(QWidget):
         client = self._client
 
         def fetch():
-            # Fetch settlements
+            # Fetch settlements (coerce "" cursor → None to prevent premature exit
+            # if Kalshi returns an empty-string cursor on the last page)
             all_settlements = []
             cursor = None
             while True:
@@ -1952,7 +1955,7 @@ class PnLTab(QWidget):
                 data   = client.get("portfolio/settlements", params=params)
                 batch  = data.get("settlements", [])
                 all_settlements.extend(batch)
-                cursor = data.get("cursor")
+                cursor = data.get("cursor") or None  # coerce "" → None
                 if not cursor or not batch:
                     break
 
@@ -1963,7 +1966,9 @@ class PnLTab(QWidget):
             ]
             settled_tickers = {s["ticker"] for s in temp}
 
-            # Fetch fills for accurate entry prices + early exit detection
+            # Fetch fills for accurate entry prices + early exit detection.
+            # Fetches all fills (no ticker filter) then filters below — cursor
+            # coercion ensures we don't stop early on empty-string cursors.
             all_fills = []
             cursor = None
             while True:
@@ -1973,7 +1978,7 @@ class PnLTab(QWidget):
                 data  = client.get("portfolio/fills", params=params)
                 batch = data.get("fills", [])
                 all_fills.extend(batch)
-                cursor = data.get("cursor")
+                cursor = data.get("cursor") or None  # coerce "" → None
                 if not cursor or not batch:
                     break
 
