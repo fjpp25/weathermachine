@@ -343,6 +343,10 @@ def _fetch_settlements() -> tuple:
         temp = [s for s in temp if s["ticker"] not in etickers]
 
         # enrich settled
+        # Side and cost come from settlement fields (yes/no_count_fp,
+        # yes/no_total_cost_dollars) — available for ALL trades regardless of
+        # Kalshi's fills historical cutoff. Fills are used only to refine
+        # entry_date; settled_time[:10] is the fallback.
         enriched = []
         for s in temp:
             tk  = s.get("ticker",""); res = s.get("market_result","").lower()
@@ -352,18 +356,30 @@ def _fetch_settlements() -> tuple:
                 dt = datetime.fromisoformat(raw.replace("Z","+00:00"))
                 sts = dt.astimezone(ZoneInfo("Europe/Lisbon")).strftime("%Y-%m-%d %H:%M")
             except Exception: sts = raw[:16].replace("T"," ") if raw else ""
-            if tk not in fbt: continue
-            bfs = [f for f in fbt[tk] if f.get("action") == "buy"]
-            if not bfs: continue
-            edate = sorted(bfs, key=lambda f: f.get("created_time",""))[0].get("created_time","")[:10]
-            sides = [f.get("side") for f in bfs]; our = max(set(sides), key=sides.count)
-            of = [f for f in bfs if f.get("side") == our]
-            nc = int(sum(float(f.get("count_fp") or 0) for f in of))
-            cost = round(sum(
-                (float(f.get("yes_price_dollars") or 0) if our=="yes" else
-                 1-float(f.get("yes_price_dollars") or 0))
-                * float(f.get("count_fp") or 0) for f in of), 4)
+
+            yes_c    = float(s.get("yes_count_fp") or 0)
+            no_c     = float(s.get("no_count_fp")  or 0)
+            yes_cost = float(s.get("yes_total_cost_dollars") or 0)
+            no_cost  = float(s.get("no_total_cost_dollars")  or 0)
+
+            if yes_c > 0 and no_c == 0:
+                our = "yes"; nc = int(yes_c); cost = round(yes_cost, 4)
+            elif no_c > 0 and yes_c == 0:
+                our = "no";  nc = int(no_c);  cost = round(no_cost, 4)
+            elif yes_c > 0 and no_c > 0:
+                if yes_c >= no_c: our = "yes"; nc = int(yes_c); cost = round(yes_cost, 4)
+                else:             our = "no";  nc = int(no_c);  cost = round(no_cost, 4)
+            else:
+                continue  # no position data (e.g. cancelled before fill)
+
             if nc == 0 or cost == 0: continue
+
+            edate = raw[:10]  # fallback to settled_time date
+            if tk in fbt:
+                bfs = [f for f in fbt[tk] if f.get("action") == "buy"]
+                if bfs:
+                    edate = sorted(bfs, key=lambda f: f.get("created_time",""))[0].get("created_time","")[:10]
+
             won = (res == our)
             pnl = round(nc - cost - fee, 4) if won else round(-cost - fee, 4)
             enriched.append({"ticker":tk,"date":edate,"settled_ts":sts,"side":our.upper(),
