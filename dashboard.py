@@ -39,7 +39,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 try:
-    from flask import Flask, jsonify, render_template_string
+    from flask import Flask, jsonify, render_template_string, request
 except ImportError:
     raise SystemExit("Flask required: pip install flask")
 
