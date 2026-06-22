@@ -216,6 +216,11 @@ def initialise(client, city_filter: str = None) -> None:
             if len(parts) < 3:
                 continue
             mdate = parts[1]
+            # Restore _sweep_entered so we never re-enter a bracket already held.
+            # This is critical after a service restart: _sweep_entered resets to
+            # empty in memory, so without this guard the scanner would attempt to
+            # place duplicate sweep orders every poll until budget runs out.
+            _sweep_entered.add(ticker)
             # Match ticker code back to a city
             for city, meta in cities.items():
                 series = _high_series(meta)

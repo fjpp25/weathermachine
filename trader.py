@@ -673,8 +673,12 @@ def sync_from_kalshi(client: KalshiClient) -> list[dict]:
                 avg_cost = round(total_cost / total_contracts, 4)
 
         if avg_cost == 0 and contracts > 0:
-            total_traded = float(pos.get("total_traded_dollars") or 0)
-            avg_cost = round(total_traded / contracts, 4)
+            # market_exposure_dollars = actual filled cost (what we paid).
+            # total_traded_dollars = total order volume including cancelled/repriced
+            # orders that never filled — do NOT use it for avg_cost.
+            exposure = float(pos.get("market_exposure_dollars") or 0)
+            if exposure > 0:
+                avg_cost = round(exposure / contracts, 4)
 
         # Current price and unrealised PnL
         p    = prices.get(ticker, {})
