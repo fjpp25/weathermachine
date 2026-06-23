@@ -403,6 +403,112 @@ get_balance    = lambda: cached("balance",      60,  _fetch_balance)
 get_settlements= lambda: cached("settlements", 300,  _fetch_settlements)
 
 # ---------------------------------------------------------------------------
+# Pending settlement fetcher
+# ---------------------------------------------------------------------------
+def _fetch_pending() -> list:
+    c = get_client()
+    if not c: return []
+    try:
+        import requests as _req
+        raw = c.get("portfolio/positions", params={"count_filter": "position"})
+        all_pos = raw.get("market_positions", [])
+        candidates = [
+            p for p in all_pos
+            if float(p.get("position_fp") or 0) != 0
+            and p.get("ticker","").startswith("KX")
+            and ("HIGH" in p.get("ticker","") or "LOWT" in p.get("ticker",""))
+            and "TEMPNYCH" not in p.get("ticker","")
+        ]
+        if not candidates:
+            return []
+        tickers = [p["ticker"] for p in candidates]
+        try:
+            resp = _req.get(
+                "https://api.elections.kalshi.com/trade-api/v2/markets",
+                params={"tickers": ",".join(tickers)},
+                timeout=15,
+            ).json()
+            market_info = {m["ticker"]: m for m in resp.get("markets", [])}
+        except Exception as e:
+            log.warning("pending: batch price fetch failed: %s", e)
+            market_info = {}
+        pending_tickers = set()
+        expiry_by_ticker = {}
+        for tk, m in market_info.items():
+            status = (m.get("status") or "").lower()
+            result = (m.get("result") or "").strip()
+            if status == "closed" and result == "":
+                pending_tickers.add(tk)
+                expiry_by_ticker[tk] = m.get("expected_expiration_time","")
+        pending_pos = [p for p in candidates if p["ticker"] in pending_tickers]
+        if not pending_pos:
+            return []
+        fills_by_ticker: dict = {}
+        try:
+            resp = c.get("portfolio/fills", params={"limit": 200})
+            for f in resp.get("fills", []):
+                t = f.get("ticker","")
+                if t in pending_tickers:
+                    fills_by_ticker.setdefault(t, []).append(f)
+        except Exception as e:
+            log.warning("pending: fills fetch failed: %s", e)
+        enriched = []
+        for pos in pending_pos:
+            ticker      = pos["ticker"]
+            position_fp = float(pos.get("position_fp") or 0)
+            side        = "no" if position_fp < 0 else "yes"
+            contracts   = int(abs(position_fp))
+            avg_cost    = 0.0
+            buy_fills   = [
+                f for f in fills_by_ticker.get(ticker, [])
+                if f.get("action") == "buy" and f.get("side") == side
+            ]
+            if buy_fills:
+                if side == "yes":
+                    total_cost = sum(
+                        float(f.get("yes_price_dollars") or 0) *
+                        float(f.get("count_fp") or 0) for f in buy_fills
+                    )
+                else:
+                    total_cost = sum(
+                        (1.0 - float(f.get("yes_price_dollars") or 0)) *
+                        float(f.get("count_fp") or 0) for f in buy_fills
+                    )
+                total_c = sum(float(f.get("count_fp") or 0) for f in buy_fills)
+                if total_c > 0:
+                    avg_cost = round(total_cost / total_c, 4)
+            if avg_cost == 0 and contracts > 0:
+                exposure = float(pos.get("market_exposure_dollars") or 0)
+                if exposure > 0:
+                    avg_cost = round(exposure / contracts, 4)
+            raw_exp = expiry_by_ticker.get(ticker, "")
+            try:
+                dt_exp  = datetime.fromisoformat(raw_exp.replace("Z","+00:00"))
+                exp_str = dt_exp.astimezone(ZoneInfo("Europe/Lisbon")).strftime("%H:%M %Z")
+            except Exception:
+                exp_str = raw_exp[:16] if raw_exp else "unknown"
+            br = ticker.split("-")[-1] if "-" in ticker else ticker
+            mt = "HIGH" if "HIGH" in ticker else "LOW"
+            enriched.append({
+                "ticker":         ticker,
+                "market":         _city_from_ticker(ticker) or ticker,
+                "city":           _city_from_ticker(ticker, bare=True) or ticker,
+                "market_type":    mt,
+                "bracket":        _fmt_bracket(br, mt),
+                "side":           side.upper(),
+                "contracts":      contracts,
+                "avg_cost":       avg_cost,
+                "cost_total":     round(avg_cost * contracts, 2),
+                "est_settlement": exp_str,
+            })
+        return enriched
+    except Exception as e:
+        log.error("pending: fetch failed: %s", e, exc_info=True)
+        return []
+
+get_pending = lambda: cached("pending", 300, _fetch_pending)
+
+# ---------------------------------------------------------------------------
 # In-process log buffer
 # ---------------------------------------------------------------------------
 class _LogBuf(logging.Handler):
@@ -527,13 +633,17 @@ def api_status():
             available += rem
     except Exception:
         available = 0.0
+    pending     = get_pending()
+    pend_cost   = round(sum(p.get("cost_total",0) for p in pending), 2)
     return jsonify({
-        "balance":    bal,
-        "available":  round(available, 2),
-        "portfolio":  round(bal+cur,2),  "unrealised": round(unr,2),
-        "mode":       "LIVE" if os.environ.get("KALSHI_DEMO","true")=="false" else "DEMO",
-        "open":       len(pos),
-        "engines":    engines,
+        "balance":      bal,
+        "available":    round(available, 2),
+        "portfolio":    round(bal+cur,2),  "unrealised": round(unr,2),
+        "mode":         "LIVE" if os.environ.get("KALSHI_DEMO","true")=="false" else "DEMO",
+        "open":         len(pos),
+        "pending":      len(pending),
+        "pending_cost": pend_cost,
+        "engines":      engines,
     })
 
 # ---------------------------------------------------------------------------
@@ -824,6 +934,13 @@ def api_log():
 
 
 # ---------------------------------------------------------------------------
+# API — /api/pending
+# ---------------------------------------------------------------------------
+@app.route("/api/pending")
+def api_pending():
+    return jsonify(get_pending())
+
+# ---------------------------------------------------------------------------
 # HTML template
 # ---------------------------------------------------------------------------
 _HTML = r"""<!DOCTYPE html>
@@ -1024,6 +1141,7 @@ td.center{text-align:center}
   <div class="bal-item"><div class="bal-k">Portfolio</div><div class="bal-v" id="b-prt">—</div></div>
   <div class="bal-item"><div class="bal-k">Unrealised</div><div class="bal-v" id="b-unr">—</div></div>
   <div class="bal-item"><div class="bal-k">Open</div><div class="bal-v" id="b-open">—</div></div>
+  <div class="bal-item" id="b-pending-wrap" style="display:none"><div class="bal-k">Pending</div><div class="bal-v" id="b-pending" style="color:var(--yel)">—</div></div>
 </div>
 
 <!-- Tab bar -->
@@ -1063,6 +1181,10 @@ td.center{text-align:center}
   <div class="sp on" id="sp-all"></div>
   <div class="sp" id="sp-high"></div>
   <div class="sp" id="sp-low"></div>
+  <div id="pending-section" style="display:none;margin-top:24px">
+    <div class="sh" style="color:var(--yel);border-color:var(--yel2)">⏳ PENDING SETTLEMENT</div>
+    <div id="pending-table"></div>
+  </div>
 </div>
 
 <!-- ── LOG ── -->
@@ -1211,6 +1333,17 @@ async function loadStatus() {
     const uEl = document.getElementById('b-unr');
     uEl.textContent = (unr >= 0 ? '+' : '') + fmt$(unr);
     uEl.className   = 'bal-v ' + clsPnl(unr);
+    // Pending settlement balance bar item — only visible when there are pending positions
+    const pendWrap = document.getElementById('b-pending-wrap');
+    if (pendWrap) {
+      if (d.pending > 0) {
+        pendWrap.style.display = '';
+        document.getElementById('b-pending').textContent =
+          d.pending + ' pos · ' + fmt$(d.pending_cost);
+      } else {
+        pendWrap.style.display = 'none';
+      }
+    }
     const mb = document.getElementById('mode-badge');
     mb.textContent  = d.mode;
     mb.className    = 'mode-badge' + (d.mode === 'LIVE' ? ' live' : '');
@@ -1332,6 +1465,43 @@ async function loadSession() {
       `${d.open} open  |  unrealised ${unr >= 0 ? '+' : ''}${fmt$(unr)}`;
     renderSessTable(_sessFilt);
   } catch(e) { console.warn('session', e); }
+  loadPending();
+}
+
+async function loadPending() {
+  try {
+    const rows = await fetch('/api/pending').then(r => r.json());
+    const sec  = document.getElementById('pending-section');
+    const tbl  = document.getElementById('pending-table');
+    if (!sec || !tbl) return;
+    if (!rows.length) { sec.style.display = 'none'; return; }
+    sec.style.display = '';
+    const totalCost = rows.reduce((s, r) => s + (r.cost_total || 0), 0);
+    let html = `<div class="tbl-wrap"><table><thead><tr>
+      <th>Market</th><th>Bracket</th><th>Side</th><th>Qty</th>
+      <th>Entry</th><th>At Risk</th><th>Est. Settlement</th>
+    </tr></thead><tbody>`;
+    for (const r of rows) {
+      html += `<tr style="color:var(--sec)">
+        <td>${r.market || r.ticker}</td>
+        <td>${r.bracket || '—'}</td>
+        <td class="center"><span class="${r.side==='NO'?'side-no':'side-yes'}">${r.side}</span></td>
+        <td class="center">${r.contracts}</td>
+        <td>${fmt$(r.avg_cost)}</td>
+        <td style="color:var(--yel)">${fmt$(r.cost_total)}</td>
+        <td style="color:var(--sec)">${r.est_settlement}</td>
+      </tr>`;
+    }
+    // Total row
+    html += `<tr class="total-row">
+      <td colspan="4"></td>
+      <td></td>
+      <td style="color:var(--yel);font-weight:600">${fmt$(totalCost)}</td>
+      <td></td>
+    </tr>`;
+    html += '</tbody></table></div>';
+    tbl.innerHTML = html;
+  } catch(e) { console.warn('pending', e); }
 }
 
 function renderSessTable(filt) {
