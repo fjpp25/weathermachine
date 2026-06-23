@@ -602,7 +602,7 @@ def _fetch_hourly_settlements() -> list:
             # Extract settlement hour from ticker: KXTEMPNYCH-26JUN2214 -> 14
             mkt_hour = None
             try:
-                mkt_hour = int(tk.split("-")[-1][-2:])
+                parts = tk.split("-"); mkt_hour = int(parts[1][-2:]) if len(parts) >= 2 else None
             except Exception:
                 pass
 
@@ -1112,7 +1112,8 @@ def api_hourly():
                 try: dist_f = float(item.split("=")[1].rstrip("°F"))
                 except Exception: pass
         mkt_hour = None
-        try: mkt_hour = int(tk.split("-")[-1][-2:])
+        try:
+            _p = tk.split("-"); mkt_hour = int(_p[1][-2:]) if len(_p) >= 2 else None
         except Exception: pass
         pa = tl.get("placed_at","")
         open_rows.append({
