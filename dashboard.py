@@ -432,14 +432,19 @@ def _fetch_pending() -> list:
         except Exception as e:
             log.warning("pending: batch price fetch failed: %s", e)
             market_info = {}
-        pending_tickers = set()
+        pending_tickers  = set()
         expiry_by_ticker = {}
+        result_by_ticker = {}
         for tk, m in market_info.items():
             status = (m.get("status") or "").lower()
             result = (m.get("result") or "").strip()
-            if status == "closed" and result == "":
+            # Two pending states:
+            #   "closed"     + no result  : market closed, result not yet published
+            #   "determined" + result set : result known, settlement payment pending
+            if status in ("closed", "determined"):
                 pending_tickers.add(tk)
                 expiry_by_ticker[tk] = m.get("expected_expiration_time","")
+                result_by_ticker[tk] = result
         pending_pos = [p for p in candidates if p["ticker"] in pending_tickers]
         if not pending_pos:
             return []
@@ -487,8 +492,17 @@ def _fetch_pending() -> list:
                 exp_str = dt_exp.astimezone(ZoneInfo("Europe/Lisbon")).strftime("%H:%M %Z")
             except Exception:
                 exp_str = raw_exp[:16] if raw_exp else "unknown"
-            br = ticker.split("-")[-1] if "-" in ticker else ticker
-            mt = "HIGH" if "HIGH" in ticker else "LOW"
+            br     = ticker.split("-")[-1] if "-" in ticker else ticker
+            mt     = "HIGH" if "HIGH" in ticker else "LOW"
+            result = result_by_ticker.get(ticker, "")
+            if result:
+                won        = (result.lower() == side)
+                outcome    = "WON ✓"  if won else "LOST ✗"
+                outcome_cls = "green" if won else "red"
+            else:
+                won         = None
+                outcome     = "Pending"
+                outcome_cls = "yellow"
             enriched.append({
                 "ticker":         ticker,
                 "market":         _city_from_ticker(ticker) or ticker,
@@ -500,6 +514,10 @@ def _fetch_pending() -> list:
                 "avg_cost":       avg_cost,
                 "cost_total":     round(avg_cost * contracts, 2),
                 "est_settlement": exp_str,
+                "result":         result,
+                "won":            won,
+                "outcome":        outcome,
+                "outcome_cls":    outcome_cls,
             })
         return enriched
     except Exception as e:
@@ -1479,9 +1497,17 @@ async function loadPending() {
     const totalCost = rows.reduce((s, r) => s + (r.cost_total || 0), 0);
     let html = `<div class="tbl-wrap"><table><thead><tr>
       <th>Market</th><th>Bracket</th><th>Side</th><th>Qty</th>
-      <th>Entry</th><th>At Risk</th><th>Est. Settlement</th>
+      <th>Entry</th><th>At Risk</th><th>Est. Settlement</th><th>Result</th>
     </tr></thead><tbody>`;
     for (const r of rows) {
+      const resCls = r.outcome_cls === 'green' ? 'pnl-pos'
+                   : r.outcome_cls === 'red'   ? 'pnl-neg'
+                   : 'style="color:var(--yel)"';
+      const resSpan = r.outcome_cls === 'green'
+        ? `<span class="pnl-pos">${r.outcome}</span>`
+        : r.outcome_cls === 'red'
+        ? `<span class="pnl-neg">${r.outcome}</span>`
+        : `<span style="color:var(--yel)">${r.outcome}</span>`;
       html += `<tr style="color:var(--sec)">
         <td>${r.market || r.ticker}</td>
         <td>${r.bracket || '—'}</td>
@@ -1490,6 +1516,7 @@ async function loadPending() {
         <td>${fmt$(r.avg_cost)}</td>
         <td style="color:var(--yel)">${fmt$(r.cost_total)}</td>
         <td style="color:var(--sec)">${r.est_settlement}</td>
+        <td>${resSpan}</td>
       </tr>`;
     }
     // Total row
@@ -1497,7 +1524,7 @@ async function loadPending() {
       <td colspan="4"></td>
       <td></td>
       <td style="color:var(--yel);font-weight:600">${fmt$(totalCost)}</td>
-      <td></td>
+      <td colspan="2"></td>
     </tr>`;
     html += '</tbody></table></div>';
     tbl.innerHTML = html;
