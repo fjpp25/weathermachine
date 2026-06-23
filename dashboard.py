@@ -288,7 +288,8 @@ def _fetch_settlements() -> tuple:
             if not cursor or len(b) < 200: break
 
         temp = [s for s in all_s if s.get("ticker","").startswith("KX")
-                and ("HIGH" in s.get("ticker","") or "LOWT" in s.get("ticker",""))]
+                and ("HIGH" in s.get("ticker","") or "LOWT" in s.get("ticker",""))
+                and "TEMPNYCH" not in s.get("ticker","")]
 
         # fills
         all_f, cursor = [], None
@@ -303,7 +304,8 @@ def _fetch_settlements() -> tuple:
         fbt: dict = defaultdict(list)
         for f in all_f:
             if f.get("ticker","").startswith("KX") and \
-               ("HIGH" in f.get("ticker","") or "LOWT" in f.get("ticker","")):
+               ("HIGH" in f.get("ticker","") or "LOWT" in f.get("ticker","")) and \
+               "TEMPNYCH" not in f.get("ticker",""):
                 fbt[f["ticker"]].append(f)
 
         sdates = {s["ticker"]: s.get("settled_time","")
@@ -525,6 +527,129 @@ def _fetch_pending() -> list:
         return []
 
 get_pending = lambda: cached("pending", 300, _fetch_pending)
+
+# ---------------------------------------------------------------------------
+# Hourly NYC settlements fetcher
+# ---------------------------------------------------------------------------
+def _fetch_hourly_settlements() -> list:
+    """
+    Fetch and enrich settled KXTEMPNYCH (NYC hourly temperature) positions.
+    Same enrichment pattern as _fetch_settlements() but filtered to the
+    KXTEMPNYCH series only. Returns enriched list newest-first.
+    """
+    c = get_client()
+    if not c: return []
+    try:
+        all_s, cursor = [], None
+        for _ in range(15):
+            p = {"limit": 200}
+            if cursor: p["cursor"] = cursor
+            d = c.get("portfolio/settlements", params=p)
+            b = d.get("settlements", [])
+            all_s.extend(b); cursor = d.get("cursor")
+            if not cursor or len(b) < 200: break
+
+        temp = [s for s in all_s if "KXTEMPNYCH" in s.get("ticker","")]
+
+        all_f, cursor = [], None
+        for _ in range(10):
+            p = {"limit": 200}
+            if cursor: p["cursor"] = cursor
+            d = c.get("portfolio/fills", params=p)
+            b = d.get("fills", [])
+            all_f.extend(b); cursor = d.get("cursor")
+            if not cursor or len(b) < 200: break
+
+        fbt: dict = defaultdict(list)
+        for f in all_f:
+            if "KXTEMPNYCH" in f.get("ticker",""):
+                fbt[f["ticker"]].append(f)
+
+        enriched = []
+        for s in temp:
+            tk  = s.get("ticker",""); res = s.get("market_result","").lower()
+            fee = float(s.get("fee_cost") or 0)
+            raw = s.get("settled_time","")
+            try:
+                dt  = datetime.fromisoformat(raw.replace("Z","+00:00"))
+                sts = dt.astimezone(ZoneInfo("Europe/Lisbon")).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                sts = raw[:16].replace("T"," ") if raw else ""
+
+            yes_c    = float(s.get("yes_count_fp") or 0)
+            no_c     = float(s.get("no_count_fp")  or 0)
+            yes_cost = float(s.get("yes_total_cost_dollars") or 0)
+            no_cost  = float(s.get("no_total_cost_dollars")  or 0)
+
+            if yes_c > 0 and no_c == 0:
+                our = "yes"; nc = int(yes_c); cost = round(yes_cost, 4)
+            elif no_c > 0 and yes_c == 0:
+                our = "no";  nc = int(no_c);  cost = round(no_cost, 4)
+            elif yes_c > 0 and no_c > 0:
+                if yes_c >= no_c: our = "yes"; nc = int(yes_c); cost = round(yes_cost, 4)
+                else:             our = "no";  nc = int(no_c);  cost = round(no_cost, 4)
+            else:
+                continue
+
+            if nc == 0 or cost == 0: continue
+
+            edate = raw[:10]
+            if tk in fbt:
+                bfs = [f for f in fbt[tk] if f.get("action") == "buy"]
+                if bfs:
+                    edate = sorted(bfs, key=lambda f: f.get("created_time",""))[0].get("created_time","")[:10]
+
+            # Extract settlement hour from ticker: KXTEMPNYCH-26JUN2214 -> 14
+            mkt_hour = None
+            try:
+                mkt_hour = int(tk.split("-")[-1][-2:])
+            except Exception:
+                pass
+
+            won = (res == our)
+            pnl = round(nc - cost - fee, 4) if won else round(-cost - fee, 4)
+            enriched.append({
+                "ticker":      tk,
+                "date":        edate,
+                "settled_ts":  sts,
+                "side":        our.upper(),
+                "contracts":   nc,
+                "result":      res.upper(),
+                "won":         won,
+                "cost":        cost,
+                "fee":         fee,
+                "net_pnl":     pnl,
+                "avg_entry":   round(cost/nc, 4),
+                "mkt_hour":    mkt_hour,
+                "threshold_f": None,
+                "forecast_f":  None,
+                "dist_f":      None,
+            })
+
+        # Enrich with trade_log score_detail (threshold, forecast, dist)
+        trades = _load_trade_log()
+        tlog   = {t.get("ticker",""): t for t in trades
+                  if t.get("entry_tier") == "hourly_nyc"}
+        for e in enriched:
+            for item in tlog.get(e["ticker"], {}).get("score_detail", []):
+                if not isinstance(item, str): continue
+                if item.startswith("threshold="):
+                    try: e["threshold_f"] = float(item.split("=")[1].rstrip("degF").rstrip("°F"))
+                    except Exception: pass
+                elif item.startswith("forecast="):
+                    try: e["forecast_f"] = float(item.split("=")[1].rstrip("degF").rstrip("°F"))
+                    except Exception: pass
+                elif item.startswith("dist="):
+                    try: e["dist_f"] = float(item.split("=")[1].rstrip("degF").rstrip("°F"))
+                    except Exception: pass
+
+        enriched.sort(key=lambda x: x["date"], reverse=True)
+        return enriched
+    except Exception as e:
+        log.error("hourly settlements failed: %s", e, exc_info=True)
+        return []
+
+get_hourly_settlements = lambda: cached("hourly_settlements", 120, _fetch_hourly_settlements)
 
 # ---------------------------------------------------------------------------
 # In-process log buffer
@@ -959,6 +1084,117 @@ def api_pending():
     return jsonify(get_pending())
 
 # ---------------------------------------------------------------------------
+# API — /api/hourly
+# ---------------------------------------------------------------------------
+@app.route("/api/hourly")
+def api_hourly():
+    # Open hourly positions
+    all_positions = get_positions()
+    open_pos = [p for p in all_positions if "KXTEMPNYCH" in p.get("ticker","")]
+    trades   = _load_trade_log()
+    tlog     = {t.get("ticker",""): t for t in trades
+                if t.get("entry_tier") == "hourly_nyc"}
+
+    open_rows = []
+    for p in open_pos:
+        tk  = p.get("ticker","")
+        tl  = tlog.get(tk, {})
+        threshold_f = None; forecast_f = None; dist_f = None
+        for item in tl.get("score_detail", []):
+            if not isinstance(item, str): continue
+            if item.startswith("threshold="):
+                try: threshold_f = float(item.split("=")[1].rstrip("°F"))
+                except Exception: pass
+            elif item.startswith("forecast="):
+                try: forecast_f = float(item.split("=")[1].rstrip("°F"))
+                except Exception: pass
+            elif item.startswith("dist="):
+                try: dist_f = float(item.split("=")[1].rstrip("°F"))
+                except Exception: pass
+        mkt_hour = None
+        try: mkt_hour = int(tk.split("-")[-1][-2:])
+        except Exception: pass
+        pa = tl.get("placed_at","")
+        open_rows.append({
+            "ticker":      tk,
+            "side":        p.get("side","").upper(),
+            "contracts":   p.get("contracts", 1),
+            "avg_cost":    round(p.get("avg_cost", 0), 2),
+            "unrealised":  round(p.get("unrealised_pnl", 0), 2),
+            "mkt_hour":    mkt_hour,
+            "threshold_f": threshold_f,
+            "forecast_f":  forecast_f,
+            "dist_f":      dist_f,
+            "entered_at":  pa[:16].replace("T"," ") if pa else "—",
+        })
+
+    # Settled history
+    enriched = get_hourly_settlements()
+    total    = len(enriched)
+    wins     = [e for e in enriched if e["won"]]
+    win_rate = round(len(wins) / total * 100, 1) if total else 0
+    net_pnl  = round(sum(e["net_pnl"] for e in enriched), 2)
+    fees     = round(sum(e["fee"]     for e in enriched), 2)
+
+    # By-hour breakdown
+    by_hour: dict = defaultdict(lambda: {"wins": 0, "total": 0, "pnl": 0.0})
+    for e in enriched:
+        h = e.get("mkt_hour")
+        if h is None: continue
+        by_hour[h]["total"] += 1
+        by_hour[h]["pnl"]   += e["net_pnl"]
+        if e["won"]: by_hour[h]["wins"] += 1
+    hour_rows = [
+        {"hour": h, "label": f"{h:02d}:00 EDT",
+         "total": v["total"], "wins": v["wins"],
+         "losses": v["total"] - v["wins"],
+         "win_pct": f"{round(v['wins']/v['total']*100,1)}%" if v["total"] else "—",
+         "net_pnl": round(v["pnl"], 2)}
+        for h, v in sorted(by_hour.items())
+    ]
+
+    # By-day breakdown
+    by_day: dict = defaultdict(lambda: {"wins": 0, "total": 0, "pnl": 0.0})
+    for e in enriched:
+        d = e.get("date","")
+        if not d: continue
+        by_day[d]["total"] += 1
+        by_day[d]["pnl"]   += e["net_pnl"]
+        if e["won"]: by_day[d]["wins"] += 1
+    cum = 0.0; day_rows = []
+    for day in sorted(by_day.keys()):
+        v = by_day[day]; cum += v["pnl"]
+        day_rows.append({
+            "date": day, "total": v["total"], "wins": v["wins"],
+            "losses": v["total"] - v["wins"],
+            "win_pct": f"{round(v['wins']/v['total']*100,1)}%" if v["total"] else "—",
+            "net_pnl": round(v["pnl"], 2), "cum_pnl": round(cum, 2)})
+    day_rows.reverse()
+
+    # Settlement rows
+    settled_rows = []
+    for e in enriched[:200]:
+        settled_rows.append({
+            **e,
+            "result_label": "WON ✓" if e["won"] else "LOST ✗",
+            "result_class": "green" if e["won"] else "red",
+            "thresh_label": f"{e['threshold_f']:.0f}°F" if e.get("threshold_f") is not None else "—",
+            "fcst_label":   f"{e['forecast_f']:.1f}°F"  if e.get("forecast_f")  is not None else "—",
+            "dist_label":   f"{e['dist_f']:.1f}°F"      if e.get("dist_f")      is not None else "—",
+            "hour_label":   f"{e['mkt_hour']:02d}:00 EDT" if e.get("mkt_hour") is not None else "—",
+        })
+
+    return jsonify({
+        "open":    open_rows,
+        "stats":   {"total": total, "win_rate": win_rate, "net_pnl": net_pnl,
+                    "total_fees": fees, "open_count": len(open_rows)},
+        "by_hour": hour_rows,
+        "by_day":  day_rows,
+        "settled": settled_rows,
+    })
+
+
+# ---------------------------------------------------------------------------
 # HTML template
 # ---------------------------------------------------------------------------
 _HTML = r"""<!DOCTYPE html>
@@ -1166,6 +1402,7 @@ td.center{text-align:center}
 <div id="tabbar">
   <button class="tb on" data-tab="home" onclick="switchTab('home',this)">Home</button>
   <button class="tb" data-tab="session" onclick="switchTab('session',this)">Session</button>
+  <button class="tb" data-tab="hourly" onclick="switchTab('hourly',this)">Hourly NYC</button>
   <button class="tb" data-tab="log" onclick="switchTab('log',this)">Log</button>
   <button class="tb" data-tab="perf" onclick="switchTab('perf',this)">Performance</button>
 </div>
@@ -1241,6 +1478,25 @@ td.center{text-align:center}
   </div>
 </div>
 
+<!-- HOURLY NYC -->
+<div class="tab" id="tab-hourly">
+  <div class="refresh-bar">
+    <button class="btn" onclick="loadHourly()">↻ Refresh</button>
+    <span id="hourly-summary" style="color:var(--sec);font-size:11px;margin-left:auto"></span>
+  </div>
+  <div class="stat-grid" id="hourly-stats"></div>
+  <div class="stabs">
+    <button class="stb on" onclick="switchHourly('open',this)">Open</button>
+    <button class="stb" onclick="switchHourly('by-hour',this)">By Hour</button>
+    <button class="stb" onclick="switchHourly('by-day',this)">By Day</button>
+    <button class="stb" onclick="switchHourly('settled',this)">History</button>
+  </div>
+  <div class="sp on" id="hsp-open"></div>
+  <div class="sp" id="hsp-by-hour"></div>
+  <div class="sp" id="hsp-by-day"></div>
+  <div class="sp" id="hsp-settled"></div>
+</div>
+
 </div><!-- /content -->
 
 <!-- City modal -->
@@ -1276,6 +1532,7 @@ function switchTab(id, btn) {
   document.getElementById('tab-' + id).classList.add('on');
   btn.classList.add('on');
   if (id === 'session') { stopLogRefresh(); loadSession(); }
+  if (id === 'hourly')  { stopLogRefresh(); loadHourly(); }
   if (id === 'log')     { loadLog(); startLogRefresh(); }
   if (id === 'perf')    { stopLogRefresh(); loadPerf(); }
   if (id === 'home')    { stopLogRefresh(); }
@@ -1756,6 +2013,139 @@ function closeModal(e) {
 }
 
 document.addEventListener('keydown', e => { if (e.key==='Escape') closeModal(); });
+
+// ── Hourly NYC ─────────────────────────────────────────────────────────────
+let _hourlyData   = {};
+let _hourlySubtab = 'open';
+
+function switchHourly(id, btn) {
+  document.querySelectorAll('#tab-hourly .stb').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('#tab-hourly .sp').forEach(s => s.classList.remove('on'));
+  btn.classList.add('on');
+  document.getElementById('hsp-' + id).classList.add('on');
+  _hourlySubtab = id;
+  renderHourly(id);
+}
+
+async function loadHourly() {
+  try {
+    const d = await fetch('/api/hourly').then(r => r.json());
+    _hourlyData = d;
+    const s = d.stats || {};
+    document.getElementById('hourly-stats').innerHTML = [
+      ['Win Rate',   fmtPct(s.win_rate),  s.win_rate >= 85 ? 'g' : ''],
+      ['Net PnL',    fmt$(s.net_pnl),     s.net_pnl  >= 0  ? 'g' : 'r'],
+      ['Settled',    s.total ?? '—',      ''],
+      ['Open Now',   s.open_count ?? '—', ''],
+      ['Total Fees', fmt$(s.total_fees),  ''],
+    ].map(([k,v,c]) =>
+      `<div class="stat-card"><div class="stat-k">${k}</div><div class="stat-v ${c}">${v}</div></div>`
+    ).join('');
+    const unr = (d.open || []).reduce((s, r) => s + (r.unrealised || 0), 0);
+    document.getElementById('hourly-summary').textContent =
+      `${s.open_count} open  |  unrealised ${unr >= 0 ? '+' : ''}${fmt$(unr)}`;
+    renderHourly(_hourlySubtab);
+  } catch(e) { console.warn('hourly', e); }
+}
+
+function renderHourly(id) {
+  if (id === 'open')    renderHourlyOpen();
+  if (id === 'by-hour') renderHourlyByHour();
+  if (id === 'by-day')  renderHourlyByDay();
+  if (id === 'settled') renderHourlySettled();
+}
+
+function renderHourlyOpen() {
+  const rows = _hourlyData.open || [];
+  const el   = document.getElementById('hsp-open');
+  if (!rows.length) { el.innerHTML = '<div class="empty">No open hourly positions</div>'; return; }
+  let html = `<div class="tbl-wrap"><table><thead><tr>
+    <th>Entered</th><th>Hour (EDT)</th><th>Threshold</th><th>Forecast</th><th>Dist</th>
+    <th>Side</th><th>Qty</th><th>Entry</th><th>Unreal. PnL</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const unr  = r.unrealised ?? 0;
+    const time = (r.entered_at || '').split(' ')[1] || '—';
+    html += `<tr>
+      <td>${time} UTC</td>
+      <td>${r.mkt_hour != null ? r.mkt_hour + ':00 EDT' : '—'}</td>
+      <td>${r.threshold_f != null ? r.threshold_f + '°F' : '—'}</td>
+      <td>${r.forecast_f  != null ? r.forecast_f.toFixed(1) + '°F' : '—'}</td>
+      <td>${r.dist_f      != null ? r.dist_f.toFixed(1)     + '°F' : '—'}</td>
+      <td class="center"><span class="${r.side==='NO'?'side-no':'side-yes'}">${r.side||'—'}</span></td>
+      <td class="center">${r.contracts || 1}</td>
+      <td>${fmt$(r.avg_cost)}</td>
+      <td class="${clsPnl(unr)}">${unr>=0?'+':''}${fmt$(unr)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+function renderHourlyByHour() {
+  const rows = _hourlyData.by_hour || [];
+  const el   = document.getElementById('hsp-by-hour');
+  if (!rows.length) { el.innerHTML = '<div class="empty">No data yet</div>'; return; }
+  let html = `<div class="tbl-wrap"><table><thead><tr>
+    <th>Hour (EDT)</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Net PnL</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const cls = r.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    html += `<tr>
+      <td>${r.label}</td><td class="center">${r.total}</td>
+      <td class="center pnl-pos">${r.wins}</td>
+      <td class="center pnl-neg">${r.losses}</td>
+      <td class="center">${r.win_pct}</td>
+      <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+function renderHourlyByDay() {
+  const rows = _hourlyData.by_day || [];
+  const el   = document.getElementById('hsp-by-day');
+  if (!rows.length) { el.innerHTML = '<div class="empty">No data yet</div>'; return; }
+  let html = `<div class="tbl-wrap"><table><thead><tr>
+    <th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Net PnL</th><th>Cum PnL</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const cls = r.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    html += `<tr>
+      <td>${r.date}</td><td class="center">${r.total}</td>
+      <td class="center pnl-pos">${r.wins}</td>
+      <td class="center pnl-neg">${r.losses}</td>
+      <td class="center">${r.win_pct}</td>
+      <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+      <td class="${r.cum_pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${r.cum_pnl >= 0 ? '+' : ''}${fmt$(r.cum_pnl)}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
+function renderHourlySettled() {
+  const rows = _hourlyData.settled || [];
+  const el   = document.getElementById('hsp-settled');
+  if (!rows.length) { el.innerHTML = '<div class="empty">No settled positions yet</div>'; return; }
+  let html = `<div class="tbl-wrap"><table><thead><tr>
+    <th>Date</th><th>Hour (EDT)</th><th>Threshold</th><th>Forecast</th><th>Dist</th>
+    <th>Entry</th><th>Qty</th><th>Net PnL</th><th>Result</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const cls = r.result_class === 'green' ? 'pnl-pos' : 'pnl-neg';
+    html += `<tr>
+      <td>${r.date || '—'}</td><td>${r.hour_label}</td>
+      <td>${r.thresh_label}</td><td>${r.fcst_label}</td><td>${r.dist_label}</td>
+      <td>${fmt$(r.avg_entry)}</td><td class="center">${r.contracts}</td>
+      <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
+      <td class="${cls}">${r.result_label}</td>
+    </tr>`;
+  }
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 document.getElementById('log-follow-btn').classList.add('active');
