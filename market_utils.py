@@ -95,6 +95,24 @@ def is_b_bracket(bracket: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Bracket value parser — shared by all engines
+# ---------------------------------------------------------------------------
+
+def bracket_val(bracket_code: str) -> float | None:
+    """
+    Extract the numeric temperature value from a bracket code.
+    B82.5 → 82.5,  T69 → 69.0,  B46 → 46.0
+    Returns None if the code is not a valid bracket string.
+    """
+    if bracket_code and bracket_code[0] in ("B", "T"):
+        try:
+            return float(bracket_code[1:])
+        except ValueError:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Standalone-mode credential loader
 # ---------------------------------------------------------------------------
 

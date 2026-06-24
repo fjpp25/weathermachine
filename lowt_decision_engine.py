@@ -55,9 +55,10 @@ from typing import Optional
 from cities import CITIES as _CITIES
 from log_setup import get_logger
 from market_utils import (
-    local_hour as _local_hour,
-    no_price   as _no_price,
-    yes_price  as _yes_price,
+    local_hour   as _local_hour,
+    no_price     as _no_price,
+    yes_price    as _yes_price,
+    bracket_val  as _bracket_val,
     load_config_env,
 )
 
@@ -100,11 +101,9 @@ def _bval(bracket: dict) -> Optional[float]:
         bracket.get("bracket", ""),
         bracket.get("ticker", "").split("-")[-1],
     ]:
-        if src and src[0] in "BT":
-            try:
-                return float(src[1:])
-            except ValueError:
-                pass
+        val = _bracket_val(src)
+        if val is not None:
+            return val
     cap = bracket.get("cap")
     return float(cap) if cap is not None else None
 
@@ -187,6 +186,12 @@ def _check_signal_b(
     """
     if city in B_SKIP_CITIES:
         return False, f"skip city ({city})"
+
+    # Respect per-city LOWT market close deadline from cities.py
+    city_cfg      = _CITIES.get(city, {})
+    trade_end     = city_cfg.get("trade_end_lowt")
+    if trade_end is not None and local_hour >= trade_end:
+        return False, f"past trade_end_lowt ({local_hour}h >= {trade_end}h)"
 
     if not (B_EVENING_START <= local_hour <= B_EVENING_END):
         return False, f"outside evening window (hour={local_hour})"
@@ -279,7 +284,13 @@ def evaluate_city_lowt(
 
         if obs_low_f is not None and no_p >= A_NO_MIN and no_p < A_NO_MAX:
             if _check_signal_a(bracket, obs_low_f):
-                signal_type = "A"
+                # Also respect city trade deadline for Signal A
+                city_cfg  = _CITIES.get(city, {})
+                trade_end = city_cfg.get("trade_end_lowt")
+                if trade_end is None or local_hr < trade_end:
+                    signal_type = "A"
+                else:
+                    pass  # past deadline, skip
 
         # ── Signal B: forecast distance (if A didn't fire) ────────────────
         if signal_type is None and B_NO_MIN <= no_p < B_NO_MAX:

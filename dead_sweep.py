@@ -79,6 +79,7 @@ from market_utils import (
     local_hour      as _local_hour,
     no_price        as _no_price,
     yes_price       as _yes_price,
+    bracket_val     as _bracket_val_shared,
     load_config_env,
 )
 
@@ -125,16 +126,8 @@ _fired: set[str] = set()
 # ---------------------------------------------------------------------------
 
 def _bracket_val(bracket_code: str) -> Optional[float]:
-    """
-    Extract the numeric temperature value from a bracket code.
-    B82.5 → 82.5,  T69 → 69.0,  T55 → 55.0
-    """
-    if bracket_code and bracket_code[0] in ("B", "T"):
-        try:
-            return float(bracket_code[1:])
-        except ValueError:
-            pass
-    return None
+    """Thin wrapper — delegates to market_utils.bracket_val."""
+    return _bracket_val_shared(bracket_code)
 
 
 def _is_bottom_t(bracket_code: str, forecast_high: float) -> bool:

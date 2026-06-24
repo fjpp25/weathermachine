@@ -329,16 +329,16 @@ class EngineCapital:
 
         log.debug(
             "EngineCapital: balance=$%.2f  "
-            "main=$%.2f  cascade=$%.2f  topup=$%.2f  "
-            "peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  lowt=$%.2f",
+            "main=$%.2f  cascade=$%.2f  sweep=$%.2f  "
+            "peak=$%.2f  topup=$%.2f  econv=$%.2f  lowt=$%.2f",
             self._balance,
-            self._budget.get("main",     0),
-            self._budget.get("cascade",  0),
-            self._budget.get("topup",    0),
-            self._budget.get("peak",     0),
-            self._budget.get("tomorrow", 0),
-            self._budget.get("econv",    0),
-            self._budget.get("lowt",     0),
+            self._budget.get("main",    0),
+            self._budget.get("cascade", 0),
+            self._budget.get("sweep",   0),
+            self._budget.get("peak",    0),
+            self._budget.get("topup",   0),
+            self._budget.get("econv",   0),
+            self._budget.get("lowt",    0),
         )
 
     @property
@@ -529,6 +529,12 @@ def _normalise_prices(m: dict) -> dict:
     Extract and normalise yes/no bid prices from a Kalshi market dict.
     Handles settled markets, last_price fallback, and one-sided books.
     Shared by _market_price() and the batch fetch in sync_from_kalshi().
+
+    Fallback priority for one-sided books:
+      no_bid missing  → use (1 - yes_ask) if available, else (1 - yes_bid)
+      yes_bid missing → use (1 - no_ask)  if available, else (1 - no_bid)
+    This matches Kalshi's own portfolio mark-to-market more closely than
+    the naive (1 - yes_bid) fallback, which overstates the bid-ask spread.
     """
     result  = (m.get("result") or "").lower()
     status  = m.get("status", "active")
@@ -540,6 +546,8 @@ def _normalise_prices(m: dict) -> dict:
 
     yes_bid = float(m.get("yes_bid_dollars") or 0)
     no_bid  = float(m.get("no_bid_dollars")  or 0)
+    yes_ask = float(m.get("yes_ask_dollars") or 0)
+    no_ask  = float(m.get("no_ask_dollars")  or 0)
 
     if yes_bid == 0 and no_bid == 0:
         lp_cents = float(m.get("last_price") or 0)
@@ -548,9 +556,12 @@ def _normalise_prices(m: dict) -> dict:
             no_bid  = round(1.0 - yes_bid, 4)
 
     if yes_bid > 0 and no_bid == 0:
-        no_bid = round(1.0 - yes_bid, 4)
+        # Prefer (1 - yes_ask) over (1 - yes_bid): yes_ask <= yes_bid so
+        # this gives a slightly lower (more conservative) No mark, matching
+        # how Kalshi values No positions in its own portfolio view.
+        no_bid = round(1.0 - yes_ask, 4) if yes_ask > 0 else round(1.0 - yes_bid, 4)
     elif no_bid > 0 and yes_bid == 0:
-        yes_bid = round(1.0 - no_bid, 4)
+        yes_bid = round(1.0 - no_ask, 4) if no_ask > 0 else round(1.0 - no_bid, 4)
 
     return {"yes_bid": yes_bid, "no_bid": no_bid, "status": status, "result": result}
 
@@ -951,21 +962,23 @@ _day_open_balance: float      = 0.0
 _day_open_date:    _date|None = None
 _deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
 _deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
-_deployed_tomorrow: float     = 0.0   # tomorrow scanner — persists across polls, resets midnight
+_deployed_tomorrow: float     = 0.0   # retained for legacy log compat — budget now in sweep
+_deployed_sweep:    float      = 0.0   # unified sweep engine — persists across polls, resets midnight
 _deployed_econv:   float      = 0.0   # evening convergence — persists across polls, resets midnight
 _deployed_lowt:    float      = 0.0   # LOWT engine — persists across polls, resets midnight
 # ---------------------------------------------------------------------------
 # Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
 ENGINE_ALLOCATIONS: dict[str, float] = {
-    "main":     0.25,   # HIGH main engine
-    "cascade":  0.33,   # HIGH cascade
-    "topup":    0.10,   # augments existing positions
+    "main":     0.10,   # HIGH main engine (post-dedup fix: ~$7/day actual need)
+    "cascade":  0.25,   # HIGH cascade — highest proven EV
+    "sweep":    0.20,   # unified sweep: directional + near-dead + dead bracket
     "peak":     0.08,   # intraday peak confirmation
-    "tomorrow": 0.10,   # overnight pre-market entries
-    "econv":    0.05,   # evening convergence
-    "hourly":   0.04,   # NYC hourly temperature
-    "lowt":     0.10,   # LOWT structural elimination + forecast distance
+    "topup":    0.03,   # augments existing positions (rarely fires)
+    "econv":    0.03,   # evening convergence (rarely fires)
+    "hourly":   0.03,   # NYC hourly temperature
+    "lowt":     0.12,   # LOWT structural elimination + forecast distance
+    # 16% unallocated buffer
 }
 
 # Legacy constant retained for backward compat
@@ -982,7 +995,7 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     """
     global _day_open_balance, _day_open_date, \
            _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv,\
-           _deployed_lowt
+           _deployed_lowt, _deployed_sweep
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
         _day_open_balance   = current_balance
@@ -992,6 +1005,7 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
         _deployed_tomorrow  = 0.0
         _deployed_econv     = 0.0
         _deployed_lowt      = 0.0
+        _deployed_sweep     = 0.0
         log.info(
             "day snapshot: $%.2f  "
             "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f)",
@@ -1075,6 +1089,20 @@ def record_lowt_deployed(cost: float) -> None:
     _deployed_lowt = round(_deployed_lowt + cost, 4)
     log.debug("lowt deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
               cost, _deployed_lowt, get_lowt_deployable())
+
+
+def get_sweep_deployable() -> float:
+    """Remaining sweep budget for today (based on day-open balance)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["sweep"], 2)
+    return max(0.0, round(budget - _deployed_sweep, 2))
+
+
+def record_sweep_deployed(cost: float) -> None:
+    """Record capital deployed by the unified sweep engine."""
+    global _deployed_sweep
+    _deployed_sweep = round(_deployed_sweep + cost, 4)
+    log.debug("sweep deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_sweep, get_sweep_deployable())
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -1763,7 +1791,7 @@ def check_topups(
         if curr_no > NO_TOPUP_MAX_PRICE or curr_no <= 0.0:
             continue
 
-        # Headroom check — don't exceed the global cross-engine total cap.
+        # Headroom check — don't exceed the cross-engine total cap.
         # TOPUP_TOTAL_CAP is aligned with GLOBAL_MAX_CONTRACTS_PER_TICKER (7)
         # so the topup engine respects the same ceiling as run_pipeline.
         held     = pos.get("contracts", 0)
@@ -1948,10 +1976,7 @@ def run_pipeline(
                 log.debug("skip %s — cooldown", ticker)
                 continue
 
-            # Main engine dedup: never re-enter a ticker already entered this
-            # session. Prevents the fill-latency accumulation bug where Kelly
-            # returns max_contracts=1 and the engine fires 1 contract every poll
-            # on the same ticker until Kalshi fills propagate to open_contracts.
+            # Main engine dedup: never re-enter a ticker already entered this session.
             tier_check = signal.get("entry_tier", "") or "main"
             if not tier_check.startswith("cascade") and ticker in _main_entered:
                 log.debug("skip %s — already entered this session (main engine)", ticker)
@@ -1974,8 +1999,6 @@ def run_pipeline(
             held      = open_contracts.get(ticker, 0)
 
             # Global per-ticker cap — enforced across all engines.
-            # Prevents unintentional concentration from cross-engine stacking
-            # while still allowing legitimate multi-signal confirmation.
             if held >= GLOBAL_MAX_CONTRACTS_PER_TICKER:
                 log.debug("skip %s — global cap reached (%d/%d contracts)",
                           ticker, held, GLOBAL_MAX_CONTRACTS_PER_TICKER)
@@ -2007,6 +2030,9 @@ def run_pipeline(
                 engine_key = "cascade"
             elif tier.startswith("lowt"):
                 engine_key = "lowt"
+            elif (tier.startswith("tomorrow") or tier == "dead_sweep"
+                  or tier == "sweep"):
+                engine_key = "sweep"
             else:
                 engine_key = "main"
             if engine_key == "cascade":
@@ -2019,6 +2045,12 @@ def run_pipeline(
                     log.debug("skip %s — lowt budget exhausted "
                               "(cost=$%.2f  remaining=$%.2f)",
                               ticker, cost, get_lowt_deployable())
+                    continue
+            elif engine_key == "sweep":
+                if get_sweep_deployable() < cost:
+                    log.debug("skip %s — sweep budget exhausted "
+                              "(cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, get_sweep_deployable())
                     continue
             else:
                 if not cap.can_deploy("main", cost):
@@ -2054,6 +2086,8 @@ def run_pipeline(
                     _deployed_cascade += cost
                 elif engine_key == "lowt":
                     record_lowt_deployed(cost)
+                elif engine_key == "sweep":
+                    record_sweep_deployed(cost)
                 else:
                     _main_entered.add(ticker)
                 executed += 1

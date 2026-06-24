@@ -36,7 +36,7 @@ from log_setup import get_logger
 
 import trader
 import hight_decision_engine as decision_engine
-import tomorrow_scanner
+import sweep_engine
 import peak_scanner
 import last_bracket
 import evening_convergence
@@ -129,12 +129,13 @@ def run_scheduler(
     log.info("=" * 60)
 
     # ── Initialise scanners ───────────────────────────────────────────────
-    log.info("initialising next-market scanner...")
+    log.info("initialising sweep engine...")
     try:
-        tomorrow_scanner.initialise(client=client, city_filter=city_filter)
+        sweep_engine.initialise(client=client, city_filter=city_filter)
     except Exception as e:
-        log.warning("scanner init error (non-fatal): %s", e)
+        log.warning("sweep engine init error (non-fatal): %s", e)
 
+    sweep_engine.log_config()
     peak_scanner.log_config()
     last_bracket.log_config()
     evening_convergence.log_config()
@@ -191,14 +192,15 @@ def run_scheduler(
 
         def _run_scan():
             t0 = time.monotonic()
-            log.debug("[next_market_scan] starting")
-            tomorrow_scanner.run_scan(
+            log.debug("[sweep_engine] starting")
+            sweep_engine.run_scan(
                 client          = client,
                 city_filter     = city_filter,
                 paper           = paper,
                 kalshi_snapshot = _k_high,
+                nws_snapshot    = _nws,
             )
-            log.debug("[next_market_scan] done  (%.1fs)", time.monotonic() - t0)
+            log.debug("[sweep_engine] done  (%.1fs)", time.monotonic() - t0)
 
         def _run_peak():
             t0 = time.monotonic()
@@ -246,7 +248,7 @@ def run_scheduler(
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {
                 pool.submit(_run_pipeline):      "pipeline",
-                pool.submit(_run_scan):          "next_market_scan",
+                pool.submit(_run_scan):          "sweep_engine",
                 pool.submit(_run_peak):          "peak_scan",
                 pool.submit(_run_last_bracket):  "last_bracket",
                 pool.submit(_run_econv):         "evening_convergence",
