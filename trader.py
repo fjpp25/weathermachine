@@ -1008,14 +1008,14 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
         _deployed_sweep     = 0.0
         log.info(
             "day snapshot: $%.2f  "
-            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f)",
+            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  sweep=$%.2f  econv=$%.2f  hourly=$%.2f)",
             current_balance,
-            round(current_balance * ENGINE_ALLOCATIONS["main"],     2),
-            round(current_balance * ENGINE_ALLOCATIONS["cascade"],  2),
-            round(current_balance * ENGINE_ALLOCATIONS["peak"],     2),
-            round(current_balance * ENGINE_ALLOCATIONS["tomorrow"], 2),
-            round(current_balance * ENGINE_ALLOCATIONS["econv"],    2),
-            round(current_balance * ENGINE_ALLOCATIONS["hourly"],   2),
+            round(current_balance * ENGINE_ALLOCATIONS["main"],    2),
+            round(current_balance * ENGINE_ALLOCATIONS["cascade"], 2),
+            round(current_balance * ENGINE_ALLOCATIONS["peak"],    2),
+            round(current_balance * ENGINE_ALLOCATIONS["sweep"],   2),
+            round(current_balance * ENGINE_ALLOCATIONS["econv"],   2),
+            round(current_balance * ENGINE_ALLOCATIONS["hourly"],  2),
         )
 
     return 0.0, CASCADE_RESERVE   # main_deployable no longer used — EngineCapital governs
@@ -1050,9 +1050,9 @@ def record_peak_deployed(cost: float) -> None:
 
 
 def get_tomorrow_deployable(ticker: str = None) -> float:
-    """Remaining tomorrow scanner budget for this session."""
-    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["tomorrow"], 2)
-    return max(0.0, round(budget - _deployed_tomorrow, 2))
+    """Remaining sweep budget for this session (legacy name retained for compat)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["sweep"], 2)
+    return max(0.0, round(budget - _deployed_sweep, 2))
 
 
 def record_tomorrow_deployed(cost: float, ticker: str = None) -> None:
@@ -1904,11 +1904,11 @@ def run_pipeline(
         cap = get_engine_capital(client)
         log.info(
             "balance: $%.2f  |  main=$%.2f  cascade=$%.2f  "
-            "tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f",
+            "sweep=$%.2f  econv=$%.2f  hourly=$%.2f",
             balance,
             cap.remaining("main"),
             cap.remaining("cascade"),
-            cap.remaining("tomorrow"),
+            cap.remaining("sweep"),
             cap.remaining("econv"),
             cap.remaining("hourly"),
         )
