@@ -1381,10 +1381,11 @@ td.center{text-align:center}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 /* ── Charts ── */
+.chart-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
 .chart-box{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);
-  padding:16px;margin-bottom:16px}
+  padding:16px}
 .chart-lbl{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}
-.chart-box canvas{max-height:200px}
+.chart-box canvas{max-height:180px}
 </style>
 </head>
 <body>
@@ -1477,8 +1478,12 @@ td.center{text-align:center}
     <button class="stb" onclick="switchPerf('settlements',this)">All Settlements</button>
   </div>
   <div class="sp on" id="sp-charts">
-    <div class="chart-box"><div class="chart-lbl">EQUITY CURVE</div><canvas id="chart-equity"></canvas></div>
-    <div class="chart-box"><div class="chart-lbl">7-DAY ROLLING WIN RATE</div><canvas id="chart-wr"></canvas></div>
+    <div class="chart-grid">
+      <div class="chart-box"><div class="chart-lbl">EQUITY CURVE</div><canvas id="chart-equity"></canvas></div>
+      <div class="chart-box"><div class="chart-lbl">7-DAY ROLLING WIN RATE</div><canvas id="chart-wr"></canvas></div>
+      <div class="chart-box"><div class="chart-lbl">DAILY PnL</div><canvas id="chart-daily-pnl"></canvas></div>
+      <div class="chart-box"><div class="chart-lbl">WIN RATE BY DAY</div><canvas id="chart-daily-wr"></canvas></div>
+    </div>
   </div>
   <div class="sp" id="sp-by-day">
     <div class="tbl-wrap" id="perf-byDay-wrap"></div>
@@ -1910,13 +1915,23 @@ async function loadPerf() {
     _buildChart('chart-equity', d.chart?.equity    || [], 'Equity ($)',       'var(--ac)',  'var(--ac2)');
     _buildChart('chart-wr',     d.chart?.win_rate  || [], 'Win Rate (%)',     'var(--blu)', 'rgba(77,159,255,.1)');
 
-    // By Day table
+    // Daily PnL bar chart
     const days = d.by_day || [];
-    if (days.length) {
+    _buildBarChart('chart-daily-pnl', days.map(r => ({x: r.date, y: r.net_pnl})));
+
+    // Win rate by day line chart
+    _buildChart('chart-daily-wr',
+      days.map(r => ({x: r.date, y: parseFloat(r.win_pct)})),
+      'Win Rate (%)', 'var(--grn)', 'rgba(56,201,138,.1)'
+    );
+
+    // By Day table
+    const days2 = d.by_day || [];
+    if (days2.length) {
       let html = `<table><thead><tr>
         <th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Net PnL</th><th>Cum PnL</th>
       </tr></thead><tbody>`;
-      for (const r of days) {
+      for (const r of days2) {
         const cls = r.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
         html += `<tr>
           <td>${r.date}</td><td class="center">${r.trades}</td>
@@ -1956,6 +1971,34 @@ async function loadPerf() {
       document.getElementById('perf-table-wrap').innerHTML = '<div class="empty">No settlements yet</div>';
     }
   } catch(e) { console.warn('perf', e); }
+}
+
+function _buildBarChart(id, data) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  if (_charts[id]) { _charts[id].destroy(); }
+  _charts[id] = new Chart(canvas, {
+    type: 'bar',
+    data: { datasets: [{
+      label: 'Daily PnL ($)',
+      data,
+      backgroundColor: data.map(d => d.y >= 0 ? 'rgba(56,201,138,.7)' : 'rgba(255,80,80,.7)'),
+      borderColor:     data.map(d => d.y >= 0 ? 'var(--grn)' : 'rgba(255,80,80,1)'),
+      borderWidth: 1,
+      borderRadius: 2,
+    }] },
+    options: {
+      responsive: true, maintainAspectRatio: true,
+      scales: {
+        x: { type:'category', ticks:{ color:'#5a6278', font:{family:'JetBrains Mono',size:9}, maxRotation:45 },
+             grid:{ color:'#1e2230' } },
+        y: { ticks:{ color:'#5a6278', font:{family:'JetBrains Mono',size:10},
+                     callback: v => '$'+v.toFixed(2) },
+             grid:{ color:'#1e2230' } }
+      },
+      plugins: { legend:{ display:false } }
+    }
+  });
 }
 
 function _buildChart(id, data, label, color, fill) {
