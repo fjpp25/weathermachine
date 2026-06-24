@@ -69,6 +69,12 @@ PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 # Max contracts per single order — hard safety cap
 MAX_CONTRACTS_PER_ORDER = 10
 
+# Global cap: maximum total contracts held across ALL engines on any single ticker.
+# Applies in run_pipeline before every order regardless of engine.
+# Allows multi-signal confirmation (e.g. tomorrow_sweep + main) while preventing
+# unintentional concentration. Revisit when scaling contract sizes.
+GLOBAL_MAX_CONTRACTS_PER_TICKER = 7
+
 # Default contracts per signal
 BASE_CONTRACTS = 1
 
@@ -884,9 +890,8 @@ TOPUP_HOUR_END      = 15     # local hour — top-up window closes (inclusive)
 YES_TOPUP_MAX       = 0.30   # max Yes price seen during window to qualify
                               # backtest: <=0.30 gives 98.6% WR, >0.40 turns negative EV
 TOPUP_MAX_CONTRACTS = 3      # additional contracts per top-up signal
-TOPUP_TOTAL_CAP     = 9      # max total contracts across all engines on a single ticker
-                              # higher than MAX_CONTRACTS (3) to allow cascade + main + topup
-                              # to stack without the headroom check silently blocking everything
+TOPUP_TOTAL_CAP     = 7      # max total contracts across all engines on a single ticker
+                              # aligned with GLOBAL_MAX_CONTRACTS_PER_TICKER
 NO_TOPUP_MAX_PRICE  = 0.91   # don't top up if No has drifted above this
 
 NO_YES_CEILING      = 0.60   # retained for reference — ceiling exit DISABLED (see check_exits)
@@ -1949,8 +1954,17 @@ def run_pipeline(
                 continue
 
             held      = open_contracts.get(ticker, 0)
+
+            # Global per-ticker cap — enforced across all engines.
+            # Prevents unintentional concentration from cross-engine stacking
+            # while still allowing legitimate multi-signal confirmation.
+            if held >= GLOBAL_MAX_CONTRACTS_PER_TICKER:
+                log.debug("skip %s — global cap reached (%d/%d contracts)",
+                          ticker, held, GLOBAL_MAX_CONTRACTS_PER_TICKER)
+                continue
+
             max_contr = signal.get("max_contracts", 2)
-            headroom  = max_contr - held
+            headroom  = min(max_contr, GLOBAL_MAX_CONTRACTS_PER_TICKER) - held
             if headroom <= 0:
                 log.debug("skip %s — max contracts (%d/%d)", ticker, held, max_contr)
                 continue

@@ -48,6 +48,8 @@ from cities import TRADING_CITIES as _CITY_REGISTRY
 
 NO_TRIGGER            = 0.80   # T bracket No price that fires the signal
 NO_CONVERGE_THRESHOLD = 0.60   # opposing T must be BELOW this to confirm signal
+NO_MIN_ENTRY          = 0.75   # minimum No price for any tomorrow entry (T or adj-B)
+                                # prevents adj-B entries at near-50/50 prices
 SETTLED_THRESHOLD     = 0.97   # max(yes, no) >= this → bracket is settled
 
 # Order sizing for tomorrow scanner signals.
@@ -96,9 +98,13 @@ _active_next_date: dict[str, str] = {}
 # (city, market_date_str) pairs already entered — never re-enter
 _fired_signals: set[tuple[str, str]] = set()
 
-# Individual tickers already swept this session — prevents re-entry on the
-# same bracket across multiple poll cycles. Keyed on ticker string directly.
-_sweep_entered: set[str] = set()
+# Shared per-ticker dedup set for all tomorrow engine entries (sweep, dismissed,
+# gradient). Any ticker entered by ANY of these paths is blocked from re-entry
+# by all others. Keyed on ticker string; resets on service restart (recovered
+# from live positions in initialise()).
+_tomorrow_entered: set[str] = set()
+_sweep_entered    = _tomorrow_entered   # alias for sweep path
+_bracket_entered  = _tomorrow_entered   # alias for dismissed/gradient path
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +222,9 @@ def initialise(client, city_filter: str = None) -> None:
             if len(parts) < 3:
                 continue
             mdate = parts[1]
-            # Restore _sweep_entered so we never re-enter a bracket already held.
-            # This is critical after a service restart: _sweep_entered resets to
-            # empty in memory, so without this guard the scanner would attempt to
-            # place duplicate sweep orders every poll until budget runs out.
-            _sweep_entered.add(ticker)
+            # Restore _tomorrow_entered (via _sweep_entered alias) so no bracket
+            # already held is re-entered by any engine after a service restart.
+            _sweep_entered.add(ticker)   # writes to _tomorrow_entered
             # Match ticker code back to a city
             for city, meta in cities.items():
                 series = _high_series(meta)
@@ -449,7 +453,7 @@ DISMISSED_NO_MAX      = 0.94
 DISMISSED_HOUR_MAX    = 18
 OPEN_LEAN_MIN         = 0.10
 
-_bracket_entered: set[str] = set()
+# _bracket_entered and _sweep_entered are both aliases of _tomorrow_entered (defined above).
 
 
 def _check_dismissed_signal(t_low: dict, t_high: dict, city: str) -> Optional[dict]:
@@ -738,8 +742,13 @@ def on_signal(
         no_price = bracket_dict.get("no_price", 0.0) or 0.0
 
         if no_price <= 0.0 or no_price > NO_MAX_ENTRY:
-            _log.info("TOMORROW skip %s %s — No price %.2f out of range",
-                      city, ticker, no_price)
+            _log.info("TOMORROW skip %s %s — No price %.2f out of range (max=%.2f)",
+                      city, ticker, no_price, NO_MAX_ENTRY)
+            continue
+
+        if no_price < NO_MIN_ENTRY:
+            _log.info("TOMORROW skip %s %s — No price %.2f below floor %.2f (%s entry skipped)",
+                      city, ticker, no_price, NO_MIN_ENTRY, label)
             continue
 
         # Capital check against session-scoped tomorrow budget

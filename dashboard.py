@@ -376,11 +376,20 @@ def _fetch_settlements() -> tuple:
 
             if nc == 0 or cost == 0: continue
 
-            edate = raw[:10]  # fallback to settled_time date
-            if tk in fbt:
-                bfs = [f for f in fbt[tk] if f.get("action") == "buy"]
-                if bfs:
-                    edate = sorted(bfs, key=lambda f: f.get("created_time",""))[0].get("created_time","")[:10]
+            # Use market date from ticker (e.g. KXHIGHTSEA-26JUN07-B61.5 → 2026-06-07).
+            # This ensures tomorrow_sweep entries placed on day D for a day D+1 market
+            # appear in the D+1 row, not the D row. Falls back to settled_time date.
+            edate = raw[:10]  # fallback: settled_time date
+            try:
+                parts = tk.split("-")
+                if len(parts) >= 2:
+                    mdate_parsed = datetime.strptime(parts[1], "%y%b%d")
+                    edate = mdate_parsed.strftime("%Y-%m-%d")
+            except Exception:
+                if tk in fbt:
+                    bfs = [f for f in fbt[tk] if f.get("action") == "buy"]
+                    if bfs:
+                        edate = sorted(bfs, key=lambda f: f.get("created_time",""))[0].get("created_time","")[:10]
 
             won = (res == our)
             pnl = round(nc - cost - fee, 4) if won else round(-cost - fee, 4)
