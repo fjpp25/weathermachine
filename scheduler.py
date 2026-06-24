@@ -44,6 +44,7 @@ import nws_feed
 import kalshi_scanner
 import hourly_nyc_engine
 import accuweather_logger
+import lowt_decision_engine
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
@@ -138,6 +139,7 @@ def run_scheduler(
     last_bracket.log_config()
     evening_convergence.log_config()
     hourly_nyc_engine.log_config()
+    lowt_decision_engine.log_config()
 
     poll_count = 0
 

@@ -330,7 +330,7 @@ class EngineCapital:
         log.debug(
             "EngineCapital: balance=$%.2f  "
             "main=$%.2f  cascade=$%.2f  topup=$%.2f  "
-            "peak=$%.2f  tomorrow=$%.2f  econv=$%.2f",
+            "peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  lowt=$%.2f",
             self._balance,
             self._budget.get("main",     0),
             self._budget.get("cascade",  0),
@@ -338,6 +338,7 @@ class EngineCapital:
             self._budget.get("peak",     0),
             self._budget.get("tomorrow", 0),
             self._budget.get("econv",    0),
+            self._budget.get("lowt",     0),
         )
 
     @property
@@ -952,17 +953,19 @@ _deployed_cascade: float      = 0.0   # cascade engine — persists across polls
 _deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
 _deployed_tomorrow: float     = 0.0   # tomorrow scanner — persists across polls, resets midnight
 _deployed_econv:   float      = 0.0   # evening convergence — persists across polls, resets midnight
+_deployed_lowt:    float      = 0.0   # LOWT engine — persists across polls, resets midnight
 # ---------------------------------------------------------------------------
 # Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
 ENGINE_ALLOCATIONS: dict[str, float] = {
-    "main":     0.28,   # 30% → 28% to make room for hourly
-    "cascade":  0.33,   # 35% → 33%
-    "topup":    0.10,   # 10% — augments existing positions
-    "peak":     0.08,   # 8%  — intraday peak confirmation
-    "tomorrow": 0.12,   # 12% — 100% WR, overnight capital efficiency
-    "econv":    0.05,   # 5%  — evening convergence
-    "hourly":   0.04,   # 4%  — NYC hourly temperature markets (new)
+    "main":     0.25,   # HIGH main engine
+    "cascade":  0.33,   # HIGH cascade
+    "topup":    0.10,   # augments existing positions
+    "peak":     0.08,   # intraday peak confirmation
+    "tomorrow": 0.10,   # overnight pre-market entries
+    "econv":    0.05,   # evening convergence
+    "hourly":   0.04,   # NYC hourly temperature
+    "lowt":     0.10,   # LOWT structural elimination + forecast distance
 }
 
 # Legacy constant retained for backward compat
@@ -978,7 +981,8 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
     based on day-open balance — not disturbed by intraday winning settlements.
     """
     global _day_open_balance, _day_open_date, \
-           _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv
+           _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv,\
+           _deployed_lowt
     today = _date.today()
     if _day_open_date != today or _day_open_balance == 0.0:
         _day_open_balance   = current_balance
@@ -987,6 +991,7 @@ def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
         _deployed_peak      = 0.0
         _deployed_tomorrow  = 0.0
         _deployed_econv     = 0.0
+        _deployed_lowt      = 0.0
         log.info(
             "day snapshot: $%.2f  "
             "(main=$%.2f  cascade=$%.2f  peak=$%.2f  tomorrow=$%.2f  econv=$%.2f  hourly=$%.2f)",
@@ -1056,6 +1061,20 @@ def record_econv_deployed(cost: float) -> None:
     _deployed_econv = round(_deployed_econv + cost, 4)
     log.debug("econv deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
               cost, _deployed_econv, get_econv_deployable())
+
+
+def get_lowt_deployable() -> float:
+    """Remaining LOWT budget for today (based on day-open balance, not live balance)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["lowt"], 2)
+    return max(0.0, round(budget - _deployed_lowt, 2))
+
+
+def record_lowt_deployed(cost: float) -> None:
+    """Record capital deployed by the LOWT engine."""
+    global _deployed_lowt
+    _deployed_lowt = round(_deployed_lowt + cost, 4)
+    log.debug("lowt deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_lowt, get_lowt_deployable())
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -1744,10 +1763,9 @@ def check_topups(
         if curr_no > NO_TOPUP_MAX_PRICE or curr_no <= 0.0:
             continue
 
-        # Headroom check — don't exceed the cross-engine total cap.
-        # TOPUP_TOTAL_CAP (9) is intentionally larger than any single engine's
-        # MAX_CONTRACTS so that positions built up across main + cascade + topup
-        # can all receive a top-up without the check silently blocking every time.
+        # Headroom check — don't exceed the global cross-engine total cap.
+        # TOPUP_TOTAL_CAP is aligned with GLOBAL_MAX_CONTRACTS_PER_TICKER (7)
+        # so the topup engine respects the same ceiling as run_pipeline.
         held     = pos.get("contracts", 0)
         headroom = TOPUP_TOTAL_CAP - held
         if headroom <= 0:
@@ -1985,11 +2003,22 @@ def run_pipeline(
 
             # Engine capital check — session-scoped per engine type
             tier = signal.get("entry_tier", "")
-            engine_key = "cascade" if tier.startswith("cascade") else "main"
+            if tier.startswith("cascade"):
+                engine_key = "cascade"
+            elif tier.startswith("lowt"):
+                engine_key = "lowt"
+            else:
+                engine_key = "main"
             if engine_key == "cascade":
                 if get_cascade_deployable() < cost:
                     log.debug("skip %s — cascade session budget exhausted (cost=$%.2f  remaining=$%.2f)",
                               ticker, cost, get_cascade_deployable())
+                    continue
+            elif engine_key == "lowt":
+                if get_lowt_deployable() < cost:
+                    log.debug("skip %s — lowt budget exhausted "
+                              "(cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, get_lowt_deployable())
                     continue
             else:
                 if not cap.can_deploy("main", cost):
@@ -2023,6 +2052,8 @@ def run_pipeline(
                 deployed += cost
                 if engine_key == "cascade":
                     _deployed_cascade += cost
+                elif engine_key == "lowt":
+                    record_lowt_deployed(cost)
                 else:
                     _main_entered.add(ticker)
                 executed += 1
