@@ -931,6 +931,8 @@ SETTLEMENT_HOLD_HOUR    = 15    # local hour (3pm) after which we trust the obse
 _exited_this_session: set[str] = set()
 _topup_done:          set[str] = set()   # tickers already topped up this session
 _yes_peaks:           dict     = {}      # ticker -> max Yes price seen today
+_main_entered:        set[str] = set()   # tickers entered by main engine this session
+                                         # prevents re-entry every poll due to fill latency
 
 # ---------------------------------------------------------------------------
 # Daily capital snapshot
@@ -1923,6 +1925,15 @@ def run_pipeline(
                 log.debug("skip %s — cooldown", ticker)
                 continue
 
+            # Main engine dedup: never re-enter a ticker already entered this
+            # session. Prevents the fill-latency accumulation bug where Kelly
+            # returns max_contracts=1 and the engine fires 1 contract every poll
+            # on the same ticker until Kalshi fills propagate to open_contracts.
+            tier_check = signal.get("entry_tier", "") or "main"
+            if not tier_check.startswith("cascade") and ticker in _main_entered:
+                log.debug("skip %s — already entered this session (main engine)", ticker)
+                continue
+
             # Determine market type for this signal — drives city cap and counter
             is_lowt_signal = signal.get("market_type", "high") == "lowt"
             held_city_map  = held_lowt_per_city if is_lowt_signal else held_high_per_city
@@ -1998,6 +2009,8 @@ def run_pipeline(
                 deployed += cost
                 if engine_key == "cascade":
                     _deployed_cascade += cost
+                else:
+                    _main_entered.add(ticker)
                 executed += 1
                 _append_trade_log({
                     "ticker":       ticker,

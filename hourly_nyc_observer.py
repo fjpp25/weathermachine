@@ -38,17 +38,17 @@ Output
 
 API budget
 ----------
-  Each poll makes: 1 AccuWeather current-conditions call
-                   1 AccuWeather hourly-forecast call (cached 30 min)
-                   1 Kalshi markets call
-  At the default 5-min interval: ~336 AccuWeather calls/day.
-  Requires an AccuWeather plan with ≥ 500 calls/day (Developer or above).
+  Normal polling (5 min): 1 Kalshi call + 1 current-conditions (cached 15 min)
+                           + 1 hourly-forecast (cached 30 min)
+  Burst window (< 15 min to close): interval tightens to 1 min automatically.
+    Current-conditions cache means no extra AccuWeather calls during burst.
+  Estimated AccuWeather usage: ~384 calls/day → ~11,500/month (Starter plan OK).
+  AccuWeather is NOT called when Kalshi returns no open market.
 
 Usage
 -----
-  python hourly_nyc_observer.py                  # poll every 5 min
-  python hourly_nyc_observer.py --poll 2         # poll every 2 min
-  python hourly_nyc_observer.py --poll 1         # poll every 1 min (near close)
+  python hourly_nyc_observer.py       # dynamic interval (5 min normal, 1 min near close)
+  python hourly_nyc_observer.py --poll 2   # override: fixed 2 min interval
 """
 
 from __future__ import annotations
@@ -75,10 +75,13 @@ log = get_logger(__name__)
 
 SERIES_TICKER      = "KXTEMPNYCH"
 NYC_TZ             = ZoneInfo("America/New_York")
-POLL_INTERVAL_SEC  = 5 * 60          # default: 5 minutes
+POLL_INTERVAL_SEC       = 5 * 60   # normal polling interval
+POLL_INTERVAL_BURST_SEC = 1 * 60   # tightened interval when < BURST_WINDOW_MINS to close
+BURST_WINDOW_MINS       = 15       # switch to burst polling this many minutes before close
 KALSHI_API_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
 REQUEST_TIMEOUT    = 10
-HOURLY_CACHE_SECS  = 30 * 60         # re-fetch AccuWeather hourly forecast every 30 min
+HOURLY_CACHE_SECS      = 30 * 60   # re-fetch AccuWeather hourly forecast every 30 min
+CURRENT_COND_CACHE_SECS = 15 * 60  # re-fetch current conditions every 15 min
 
 OUTPUT_JSON = Path("data/hourly_nyc_observations.json")
 OUTPUT_CSV  = Path("data/hourly_nyc_observations.csv")
@@ -115,6 +118,11 @@ CSV_FIELDS = [
 # In-process cache for the hourly forecast: {hour_edt: (fetched_at_utc, temp_f)}
 _hourly_forecast_cache: dict[int, tuple[datetime, Optional[float]]] = {}
 
+# In-process cache for current conditions: (fetched_at_utc, temp_f)
+# Refreshed every CURRENT_COND_CACHE_SECS — temperature moves slowly enough
+# that a 15-minute cache is accurate and saves ~200 AccuWeather calls/day.
+_current_cond_cache: tuple[datetime, Optional[float]] | None = None
+
 
 def _aw_api_key() -> Optional[str]:
     """Reuse the AccuWeather API key from accuweather_feed."""
@@ -141,14 +149,27 @@ def _nyc_location_key() -> Optional[str]:
 
 def fetch_accuweather_current(location_key: str, api_key: str) -> Optional[float]:
     """
-    Fetch the AccuWeather current conditions temperature (°F) for NYC.
+    Fetch the AccuWeather current conditions temperature (°F) for NYC,
+    cached for CURRENT_COND_CACHE_SECS (15 min) to limit API usage.
 
-    This is the data point Kalshi settles against — the reading AccuWeather
-    shows as "current" at the time of market close. Fetching it every poll
-    lets us measure how it moves in the minutes before settlement.
+    Temperature moves slowly enough that a 15-minute cache is accurate
+    for observation purposes while cutting calls from ~288/day to ~96/day.
+    The cache is bypassed on first call and after TTL expiry.
 
-    Returns the temperature in °F, or None on failure.
+    Returns the temperature in °F, or the last cached value on failure.
     """
+    global _current_cond_cache
+    now_utc = datetime.now(timezone.utc)
+
+    # Return cached value if still fresh
+    if _current_cond_cache is not None:
+        fetched_at, cached_val = _current_cond_cache
+        if (now_utc - fetched_at).total_seconds() < CURRENT_COND_CACHE_SECS:
+            log.debug("current-conditions cache hit: %.1f°F (age=%.0fs)",
+                      cached_val or 0,
+                      (now_utc - fetched_at).total_seconds())
+            return cached_val
+
     try:
         resp = requests.get(
             f"{accuweather_feed.BASE_URL}/currentconditions/v1/{location_key}",
@@ -164,9 +185,15 @@ def fetch_accuweather_current(location_key: str, api_key: str) -> Optional[float
                 .get("Imperial", {})
                 .get("Value")
             )
-            return float(temp) if temp is not None else None
+            val = float(temp) if temp is not None else None
+            _current_cond_cache = (now_utc, val)
+            log.info("current-conditions refreshed: %.1f°F", val or 0)
+            return val
     except Exception as e:
         log.warning("accuweather current-conditions failed: %s", e)
+        # Return stale cache on failure rather than None — better than nothing
+        if _current_cond_cache is not None:
+            return _current_cond_cache[1]
     return None
 
 
@@ -506,10 +533,29 @@ def poll_once(
     market_hour, mins_close  = _active_market_hour_and_minutes()
     evt_ticker               = _event_ticker(market_hour)
 
-    log.info("poll  %s  hour=%dam EDT  closes_in=%dmin",
+    log.info("poll  %s  hour=%02d EDT  closes_in=%dmin",
              evt_ticker, market_hour, mins_close)
 
-    # ── AccuWeather ───────────────────────────────────────────────────────
+    # ── Kalshi brackets first — skip AccuWeather entirely if no market ────
+    # Avoids burning AccuWeather calls during the overnight dead zone when
+    # Kalshi hasn't opened the next hour's market yet.
+    brackets = _fetch_brackets(evt_ticker)
+
+    if not brackets:
+        log.warning("no open brackets for %s — skipping AccuWeather", evt_ticker)
+        sentinel = {k: None for k in CSV_FIELDS}
+        sentinel.update({
+            "poll_time_utc":    poll_time,
+            "market_ticker":    evt_ticker,
+            "market_hour_edt":  market_hour,
+            "minutes_to_close": mins_close,
+        })
+        observations.append(sentinel)
+        _append_csv_rows([sentinel])
+        print(f"  {_now_local()}  {evt_ticker}  NO MARKET")
+        return 1
+
+    # ── AccuWeather — only fetched when market exists ─────────────────────
     current_f  = fetch_accuweather_current(location_key, api_key)
     forecast_f = fetch_accuweather_hourly(location_key, api_key, market_hour)
 
@@ -517,26 +563,6 @@ def poll_once(
         f"cur={'?' if current_f is None else f'{current_f:.1f}'}°F  "
         f"fcst_h{market_hour:02d}={'?' if forecast_f is None else f'{forecast_f:.1f}'}°F"
     )
-
-    # ── Kalshi brackets ───────────────────────────────────────────────────
-    brackets = _fetch_brackets(evt_ticker)
-
-    if not brackets:
-        log.warning("no open brackets for %s — market may not exist yet", evt_ticker)
-        # Sentinel row: records that the poll ran but found no market
-        sentinel = {k: None for k in CSV_FIELDS}
-        sentinel.update({
-            "poll_time_utc":    poll_time,
-            "market_ticker":    evt_ticker,
-            "market_hour_edt":  market_hour,
-            "minutes_to_close": mins_close,
-            "accuweather_current_f":  current_f,
-            "accuweather_forecast_f": forecast_f,
-        })
-        observations.append(sentinel)
-        _append_csv_rows([sentinel])
-        print(f"  {_now_local()}  {evt_ticker}  NO MARKET  |  {aw_str}")
-        return 1
 
     # ── Identify the border bracket ───────────────────────────────────────
     # The border bracket is the most contested one — yes_bid closest to 0.50.
@@ -658,20 +684,37 @@ def main(poll_interval_sec: int = POLL_INTERVAL_SEC) -> None:
     log.info("loaded %d existing observations from %s", len(observations), OUTPUT_JSON)
 
     # ── Poll loop ─────────────────────────────────────────────────────────
+    # Interval is dynamic when poll_interval_sec == POLL_INTERVAL_SEC (default):
+    #   normal:       5 min  (>= BURST_WINDOW_MINS minutes to close)
+    #   burst window: 1 min  (< BURST_WINDOW_MINS minutes to close)
+    # A fixed --poll override disables dynamic behaviour entirely.
+    use_dynamic = (poll_interval_sec == POLL_INTERVAL_SEC)
+
     try:
         while True:
-            t0    = time.monotonic()
-            added = poll_once(observations, api_key, location_key)
+            t0 = time.monotonic()
+            _, mins_to_close = _active_market_hour_and_minutes()
 
+            # Dynamic interval: tighten to 1 min in the burst window
+            if use_dynamic:
+                interval = (
+                    POLL_INTERVAL_BURST_SEC
+                    if mins_to_close < BURST_WINDOW_MINS
+                    else POLL_INTERVAL_SEC
+                )
+            else:
+                interval = poll_interval_sec
+
+            added = poll_once(observations, api_key, location_key)
             _save_json(observations)
 
             elapsed = time.monotonic() - t0
-            next_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval_sec)
-            log.info("  +%d rows  (%d total)  %.1fs  next at %s",
-                     added, len(observations), elapsed,
+            next_at = datetime.now(timezone.utc) + timedelta(seconds=interval)
+            log.info("  +%d rows  (%d total)  %.1fs  interval=%dmin  next at %s",
+                     added, len(observations), elapsed, interval // 60,
                      next_at.strftime("%H:%M:%S UTC"))
 
-            time.sleep(poll_interval_sec)
+            time.sleep(max(0, interval - elapsed))
 
     except KeyboardInterrupt:
         _save_json(observations)
@@ -691,9 +734,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--poll",
         type    = int,
-        default = POLL_INTERVAL_SEC // 60,
+        default = None,
         metavar = "MINUTES",
-        help    = f"Poll interval in minutes (default: {POLL_INTERVAL_SEC // 60})",
+        help    = (
+            "Fixed poll interval in minutes. Omit for dynamic mode: "
+            f"{POLL_INTERVAL_SEC//60}min normally, "
+            f"{POLL_INTERVAL_BURST_SEC//60}min when < {BURST_WINDOW_MINS}min to close."
+        ),
     )
     args = parser.parse_args()
 
@@ -709,4 +756,4 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    main(poll_interval_sec=args.poll * 60)
+    main(poll_interval_sec=args.poll * 60 if args.poll else POLL_INTERVAL_SEC)
