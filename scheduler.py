@@ -43,6 +43,7 @@ import evening_convergence
 import nws_feed
 import kalshi_scanner
 import hourly_nyc_engine
+import accuweather_logger
 from cities import TRADING_CITIES as _CITY_REGISTRY
 
 log = get_logger(__name__)
@@ -160,6 +161,7 @@ def run_scheduler(
         t_fetch = time.monotonic()
         try:
             _nws    = nws_feed.snapshot(city_filter)
+            accuweather_logger.log_snapshot(city_filter)
             _k_high = kalshi_scanner.scan_all(city_filter, market_type="high",
                                                max_workers=2)
             time.sleep(1.0)   # pause between HIGH and LOWT scans to avoid 429s
