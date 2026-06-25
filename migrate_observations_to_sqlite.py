@@ -59,6 +59,7 @@ COLUMNS = [
     ("spread",             "REAL"),
     ("volume",             "REAL"),
     ("open_interest",      "REAL"),
+    ("current_temp_f",     "REAL"),
 ]
 COL_NAMES = [c[0] for c in COLUMNS]
 BATCH = 50_000

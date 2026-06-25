@@ -40,6 +40,7 @@ CSV_FIELDS = [
     "forecast_issued_at", "hazards",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
+    "current_temp_f",
 ]
 
 
