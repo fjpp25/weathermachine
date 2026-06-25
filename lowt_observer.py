@@ -64,7 +64,7 @@ OUTPUT_DB   = Path("data/observations.db")
 #   False → DB only (the destination state). The giant JSON/CSV rewrites stop;
 #           the evaluation CSV is then produced from the DB by export_csv.py.
 # Flip to False once parity is confirmed.
-DUAL_WRITE = True
+DUAL_WRITE = False
 
 # Column order for the SQLite table — matches migrate_observations_to_sqlite.py.
 # current_temp_f is included (the live writer collects it; the old CSV_FIELDS
