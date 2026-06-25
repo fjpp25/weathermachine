@@ -35,6 +35,7 @@ analysis time to stratify forecast error by forecast freshness.
 import json
 import time
 import csv
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -55,6 +56,28 @@ POLL_INTERVAL_SECS = 15 * 60   # 15 minutes
 
 OUTPUT_JSON = Path("data/lowt_observations.json")
 OUTPUT_CSV  = Path("data/lowt_observations.csv")
+OUTPUT_DB   = Path("data/observations.db")
+
+# Dual-write safety flag.
+#   True  → write new rows to the DB AND keep rewriting the old JSON/CSV, so the
+#           two can be compared for parity during cutover validation.
+#   False → DB only (the destination state). The giant JSON/CSV rewrites stop;
+#           the evaluation CSV is then produced from the DB by export_csv.py.
+# Flip to False once parity is confirmed.
+DUAL_WRITE = True
+
+# Column order for the SQLite table — matches migrate_observations_to_sqlite.py.
+# current_temp_f is included (the live writer collects it; the old CSV_FIELDS
+# dropped it, which also broke the dashboard's d.get("current_temp_f")).
+DB_COLUMNS = [
+    "poll_time_utc", "city", "market_type", "local_time", "local_hour",
+    "observed_high_f", "forecast_high_f",
+    "observed_low_f",  "forecast_low_f",
+    "forecast_issued_at", "hazards",
+    "ticker", "bracket", "yes_price", "no_price",
+    "spread", "volume", "open_interest",
+    "current_temp_f",
+]
 
 CSV_FIELDS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
@@ -63,6 +86,7 @@ CSV_FIELDS = [
     "forecast_issued_at", "hazards",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
+    "current_temp_f",
 ]
 
 # ---------------------------------------------------------------------------
@@ -186,7 +210,16 @@ def _is_converged(brackets: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 def load_observations() -> list[dict]:
-    """Load observations from disk, normalising any v1 rows to v2 schema."""
+    """
+    Load observations into memory.
+
+    Only needed while DUAL_WRITE is on (the JSON/CSV rewrite needs full history
+    in memory). Once DB-only, poll_once just appends to the DB and never reads
+    history, so we start empty — avoiding the multi-GB JSON deserialize on every
+    startup. (poll_once only appends to this list; it never reads it.)
+    """
+    if not DUAL_WRITE:
+        return []
     if OUTPUT_JSON.exists():
         try:
             raw = json.loads(OUTPUT_JSON.read_text())
@@ -196,13 +229,82 @@ def load_observations() -> list[dict]:
     return []
 
 
-def save_observations(obs: list[dict]):
-    OUTPUT_JSON.parent.mkdir(exist_ok=True)
-    OUTPUT_JSON.write_text(json.dumps(obs, indent=2))
-    with open(OUTPUT_CSV, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(obs)
+def _hazards_to_str(h) -> str:
+    """Serialize hazards as a pipe-joined, comma-free string (CSV/DB-safe)."""
+    if h is None or h == "":
+        return ""
+    if isinstance(h, (list, tuple)):
+        return "|".join(str(x) for x in h)
+    return str(h)
+
+
+def _ensure_db():
+    """Create the observations table if the DB doesn't have it yet."""
+    OUTPUT_DB.parent.mkdir(exist_ok=True)
+    con = sqlite3.connect(OUTPUT_DB)
+    cols_ddl = ", ".join(f"{c} {'REAL' if c in _REAL_COLS else 'TEXT'}"
+                         for c in DB_COLUMNS)
+    con.execute(f"CREATE TABLE IF NOT EXISTS observations ({cols_ddl})")
+    con.commit()
+    return con
+
+
+_REAL_COLS = {
+    "local_hour", "observed_high_f", "forecast_high_f",
+    "observed_low_f", "forecast_low_f",
+    "yes_price", "no_price", "spread", "volume", "open_interest",
+    "current_temp_f",
+}
+
+
+def _row_to_db_tuple(row: dict) -> tuple:
+    """Build an insert tuple in DB_COLUMNS order, hazards pipe-joined."""
+    out = []
+    for c in DB_COLUMNS:
+        if c == "hazards":
+            out.append(_hazards_to_str(row.get("hazards")))
+        else:
+            out.append(row.get(c))
+    return tuple(out)
+
+
+def append_observations_to_db(new_rows: list[dict]) -> int:
+    """INSERT this poll's new rows into the DB. Cheap: no rewrite of history."""
+    if not new_rows:
+        return 0
+    con = _ensure_db()
+    placeholders = ", ".join(["?"] * len(DB_COLUMNS))
+    sql = (f"INSERT INTO observations ({', '.join(DB_COLUMNS)}) "
+           f"VALUES ({placeholders})")
+    con.executemany(sql, [_row_to_db_tuple(r) for r in new_rows])
+    con.commit()
+    con.close()
+    return len(new_rows)
+
+
+def save_observations(obs: list[dict], added: int = 0):
+    """
+    Persist observations.
+
+    New permanent path: append only this poll's `added` new rows (the last
+    `added` entries of `obs`) to the SQLite DB — no full-history rewrite.
+
+    During DUAL_WRITE, ALSO rewrite the old JSON + CSV in full, so the DB can
+    be compared against them for parity. Once parity is confirmed, set
+    DUAL_WRITE = False and the giant rewrites stop; the evaluation CSV is then
+    produced from the DB by export_csv.py.
+    """
+    new_rows = obs[-added:] if added > 0 else []
+    append_observations_to_db(new_rows)
+
+    if DUAL_WRITE:
+        OUTPUT_JSON.parent.mkdir(exist_ok=True)
+        OUTPUT_JSON.write_text(json.dumps(obs, indent=2))
+        with open(OUTPUT_CSV, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS,
+                                    extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(obs)
 
 
 def poll_once(observations: list[dict]) -> int:
@@ -447,7 +549,7 @@ def main():
     try:
         while True:
             added = poll_once(observations)
-            save_observations(observations)
+            save_observations(observations, added)
             print(f"  Saved {added} new rows ({len(observations)} total). "
                   f"Next poll in {POLL_INTERVAL_SECS // 60} min.")
             time.sleep(POLL_INTERVAL_SECS)
