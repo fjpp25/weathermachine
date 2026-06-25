@@ -25,10 +25,14 @@ Then eyeball the clean file, diff row counts, and only then replace the live CSV
 """
 import argparse
 import csv
-import ijson  # streaming JSON parser — avoids loading 1.1GB into RAM
 import json
 import sys
 from pathlib import Path
+
+try:
+    import ijson  # streaming JSON parser — avoids loading 1.1GB into RAM
+except ImportError:
+    ijson = None
 
 CSV_FIELDS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
@@ -70,6 +74,10 @@ def main():
 
     if not Path(args.json).exists():
         sys.exit(f"JSON not found: {args.json}")
+
+    if ijson is None and not args.no_stream:
+        sys.exit("ijson not installed. Either `pip3 install ijson`, or re-run "
+                 "with --no-stream to load the file with plain json.")
 
     n = 0
     multi_hazard = 0
