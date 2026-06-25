@@ -226,16 +226,33 @@ def _chunks(seq, size):
         yield seq[i:i + size]
 
 
-def _load_dotenv():
+def _load_credentials():
     """
-    Load .env into os.environ, mirroring trader.py's own loader exactly
-    (simple KEY=VALUE lines, '#' comments, setdefault so real env wins).
+    Populate os.environ with Kalshi credentials, mirroring scheduler.py's
+    own loading order EXACTLY:
 
-    trader.py only runs this inside its __main__ block, so importing it and
-    calling make_client() does NOT pick up .env on its own — we must do it here.
+      1. data/config.json  (keys: key_id, key_file, live_mode)  -- primary
+      2. .env fallback     (KEY=VALUE lines)                    -- only if no config.json
+
+    This is how the live system actually loads creds. There is no .env on the
+    Pi; the credentials live in data/config.json. live_mode=true maps to
+    KALSHI_DEMO=false (real prod endpoint).
     """
     import os
     from pathlib import Path
+    config_file = Path("data/config.json")
+    if config_file.exists():
+        try:
+            config = json.loads(config_file.read_text())
+            if config.get("key_id"):
+                os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
+            if config.get("key_file"):
+                os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
+            os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+            return
+        except Exception as e:   # noqa: BLE001
+            print(f"  warning: could not parse data/config.json ({e}); "
+                  "trying .env")
     env_file = Path(".env")
     if env_file.exists():
         for line in env_file.read_text().splitlines():
@@ -262,7 +279,7 @@ def fetch_resolutions_from_kalshi(tickers, out_path=None, batch_size=100):
             "pre-built resolutions file instead of --fetch."
         )
 
-    _load_dotenv()   # trader.py only loads .env in its __main__ block
+    _load_credentials()   # config.json first, then .env — matches scheduler.py
     client = trader.make_client(skip_confirmation=True)
     uniq = sorted(set(tickers))
     print(f"Fetching results for {len(uniq)} unique tickers from Kalshi "
