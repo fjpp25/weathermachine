@@ -777,7 +777,11 @@ def api_status():
     engines = {}
     available = 0.0
     try:
-        cap = trader.get_engine_capital()
+        # Pass the client so the EngineCapital singleton refreshes its balance
+        # against the live account. Without a client it defaults to $0 balance
+        # -> all budgets $0 -> the capital strip shows empty. get_engine_capital
+        # preserves per-engine _deployed while recomputing budgets.
+        cap = trader.get_engine_capital(client=get_client())
         for e in trader.ENGINE_ALLOCATIONS:
             rem = round(cap.remaining(e), 2)
             bud = round(cap.budget(e), 2)
