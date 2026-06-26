@@ -934,7 +934,7 @@ def api_performance():
 # ---------------------------------------------------------------------------
 @app.route("/api/city/<path:city>")
 def api_city(city: str):
-    enriched,_ = get_settlements(); trades = _load_trade_log()
+    enriched, fills_by_ticker = get_settlements(); trades = _load_trade_log()
     bias_data: dict = {}
     try:
         if BIAS_FILE.exists():
@@ -975,7 +975,12 @@ def api_city(city: str):
     for t in sorted(trades, key=lambda x: x.get("placed_at","") or ""):
         if t.get("city")!=city: continue
         tk=t.get("ticker","")
-        if tk not in etickers and tk not in seen:
+        # An entry only counts as a live open position if it actually filled.
+        # Placed-but-never-filled orders (price moved, order left hanging) get
+        # written to trade_log.json but have no fill and no held settlement —
+        # they must NOT render as perpetual OPEN. A genuinely-open position has
+        # a fill but no settlement yet, so the fills check keeps those.
+        if tk not in etickers and tk not in seen and fills_by_ticker.get(tk):
             seen.add(tk); open_trades.append({**t,"_src":"open"})
 
     all_items=sorted(enriched_city+open_trades,
@@ -1251,7 +1256,8 @@ button,select,input{font-family:var(--f)}
 
 /* ── Tab bar ── */
 #tabbar{height:var(--tab);background:var(--panel);border-bottom:1px solid var(--bdr);
-  display:flex;align-items:stretch;padding:0 8px;flex-shrink:0;overflow-x:auto}
+  display:flex;align-items:stretch;padding:0 8px;flex-shrink:0;overflow-x:auto;
+  position:sticky;top:var(--hdr);z-index:198}
 .tb{padding:0 16px;font-size:11px;letter-spacing:1px;color:var(--sec);background:none;
   border:none;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;
   transition:color .15s,border-color .15s}
@@ -1270,7 +1276,8 @@ button,select,input{font-family:var(--f)}
 
 /* ── Balance bar ── */
 #bal-bar{display:flex;gap:24px;padding:14px 20px;background:var(--panel);
-  border-bottom:1px solid var(--bdr);flex-wrap:wrap;flex-shrink:0}
+  border-bottom:1px solid var(--bdr);flex-wrap:wrap;flex-shrink:0;
+  position:sticky;top:var(--hdr);z-index:199}
 .bal-item{}
 .bal-k{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:3px}
 .bal-v{font-size:16px;font-weight:600;color:var(--pri)}
@@ -1588,7 +1595,22 @@ const _mapObs = new ResizeObserver(() => loadCities());
 document.addEventListener('DOMContentLoaded', () => {
   const svgEl = document.getElementById('us-svg');
   if (svgEl) _mapObs.observe(svgEl);
+  syncStickyOffsets();
 });
+
+// The balance bar wraps to two rows on narrow/mobile screens, so its height
+// isn't fixed. Measure the real rendered heights of the header + balance bar
+// and pin the tab bar directly beneath them. Re-run on resize because that's
+// exactly when the balance bar wraps/unwraps.
+function syncStickyOffsets() {
+  const hdr = document.getElementById('hdr');
+  const bal = document.getElementById('bal-bar');
+  const tab = document.getElementById('tabbar');
+  if (!hdr || !bal || !tab) return;
+  const offset = hdr.offsetHeight + bal.offsetHeight;
+  tab.style.top = offset + 'px';
+}
+window.addEventListener('resize', syncStickyOffsets);
 
 function refreshAll() {
   setStatus('Refreshing...');
@@ -1643,6 +1665,9 @@ async function loadStatus() {
         pendWrap.style.display = 'none';
       }
     }
+    // The Pending field appearing/disappearing can change the balance bar's
+    // height (it may wrap to a new row), so re-pin the tab bar beneath it.
+    syncStickyOffsets();
     const mb = document.getElementById('mode-badge');
     mb.textContent  = d.mode;
     mb.className    = 'mode-badge' + (d.mode === 'LIVE' ? ' live' : '');
