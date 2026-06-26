@@ -1339,6 +1339,12 @@ td.center{text-align:center}
   border-bottom:2px solid transparent;cursor:pointer;letter-spacing:.5px;transition:color .15s}
 .stb:hover{color:var(--pri)}.stb.on{color:var(--ac);border-bottom-color:var(--ac)}
 .sp{display:none}.sp.on{display:block}
+/* city-modal tabs — scoped variant of .stb/.sp, mirrors the same look */
+.stb-row{display:flex;gap:4px;border-bottom:1px solid #252d42}
+.mtb{padding:8px 16px;font-size:11px;color:var(--sec);background:none;border:none;
+  border-bottom:2px solid transparent;cursor:pointer;letter-spacing:.5px;transition:color .15s}
+.mtb:hover{color:var(--pri)}.mtb.on{color:var(--ac);border-bottom-color:var(--ac)}
+.msp{display:none}.msp.on{display:block}
 
 /* ── Buttons ── */
 .btn{padding:6px 14px;border-radius:var(--r);border:1px solid var(--bdr);background:none;
@@ -1527,6 +1533,7 @@ td.center{text-align:center}
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let _sessData = [];
+let _citiesData = {};   // {city: row} from /api/cities — reused by the city modal
 let _sessFilt = 'all';
 let _autoRefresh;
 let _cdSecs = 60;
@@ -1712,6 +1719,7 @@ async function loadCities() {
 
     for (const d of cities) {
       const city = d.city;
+      _citiesData[city] = d;   // stash for the city modal's Weather tab
       const ll   = CITY_LL[city];
       if (!ll || !_mapProj) continue;
 
@@ -2023,16 +2031,69 @@ function _buildChart(id, data, label, color, fill) {
 }
 
 // ── City modal ─────────────────────────────────────────────────────────────
+// Scoped tab switcher for the city modal. Kept separate from switchSess/
+// switchPerf/switchHourly so the page-level `.stb`/`.sp` queries can never
+// touch the modal's tabs (and vice versa) — all selectors are scoped to
+// #modal-content.
+function switchCityTab(id, btn) {
+  const root = document.getElementById('modal-content');
+  if (!root) return;
+  root.querySelectorAll('.mtb').forEach(b => b.classList.remove('on'));
+  root.querySelectorAll('.msp').forEach(s => s.classList.remove('on'));
+  btn.classList.add('on');
+  const pane = document.getElementById('msp-' + id);
+  if (pane) pane.classList.add('on');
+}
+
+function _cityWeatherHTML(city) {
+  // Reuse the live snapshot already fetched by loadCities() — no extra round
+  // trip, and the numbers stay identical to the chip the user just tapped.
+  const w = _citiesData[city];
+  const f1 = v => (v != null ? Number(v).toFixed(1) + '°F' : '—');
+  if (!w) {
+    return '<div class="empty">No live weather snapshot yet — '
+         + 'the map is still loading. Try again in a moment.</div>';
+  }
+  const cells = [
+    ['Now',          f1(w.now)],
+    ['Observed High', f1(w.obs_hi)],
+    ['Observed Low',  f1(w.obs_lo)],
+    ['Forecast High', f1(w.fcst_hi)],
+    ['Forecast Low',  f1(w.fcst_lo)],
+    ['Local Time',   (w.local_time || '—') + (w.tz_abbr ? ' ' + w.tz_abbr : '')],
+  ];
+  return `<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:4px">
+    ${cells.map(([k,v]) =>
+      `<div class="stat-card"><div class="stat-k">${k}</div>`
+      + `<div class="stat-v" style="font-size:18px">${v}</div></div>`).join('')}
+  </div>
+  <div style="font-size:10px;color:var(--sec);margin-top:10px">
+    Window: ${w.window || '—'} · snapshot shared with map markers</div>`;
+}
+
 async function openCityModal(city) {
   document.getElementById('modal-bg').classList.add('on');
-  document.getElementById('modal-content').innerHTML =
-    '<div style="text-align:center;padding:24px"><span class="spin"></span> Loading ' + city + '...</div>';
+  const mc = document.getElementById('modal-content');
+
+  // Header + tab bar render immediately; Weather tab is instant (stashed
+  // snapshot), History tab fills in once /api/city returns.
+  mc.innerHTML =
+    `<h2 style="color:var(--ac);font-size:16px;font-weight:700;margin-bottom:12px">⛅ ${city}</h2>
+     <div class="stb-row" style="margin-bottom:14px">
+       <button class="mtb on" onclick="switchCityTab('weather',this)">Weather</button>
+       <button class="mtb" onclick="switchCityTab('history',this)">Trade History</button>
+     </div>
+     <div class="msp on" id="msp-weather">${_cityWeatherHTML(city)}</div>
+     <div class="msp" id="msp-history">
+       <div style="text-align:center;padding:24px">
+         <span class="spin"></span> Loading history...</div>
+     </div>`;
+
   try {
     const d = await fetch('/api/city/' + encodeURIComponent(city)).then(r => r.json());
     const s = d.stats || {};
     const pos = d.positions || [];
-    let html = `<h2 style="color:var(--ac);font-size:16px;font-weight:700;margin-bottom:16px">⛅ ${city}</h2>`;
-    html += `<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
+    let html = `<div class="stat-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px">
       ${[['Win Rate',fmtPct(s.win_rate),''],['Net PnL',fmt$(s.total_pnl),s.total_pnl>=0?'g':'r'],
          ['Positions',s.positions,''],['Avg Conv',s.avg_conv,''],['Bias',s.bias,''],['Obs Hi',s.obs_hi,'']]
         .map(([k,v,c])=>`<div class="stat-card"><div class="stat-k">${k}</div><div class="stat-v ${c}" style="font-size:16px">${v}</div></div>`).join('')}
@@ -2054,9 +2115,13 @@ async function openCityModal(city) {
     } else {
       html += '<div class="empty">No position history for this city</div>';
     }
-    document.getElementById('modal-content').innerHTML = html;
+    // Only replace the history pane — leave the Weather tab (and which tab is
+    // currently selected) untouched.
+    const hist = document.getElementById('msp-history');
+    if (hist) hist.innerHTML = html;
   } catch(e) {
-    document.getElementById('modal-content').innerHTML = '<div class="empty">Failed to load city data</div>';
+    const hist = document.getElementById('msp-history');
+    if (hist) hist.innerHTML = '<div class="empty">Failed to load trade history</div>';
   }
 }
 
