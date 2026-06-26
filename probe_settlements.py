@@ -6,20 +6,25 @@ Diagnostic for the "position shows OPEN even though it settled days ago" bug.
 Run from the project root on the Pi:
     python3 probe_settlements.py
 
-It pulls the FULL settlements list from Kalshi (no 15-page cap), reports
-the total record count, and checks whether the dashboard's current
-15-page (3,000-record) cap is dropping older settlements.
+Builds its own Kalshi client via trader.make_client() — no Flask / dashboard
+dependency. Pulls the FULL settlements list (no 15-page cap), reports the
+total record count, and checks whether the dashboard's current 15-page
+(3,000-record) cap is dropping older settlements.
 """
 
 import sys
 sys.path.insert(0, ".")
 
-import dashboard   # reuse the dashboard's client + config loader
+from market_utils import load_config_env
+import trader
 
-c = dashboard.get_client()
+load_config_env()
+c = trader.make_client(skip_confirmation=True)
 if not c:
-    print("No client — check config.json")
+    print("No client — check data/config.json")
     sys.exit(1)
+
+print("client ready (%s)" % ("LIVE" if not c.demo else "DEMO"))
 
 all_s, cursor, pages = [], None, 0
 while True:
@@ -46,7 +51,7 @@ print(f"KX HIGH/LOWT temp settlements: {len(temp)}")
 
 print("Dashboard currently caps at 15 pages = 3000 records.")
 print(f"  -> hitting cap? "
-      f"{'YES — older settlements DROPPED' if len(all_s) > 3000 else 'no'}")
+      f"{'YES - older settlements DROPPED' if len(all_s) > 3000 else 'no'}")
 
 dates = sorted(s.get("settled_time", "")[:10] for s in temp if s.get("settled_time"))
 if dates:
