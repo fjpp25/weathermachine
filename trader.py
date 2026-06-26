@@ -1369,8 +1369,10 @@ def manage_open_orders(
         order_id = order.get("order_id", "")
         ticker   = order.get("ticker", "")
 
-        # ── Contract count — handle both v1 and v2 field names ───────────
-        resting = (order.get("remaining_count")
+        # ── Contract count — v2 field is remaining_count_fp (a string like
+        #    "3.00"); older names kept as fallback. Always float() first. ──
+        resting = (order.get("remaining_count_fp")
+                   or order.get("remaining_count")
                    or order.get("resting_contracts_count")
                    or order.get("count")
                    or 0)
@@ -1404,16 +1406,24 @@ def manage_open_orders(
                 continue
 
         if not current_no or current_no <= 0:
+            log.debug("manage_open_orders: %s — no usable price "
+                      "(snapshot miss + fallback=%.2f), skipping",
+                      ticker, current_no or 0.0)
             continue
 
-        # ── Order's placed NO price (v2: YES price string → convert) ─────
-        if order.get("price") is not None:
+        # ── Order's placed NO price ──────────────────────────────────────
+        # v2 stores the order's NO price as no_price_dollars (string "0.9200").
+        # Older paths: price (YES, fraction) or no_price (cents or fraction).
+        if order.get("no_price_dollars") is not None:
+            order_no_price = round(float(order["no_price_dollars"]), 4)
+        elif order.get("price") is not None:
             order_no_price = round(1.0 - float(order["price"]), 4)
         elif order.get("no_price") is not None:
             raw = float(order["no_price"])
             order_no_price = raw / 100 if raw > 1 else raw
         else:
-            raw = float(order.get("yes_price", 0) or 0)
+            raw = float(order.get("yes_price_dollars",
+                                  order.get("yes_price", 0)) or 0)
             yes_p = raw / 100 if raw > 1 else raw
             order_no_price = round(1.0 - yes_p, 4)
 
@@ -1931,8 +1941,9 @@ def run_pipeline(
             for o in resting:
                 t = o.get("ticker", "")
                 if not t: continue
-                n = int(o.get("remaining_count") or
-                        o.get("resting_contracts_count") or 0)
+                n = int(float(o.get("remaining_count_fp") or
+                              o.get("remaining_count") or
+                              o.get("resting_contracts_count") or 0))
                 if n > 0:
                     open_contracts[t] = open_contracts.get(t, 0) + n
         except Exception as e:
