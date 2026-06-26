@@ -1231,6 +1231,9 @@ _HTML = r"""<!DOCTYPE html>
   --red:#ff4d6a;--red2:rgba(255,77,106,.12);
   --yel:#f5c518;--yel2:rgba(245,197,24,.12);
   --blu:#4d9fff;
+  /* per-engine colors — shared by Session badges and the capital strip */
+  --eng-sweep:#ff9f43;--eng-peak:#22d3ee;--eng-topup:#c084fc;
+  --eng-econv:#f472b6;--eng-hourly:#2dd4bf;--eng-lowt:#fbbf24;
   --pri:#dde2ee;--sec:#5a6278;--ter:#3a3f52;
   --bdr:#1e2230;--bdr2:#252a3a;
   --f:'JetBrains Mono','Consolas',monospace;
@@ -1336,6 +1339,28 @@ td.center{text-align:center}
 .eng.cascade{color:var(--blu);border-color:#2a4a88}
 .eng.near_cap{color:var(--yel);border-color:#7a6200}
 .eng.tomorrow{color:#c084fc;border-color:#6b21a8}
+.eng.sweep{color:var(--eng-sweep);border-color:#8a5418}
+.eng.peak{color:var(--eng-peak);border-color:#0e6b7a}
+.eng.topup{color:var(--eng-topup);border-color:#6b21a8}
+.eng.econv{color:var(--eng-econv);border-color:#8a2c5e}
+.eng.hourly{color:var(--eng-hourly);border-color:#13705f}
+.eng.lowt{color:var(--eng-lowt);border-color:#8a6510}
+/* ── Capital strip (per-engine remaining budget) ── */
+#cap-strip{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.cap-eng{display:flex;align-items:center;gap:3px;font-size:11px;white-space:nowrap}
+.cap-let{display:inline-flex;align-items:center;justify-content:center;
+  width:16px;height:16px;border-radius:3px;border:1px solid;font-size:9px;
+  font-weight:700;line-height:1}
+.cap-amt{color:var(--pri);font-variant-numeric:tabular-nums}
+.cap-eng.exhausted .cap-amt{color:var(--sec)}
+.cap-let.main{color:var(--ac);border-color:var(--acd)}
+.cap-let.cascade{color:var(--blu);border-color:#2a4a88}
+.cap-let.sweep{color:var(--eng-sweep);border-color:#8a5418}
+.cap-let.peak{color:var(--eng-peak);border-color:#0e6b7a}
+.cap-let.topup{color:var(--eng-topup);border-color:#6b21a8}
+.cap-let.econv{color:var(--eng-econv);border-color:#8a2c5e}
+.cap-let.hourly{color:var(--eng-hourly);border-color:#13705f}
+.cap-let.lowt{color:var(--eng-lowt);border-color:#8a6510}
 .side-no{color:var(--ac)}.side-yes{color:var(--yel)}
 .pnl-pos{color:var(--ac)}.pnl-neg{color:var(--red)}
 .status-live{color:var(--ac)}.status-settled{color:var(--sec)}
@@ -1417,7 +1442,7 @@ td.center{text-align:center}
 <!-- Balance bar -->
 <div id="bal-bar">
   <div class="bal-item"><div class="bal-k">Balance</div><div class="bal-v" id="b-bal">—</div></div>
-  <div class="bal-item"><div class="bal-k">Available</div><div class="bal-v" id="b-dep">—</div></div>
+  <div class="bal-item" style="flex:1 1 auto;min-width:0"><div class="bal-k">Available · per engine</div><div id="cap-strip" style="margin-top:3px"></div></div>
   <div class="bal-item"><div class="bal-k">Portfolio</div><div class="bal-v" id="b-prt">—</div></div>
   <div class="bal-item"><div class="bal-k">Unrealised</div><div class="bal-v" id="b-unr">—</div></div>
   <div class="bal-item"><div class="bal-k">Open</div><div class="bal-v" id="b-open">—</div></div>
@@ -1553,8 +1578,26 @@ let _charts = {};
 const fmt$ = v => v == null ? '—' : '$' + v.toFixed(2);
 const fmtPct = v => v == null ? '—' : v.toFixed(1) + '%';
 const clsPnl = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
-const clsEng = e => ({'MAIN':'main','CASCADE':'cascade','NEAR_CAP':'near_cap',
-  'TOMORROW_DISMISSED':'tomorrow'}[e?.toUpperCase()] ?? 'main');
+// Canonicalize any raw engine/tier string to one of the known engine classes.
+// Tier strings in the trade log are messy (cascade_afternoon, tomorrow_sweep,
+// lowt_main, hourly_nyc...), so we resolve by substring priority. Shared by
+// the Session-tab badges and the capital strip so both always agree.
+const _engCanon = e => {
+  const s = (e || '').toLowerCase();
+  if (s.includes('cascade'))   return 'cascade';
+  if (s.includes('sweep') || s.includes('tomorrow')) return 'sweep';
+  if (s.includes('peak'))      return 'peak';
+  if (s.includes('topup'))     return 'topup';
+  if (s.includes('econv'))     return 'econv';
+  if (s.includes('hourly'))    return 'hourly';
+  if (s.includes('lowt'))      return 'lowt';
+  if (s.includes('near_cap'))  return 'near_cap';
+  return 'main';
+};
+const clsEng = e => _engCanon(e);
+// Single-letter labels for the compact capital strip / badges.
+const engLetter = e => ({main:'M', near_cap:'N', cascade:'C', sweep:'S',
+  peak:'P', topup:'T', econv:'E', hourly:'H', lowt:'L'}[_engCanon(e)] ?? 'M');
 
 // ── Tab switching ──────────────────────────────────────────────────────────
 function switchTab(id, btn) {
@@ -1627,11 +1670,39 @@ function setStatus(msg, polling=false) {
 }
 
 // ── Status / balance ───────────────────────────────────────────────────────
+// Render the per-engine capital strip in the balance bar. Fixed canonical
+// order (object key order isn't guaranteed). Each engine: colored letter
+// badge + remaining $. near_cap is intentionally absent — it's a state of
+// the main engine, not a separately-budgeted line.
+const _CAP_ORDER = ['main','cascade','sweep','peak','topup','econv','hourly','lowt'];
+function renderCapStrip(engines) {
+  const strip = document.getElementById('cap-strip');
+  if (!strip) return;
+  const parts = [];
+  for (const e of _CAP_ORDER) {
+    const info = engines[e];
+    if (!info) continue;                       // engine not present in payload
+    const rem = Number(info.remaining ?? 0);
+    const exhausted = rem <= 0.005 ? ' exhausted' : '';
+    parts.push(
+      `<span class="cap-eng${exhausted}" title="${e}: $${rem.toFixed(2)} of `
+      + `$${Number(info.budget ?? 0).toFixed(2)}">`
+      + `<span class="cap-let ${e}">${engLetter(e)}</span>`
+      + `<span class="cap-amt">$${rem.toFixed(2)}</span></span>`
+    );
+  }
+  strip.innerHTML = parts.length
+    ? parts.join('')
+    : '<span style="color:var(--sec);font-size:11px">—</span>';
+  // Strip height can change the balance bar height (wrapping) — re-pin tab bar.
+  if (typeof syncStickyOffsets === 'function') syncStickyOffsets();
+}
+
 async function loadStatus() {
   try {
     const d = await fetch('/api/status').then(r => r.json());
     document.getElementById('b-bal').textContent  = fmt$(d.balance);
-    document.getElementById('b-dep').textContent  = fmt$(d.available ?? 0);
+    renderCapStrip(d.engines || {});
     document.getElementById('b-prt').textContent  = fmt$(d.portfolio);
     // Engine budget cards
     const eg = document.getElementById('eng-grid');
