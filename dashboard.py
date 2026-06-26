@@ -1363,6 +1363,8 @@ td.center{text-align:center}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-bottom:20px}
 .stat-card{background:var(--panel);border:1px solid var(--bdr);border-radius:var(--r2);padding:14px 16px}
 .stat-k{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
+/* Weather-tab label override — larger + bold for readability (city modal only) */
+.stat-k-wx{font-size:12px;font-weight:700;letter-spacing:1.5px;color:#a8c4e0}
 .stat-v{font-size:22px;font-weight:600}
 
 /* ── City modal ── */
@@ -2064,7 +2066,7 @@ function _cityWeatherHTML(city) {
   ];
   return `<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:4px">
     ${cells.map(([k,v]) =>
-      `<div class="stat-card"><div class="stat-k">${k}</div>`
+      `<div class="stat-card"><div class="stat-k stat-k-wx">${k}</div>`
       + `<div class="stat-v" style="font-size:18px">${v}</div></div>`).join('')}
   </div>
   <div style="font-size:10px;color:var(--sec);margin-top:10px">
