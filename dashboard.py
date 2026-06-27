@@ -1370,6 +1370,9 @@ tbody tr.total-row td{background:var(--bg);color:var(--sec);font-weight:600}
 tbody tr.total-row td.qty-total{color:var(--ac)}
 td.center{text-align:center}
 .eng{font-size:10px;padding:2px 6px;border-radius:3px;border:1px solid;font-weight:600;letter-spacing:.5px}
+.mtype{font-size:10px;padding:2px 6px;border-radius:3px;border:1px solid;font-weight:600;letter-spacing:.5px}
+.mtype.high{color:var(--yel);border-color:#7a6200}
+.mtype.low{color:var(--blu);border-color:#2a4a88}
 .eng.main{color:var(--ac);border-color:var(--acd)}
 .eng.cascade{color:var(--blu);border-color:#2a4a88}
 .eng.near_cap{color:var(--yel);border-color:#7a6200}
@@ -1613,6 +1616,18 @@ let _charts = {};
 const fmt$ = v => v == null ? '—' : '$' + v.toFixed(2);
 const fmtPct = v => v == null ? '—' : v.toFixed(1) + '%';
 const clsPnl = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+// Market-type badge: HIGH (orange) / LOW (blue). Derives from an explicit
+// market_type field when present, else from the ticker (HIGH markets contain
+// "HIGH"; everything else is treated as LOW). Single source for both tables.
+function mtypeBadge(row) {
+  let t = (row && row.market_type) ? String(row.market_type).toUpperCase() : '';
+  if (!t) {
+    const tk = (row && row.ticker) ? String(row.ticker).toUpperCase() : '';
+    t = tk.includes('HIGH') ? 'HIGH' : 'LOW';
+  }
+  const isHigh = t === 'HIGH';
+  return `<span class="mtype ${isHigh ? 'high' : 'low'}">${isHigh ? 'HIGH' : 'LOW'}</span>`;
+}
 // Canonicalize any raw engine/tier string to one of the known engine classes.
 // Tier strings in the trade log are messy (cascade_afternoon, tomorrow_sweep,
 // lowt_main, hourly_nyc...), so we resolve by substring priority. Shared by
@@ -1909,7 +1924,7 @@ async function loadPending() {
     sec.style.display = '';
     const totalCost = rows.reduce((s, r) => s + (r.cost_total || 0), 0);
     let html = `<div class="tbl-wrap"><table><thead><tr>
-      <th>Market</th><th>Bracket</th><th>Side</th><th>Qty</th>
+      <th>Market</th><th>Type</th><th>Bracket</th><th>Side</th><th>Qty</th>
       <th>Entry</th><th>At Risk</th><th>Est. Settlement</th><th>Result</th>
     </tr></thead><tbody>`;
     for (const r of rows) {
@@ -1923,6 +1938,7 @@ async function loadPending() {
         : `<span style="color:var(--yel)">${r.outcome}</span>`;
       html += `<tr style="color:var(--sec)">
         <td>${r.market || r.ticker}</td>
+        <td>${mtypeBadge(r)}</td>
         <td>${r.bracket || '—'}</td>
         <td class="center"><span class="${r.side==='NO'?'side-no':'side-yes'}">${r.side}</span></td>
         <td class="center">${r.contracts}</td>
@@ -1934,7 +1950,7 @@ async function loadPending() {
     }
     // Total row
     html += `<tr class="total-row">
-      <td colspan="4"></td>
+      <td colspan="5"></td>
       <td></td>
       <td style="color:var(--yel);font-weight:600">${fmt$(totalCost)}</td>
       <td colspan="2"></td>
@@ -1952,7 +1968,7 @@ function renderSessTable(filt) {
   if (!rows.length) { sp.innerHTML = '<div class="empty">No open positions</div>'; return; }
 
   const totalQty = rows.reduce((s, r) => s + (r.contracts || 1), 0);
-  const cols = ['Time','Market','Bracket','Engine','Side','Qty','Entry','Score','Unreal. PnL','Status'];
+  const cols = ['Time','Market','Type','Bracket','Engine','Side','Qty','Entry','Score','Unreal. PnL','Status'];
   let html = `<div class="tbl-wrap"><table><thead><tr>${cols.map(c=>`<th>${c}</th>`).join('')}</tr></thead><tbody>`;
   for (const r of rows) {
     const unr = r.unrealised ?? 0;
@@ -1961,6 +1977,7 @@ function renderSessTable(filt) {
     html += `<tr>
       <td>${time} UTC</td>
       <td>${r.market || '—'}</td>
+      <td>${mtypeBadge(r)}</td>
       <td>${r.bracket || '—'}</td>
       <td><span class="eng ${clsEng(eng)}">${eng}</span></td>
       <td class="center"><span class="${r.side==='NO'?'side-no':'side-yes'}">${r.side||'—'}</span></td>
@@ -1972,7 +1989,7 @@ function renderSessTable(filt) {
     </tr>`;
   }
   // Total row
-  html += `<tr class="total-row"><td colspan="4"></td><td></td><td class="center qty-total">${totalQty}</td><td colspan="4"></td></tr>`;
+  html += `<tr class="total-row"><td colspan="5"></td><td></td><td class="center qty-total">${totalQty}</td><td colspan="4"></td></tr>`;
   html += '</tbody></table></div>';
   sp.innerHTML = html;
 }
@@ -2093,13 +2110,14 @@ async function loadPerf() {
     const rows = d.all_settlements || [];
     if (rows.length) {
       let html = `<table><thead><tr>
-        <th>Date</th><th>Market</th><th>Bracket</th><th>Entry</th><th>Net PnL</th><th>Result</th>
+        <th>Date</th><th>Market</th><th>Type</th><th>Bracket</th><th>Entry</th><th>Net PnL</th><th>Result</th>
       </tr></thead><tbody>`;
       for (const r of rows) {
         const cls = r.result_class === 'green' ? 'pnl-pos' : r.result_class === 'red' ? 'pnl-neg' : '';
         html += `<tr>
           <td>${r.date || '—'}</td>
           <td>${r.market_label || r.ticker}</td>
+          <td>${mtypeBadge(r)}</td>
           <td>${(r.ticker||'').split('-').pop()}</td>
           <td>${fmt$(r.avg_entry || r.entry_price)}</td>
           <td class="${cls}">${r.net_pnl >= 0 ? '+' : ''}${fmt$(r.net_pnl)}</td>
