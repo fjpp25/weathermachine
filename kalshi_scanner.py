@@ -40,26 +40,26 @@ except ImportError:
 # Each series has one market per day (today's event)
 # ---------------------------------------------------------------------------
 CITY_SERIES = {
-    "New York":      {"high": "KXHIGHNY",    "low": "KXLOWTNYC"},
-    "Chicago":       {"high": "KXHIGHCHI",   "low": "KXLOWTCHI"},
-    "Miami":         {"high": "KXHIGHMIA",   "low": "KXLOWTMIA"},
-    "Austin":        {"high": "KXHIGHAUS",   "low": "KXLOWTAUS"},
-    "Los Angeles":   {"high": "KXHIGHLAX",   "low": "KXLOWTLAX"},
-    "San Francisco": {"high": "KXHIGHTSFO",  "low": None},
-    "Denver":        {"high": "KXHIGHDEN",   "low": "KXLOWTDEN"},
-    "Philadelphia":  {"high": "KXHIGHPHIL",  "low": "KXLOWTPHIL"},
-    "Atlanta":       {"high": "KXHIGHTATL",  "low": "KXLOWTATL"},
-    "Houston":       {"high": "KXHIGHTHOU",  "low": "KXLOWTHOU"},
-    "Phoenix":       {"high": "KXHIGHTPHX",  "low": "KXLOWTPHX"},
-    "Las Vegas":     {"high": "KXHIGHTLV",   "low": "KXLOWTLV"},
-    "Dallas":        {"high": "KXHIGHTDAL",  "low": "KXLOWTDAL"},
-    "Boston":        {"high": "KXHIGHTBOS",  "low": "KXLOWTBOS"},
-    "Washington DC": {"high": "KXHIGHTDC",   "low": "KXLOWTDC"},
-    "Seattle":       {"high": "KXHIGHTSEA",  "low": "KXLOWTSEA"},
-    "Minneapolis":   {"high": "KXHIGHTMIN",  "low": "KXLOWTMIN"},
-    "Oklahoma City": {"high": "KXHIGHTOKC",  "low": "KXLOWTOKC"},
-    "New Orleans":   {"high": "KXHIGHTNOLA", "low": "KXLOWTNOLA"},
-    "San Antonio":   {"high": "KXHIGHTSATX", "low": "KXLOWTSATX"},
+    "New York":      {"high": "KXHIGHNY",    "lowt": "KXLOWTNYC"},
+    "Chicago":       {"high": "KXHIGHCHI",   "lowt": "KXLOWTCHI"},
+    "Miami":         {"high": "KXHIGHMIA",   "lowt": "KXLOWTMIA"},
+    "Austin":        {"high": "KXHIGHAUS",   "lowt": "KXLOWTAUS"},
+    "Los Angeles":   {"high": "KXHIGHLAX",   "lowt": "KXLOWTLAX"},
+    "San Francisco": {"high": "KXHIGHTSFO",  "lowt": None},
+    "Denver":        {"high": "KXHIGHDEN",   "lowt": "KXLOWTDEN"},
+    "Philadelphia":  {"high": "KXHIGHPHIL",  "lowt": "KXLOWTPHIL"},
+    "Atlanta":       {"high": "KXHIGHTATL",  "lowt": "KXLOWTATL"},
+    "Houston":       {"high": "KXHIGHTHOU",  "lowt": "KXLOWTHOU"},
+    "Phoenix":       {"high": "KXHIGHTPHX",  "lowt": "KXLOWTPHX"},
+    "Las Vegas":     {"high": "KXHIGHTLV",   "lowt": "KXLOWTLV"},
+    "Dallas":        {"high": "KXHIGHTDAL",  "lowt": "KXLOWTDAL"},
+    "Boston":        {"high": "KXHIGHTBOS",  "lowt": "KXLOWTBOS"},
+    "Washington DC": {"high": "KXHIGHTDC",   "lowt": "KXLOWTDC"},
+    "Seattle":       {"high": "KXHIGHTSEA",  "lowt": "KXLOWTSEA"},
+    "Minneapolis":   {"high": "KXHIGHTMIN",  "lowt": "KXLOWTMIN"},
+    "Oklahoma City": {"high": "KXHIGHTOKC",  "lowt": "KXLOWTOKC"},
+    "New Orleans":   {"high": "KXHIGHTNOLA", "lowt": "KXLOWTNOLA"},
+    "San Antonio":   {"high": "KXHIGHTSATX", "lowt": "KXLOWTSATX"},
 }
 
 API_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
@@ -417,7 +417,7 @@ def _scan_brackets(markets: list[dict], series_ticker: str,
 
 def scan_city(city: str, market_type: str = "high") -> dict:
     """
-    Full scan for one city and market type ("high" or "low").
+    Full scan for one city and market type ("high" or "lowt").
     Returns a structured dict with all brackets and their data.
 
     When today's market has fully converged (all brackets at or above
