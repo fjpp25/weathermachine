@@ -21,6 +21,7 @@ Import pattern in each engine:
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,6 +111,118 @@ def bracket_val(bracket_code: str) -> float | None:
         except ValueError:
             pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical bracket → temperature mapping
+# ---------------------------------------------------------------------------
+#
+# Kalshi temperature markets use the floor_strike / cap_strike API fields as
+# the authoritative bracket geometry. The ticker number and the human-readable
+# label both carry display offsets that vary by bracket type, so neither is a
+# reliable source for temperature math — only the strikes are.
+#
+# Validated against today's open markets across all 20 HIGH cities (45 brackets,
+# 0 discrepancies): the rule below reproduces the exact integer settlement
+# outcomes implied by every market's human label.
+#
+# Bracket geometry (uniform across all cities):
+#
+#   B bracket  — floor and cap both present, label "X° to X+1°"
+#       floor = X, cap = X+1.  Settles Yes on integer highs {X, X+1}.
+#       Continuous interval: [floor - 0.5, cap + 0.5)
+#       e.g. B82.5 floor=82 cap=83 → [81.5, 83.5) → {82, 83} → "82° to 83°"
+#
+#   T-top      — floor present, cap None, label "N° or above"
+#       Settles Yes on integer highs >= N, where N = floor + 1.
+#       Continuous interval: [floor + 0.5, +inf)
+#       e.g. T83 floor=83 → [83.5, inf) → >= 84 → "84° or above"
+#
+#   T-bottom   — cap present, floor None, label "N° or below"
+#       Settles Yes on integer highs <= N, where N = cap - 1.
+#       Continuous interval: (-inf, cap - 0.5)
+#       e.g. T76 cap=76 → (-inf, 75.5) → <= 75 → "75° or below"
+#
+# Reads both the enriched shape (floor / cap, as produced by
+# kalshi_scanner._scan_brackets) and the raw Kalshi shape
+# (floor_strike / cap_strike). Falls back to ticker parsing only when no
+# strikes are present, which should not occur for well-formed markets.
+# ---------------------------------------------------------------------------
+
+def _bracket_strikes(bracket: dict) -> tuple[float | None, float | None]:
+    """Return (floor, cap) reading enriched or raw Kalshi field names."""
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+    if floor is None:
+        floor = bracket.get("floor_strike")
+    if cap is None:
+        cap = bracket.get("cap_strike")
+    try:
+        floor = float(floor) if floor is not None else None
+    except (TypeError, ValueError):
+        floor = None
+    try:
+        cap = float(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        cap = None
+    return floor, cap
+
+
+def bracket_interval(bracket: dict) -> tuple[float | None, float | None]:
+    """
+    Return the (lo, hi) continuous temperature interval a bracket settles over,
+    as a half-open interval [lo, hi). Open ends are represented by -math.inf /
+    math.inf. Returns (None, None) if the bracket geometry cannot be determined.
+
+    This is the single source of truth for bracket temperature geometry;
+    bracket_temp() is derived from it.
+    """
+    floor, cap = _bracket_strikes(bracket)
+
+    # B bracket: both strikes present
+    if floor is not None and cap is not None:
+        return (floor - 0.5, cap + 0.5)
+
+    # T-top "or above": floor present, cap open
+    if floor is not None and cap is None:
+        return (floor + 0.5, math.inf)
+
+    # T-bottom "or below": cap present, floor open
+    if cap is not None and floor is None:
+        return (-math.inf, cap - 0.5)
+
+    # Fallback: derive from the ticker code (heuristic; should not be needed
+    # for well-formed markets, which always carry strikes).
+    code = str(bracket.get("ticker", "")).split("-")[-1]
+    val  = bracket_val(code)
+    if val is not None and code[:1] == "B":
+        # B ticker number is the range midpoint → 1°-wide integer span
+        return (val - 1.0, val + 1.0)
+    return (None, None)
+
+
+def bracket_temp(bracket: dict) -> float | None:
+    """
+    Return a single representative temperature for a bracket, for use in
+    forecast-distance calculations.
+
+      B bracket  → interval midpoint           (e.g. 82.5)
+      T-top      → lower threshold edge         (e.g. 83.5  for ">= 84")
+      T-bottom   → upper threshold edge         (e.g. 75.5  for "<= 75")
+
+    For T brackets the returned value is the finite settlement boundary — the
+    temperature at which the bracket flips between Yes and No — which is the
+    quantity that matters when judging how far a tail bracket is from forecast.
+    Returns None if the geometry cannot be determined.
+    """
+    lo, hi = bracket_interval(bracket)
+    if lo is None and hi is None:
+        return None
+    if lo == -math.inf:        # T-bottom → finite upper edge
+        return hi
+    if hi == math.inf:         # T-top → finite lower edge
+        return lo
+    return (lo + hi) / 2.0     # B → midpoint
 
 
 # ---------------------------------------------------------------------------

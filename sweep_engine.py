@@ -74,6 +74,7 @@ from market_utils import (
     no_price        as _no_price,
     yes_price       as _yes_price,
     bracket_val     as _bracket_val,
+    bracket_temp    as _bracket_temp,
     load_config_env,
 )
 
@@ -200,17 +201,37 @@ def _high_series(meta: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _fetch_markets(client, series: str, mdate: str) -> list[dict]:
-    """Fetch all brackets for a specific market date."""
+    """Fetch all brackets for a specific market date, enriched to the canonical
+    shape used by every signal engine.
+
+    The raw Kalshi /markets payload carries floor_strike / cap_strike and
+    *_dollars price fields, but NOT the `no_price` / `yes_price` / `floor` /
+    `cap` fields the signal functions read. We route the raw markets through
+    kalshi_scanner._scan_brackets — the single canonical normalizer — so the
+    enriched fields (floor, cap, ob_no_bid/ask, yes_bid/ask, ...) are present
+    and the market_utils accessors (_no_price, _yes_price, _bracket_temp) work.
+
+    Candles are skipped (sweep never uses them); orderbook is fetched so the
+    price accessors have ob_* data to read.
+    """
     try:
         resp = client.get("/markets", params={
             "series_ticker": series,
             "status":        "open",
         })
         all_markets = resp.get("markets", [])
-        return [
+        raw = [
             m for m in all_markets
             if m.get("event_ticker", "").endswith(mdate)
         ]
+        if not raw:
+            return []
+        import kalshi_scanner as _ks
+        return _ks._scan_brackets(
+            raw, series,
+            skip_orderbook=False,   # need ob_* for _no_price / _yes_price
+            skip_candles=True,      # sweep never reads candles
+        )
     except Exception as e:
         log.debug("sweep: fetch_markets failed for %s %s: %s", series, mdate, e)
         return []
@@ -221,10 +242,7 @@ def _is_converged(markets: list[dict]) -> bool:
     if not markets:
         return False
     return all(
-        max(
-            float(m.get("yes_price", 0) or 0),
-            float(m.get("no_price",  0) or 0),
-        ) >= SETTLED_THRESHOLD
+        max(_yes_price(m), _no_price(m)) >= SETTLED_THRESHOLD
         for m in markets
     )
 
@@ -301,25 +319,61 @@ def initialise(client, city_filter: str = None) -> None:
 def _compute_fcst_rank(brackets: list[dict], forecast_high: float) -> dict[str, int]:
     """Assign forecast-distance rank to each bracket. Rank 0 = closest."""
     def dist(b: dict) -> float:
-        code = b.get("bracket") or b.get("ticker", "").split("-")[-1]
-        val  = _bracket_val(code)
+        # Use the canonical bracket temperature (strike-derived), not the
+        # ticker number, so distance is measured against true settlement
+        # geometry. _bracket_temp returns the midpoint for B brackets and the
+        # finite threshold edge for T brackets.
+        val = _bracket_temp(b)
         return abs(val - forecast_high) if val is not None else 0.0
 
     sorted_b = sorted(brackets, key=dist)
     return {b["ticker"]: i for i, b in enumerate(sorted_b)}
 
 
-def _is_bottom_t(bracket_code: str, forecast_high: float) -> bool:
-    """True if T bracket threshold is below the forecast — structurally safe."""
-    if not bracket_code.startswith("T"):
+def _is_bottom_t(bracket: dict, forecast_high: float) -> bool:
+    """True if this is a bottom-T ('or below') bracket whose threshold is below
+    the forecast — structurally safe (the day is forecast warmer than the
+    bracket's upper edge, so the low-tail bracket is dead).
+
+    Uses the canonical strike-derived threshold (cap - 0.5), not the ticker
+    number, so the comparison is against true settlement geometry.
+    """
+    floor, cap = _strikes_of(bracket)
+    # bottom-T: cap present, floor open
+    if not (cap is not None and floor is None):
         return False
-    val = _bracket_val(bracket_code)
+    val = _bracket_temp(bracket)   # = cap - 0.5
     return val is not None and val < forecast_high
 
 
-def _dead_is_safe(bracket_code: str, city: str, month: int, fcst: float) -> bool:
+def _strikes_of(bracket: dict) -> tuple:
+    """Local strike reader mirroring market_utils — enriched or raw fields."""
+    floor = bracket.get("floor")
+    cap   = bracket.get("cap")
+    if floor is None:
+        floor = bracket.get("floor_strike")
+    if cap is None:
+        cap = bracket.get("cap_strike")
+    return floor, cap
+
+
+def _code(bracket: dict) -> str:
+    """Bracket code from the ticker suffix, e.g. 'T83', 'B82.5'. Structural —
+    the enriched shape has no 'bracket' field, so the ticker is the source."""
+    return str(bracket.get("ticker", "")).split("-")[-1]
+
+
+def _is_t(bracket: dict) -> bool:
+    return _code(bracket).startswith("T")
+
+
+def _is_b(bracket: dict) -> bool:
+    return _code(bracket).startswith("B")
+
+
+def _dead_is_safe(bracket: dict, city: str, month: int, fcst: float) -> bool:
     """Return True if this bracket passes the dead-sweep city safety filter."""
-    if _is_bottom_t(bracket_code, fcst):
+    if _is_bottom_t(bracket, fcst):
         return True
     if city in _SAFE_ALWAYS:
         return True
@@ -340,13 +394,13 @@ def _check_directional(
     Signal A: returns (trigger_T, adj_B, T_no, B_no) or None.
     Exactly one T must have No >= NO_TRIGGER while the other is < NO_CONVERGE_THRESHOLD.
     """
-    t_low_no  = float(t_low.get("no_price",  0.0) or 0.0)
-    t_high_no = float(t_high.get("no_price", 0.0) or 0.0)
+    t_low_no  = _no_price(t_low)
+    t_high_no = _no_price(t_high)
 
     if t_low_no >= NO_TRIGGER and t_high_no < NO_CONVERGE_THRESHOLD:
-        return t_low, b_adj_low, t_low_no, float(b_adj_low.get("no_price", 0.0) or 0.0)
+        return t_low, b_adj_low, t_low_no, _no_price(b_adj_low)
     if t_high_no >= NO_TRIGGER and t_low_no < NO_CONVERGE_THRESHOLD:
-        return t_high, b_adj_high, t_high_no, float(b_adj_high.get("no_price", 0.0) or 0.0)
+        return t_high, b_adj_high, t_high_no, _no_price(b_adj_high)
     return None
 
 
@@ -357,14 +411,30 @@ def _check_dismissed(t_low: dict, t_high: dict, city: str) -> Optional[dict]:
     if lh >= DISMISSED_HOUR_MAX:
         return None
     for dismissed, other in [(t_low, t_high), (t_high, t_low)]:
-        yes_p     = float(dismissed.get("yes_price", 1.0) or 1.0)
-        no_p      = float(dismissed.get("no_price",  0.0) or 0.0)
-        other_yes = float(other.get("yes_price", 1.0) or 1.0)
+        # _yes_price returns 0.0 when no price data is available. For the
+        # dismissed test we must not treat "no data" as "fully dismissed",
+        # so fall back to 1.0 (not-dismissed) only when there is genuinely no
+        # yes-price signal on the bracket at all.
+        _dy = _yes_price(dismissed)
+        _oy = _yes_price(other)
+        yes_p     = _dy if _has_price(dismissed) else 1.0
+        no_p      = _no_price(dismissed)
+        other_yes = _oy if _has_price(other) else 1.0
         if (yes_p <= YES_DISMISSED
                 and DISMISSED_NO_MIN <= no_p < DISMISSED_NO_MAX
                 and other_yes >= YES_DISMISSED_T_OTHER):
             return dismissed
     return None
+
+
+def _has_price(bracket: dict) -> bool:
+    """True if the bracket carries any usable yes/no price field."""
+    for k in ("ob_yes_ask", "ob_yes_bid", "yes_ask", "yes_bid", "yes_price",
+              "ob_no_bid", "ob_no_ask", "no_ask", "no_bid", "no_price"):
+        v = bracket.get(k)
+        if v:
+            return True
+    return False
 
 
 def _check_gradient(
@@ -378,14 +448,7 @@ def _check_gradient(
     if lh >= DISMISSED_HOUR_MAX:
         return []
 
-    def floor_of(b: dict) -> Optional[float]:
-        s = b.get("bracket", "")
-        try:
-            return float(s[1:]) if s else None
-        except (ValueError, IndexError):
-            return None
-
-    sortable = [(floor_of(b), b) for b in all_brackets]
+    sortable = [(_bracket_temp(b), b) for b in all_brackets]
     sortable = [(f, b) for f, b in sortable if f is not None]
     if len(sortable) < 6:
         return []
@@ -394,7 +457,7 @@ def _check_gradient(
     bottom3, top3 = sorted_b[:3], sorted_b[-3:]
 
     def avg_yes(brackets):
-        vals = [float(b.get("yes_price", 0.0) or 0.0) for b in brackets]
+        vals = [_yes_price(b) for b in brackets]
         return sum(vals) / len(vals) if vals else 0.0
 
     lean = avg_yes(bottom3) - avg_yes(top3)
@@ -405,8 +468,8 @@ def _check_gradient(
     yes_gate = yes_override if yes_override is not None else YES_DISMISSED
     return [
         b for b in far_end
-        if float(b.get("yes_price", 1.0) or 1.0) <= yes_gate
-        and DISMISSED_NO_MIN <= float(b.get("no_price", 0.0) or 0.0) < DISMISSED_NO_MAX
+        if (_yes_price(b) if _has_price(b) else 1.0) <= yes_gate
+        and DISMISSED_NO_MIN <= _no_price(b) < DISMISSED_NO_MAX
     ]
 
 
@@ -417,13 +480,13 @@ def _check_sweep(markets: list[dict], city: str) -> list[dict]:
         return []
     forecast_ticker = max(
         markets,
-        key=lambda m: float(m.get("yes_price", 0.0) or 0.0),
+        key=lambda m: _yes_price(m),
     ).get("ticker", "")
     return [
         m for m in markets
         if m.get("ticker", "") != forecast_ticker
         and m.get("ticker", "") not in _sweep_entered
-        and floor <= float(m.get("no_price", 0.0) or 0.0) < SWEEP_CEILING
+        and floor <= _no_price(m) < SWEEP_CEILING
     ]
 
 
@@ -444,11 +507,10 @@ def _check_dead(
             continue
         if rank_map.get(ticker, -1) not in (4, 5):
             continue
-        no_p = float(b.get("no_price", 0.0) or 0.0)
+        no_p = _no_price(b)
         if not (DEAD_FLOOR <= no_p <= DEAD_CEILING):
             continue
-        bracket_code = b.get("bracket") or ticker.split("-")[-1]
-        if not _dead_is_safe(bracket_code, city, month, forecast_high):
+        if not _dead_is_safe(b, city, month, forecast_high):
             continue
         results.append(b)
     return results
@@ -588,17 +650,41 @@ def run_scan(
         # ── Signal A: directional pre-market ─────────────────────────────
         markets = _fetch_markets(client, series, next_date)
         if markets:
+            # Classify and order brackets using the ticker suffix (structural)
+            # and the canonical strike-derived temperature (geometry). The
+            # enriched shape has no 'bracket' field, so the ticker is the
+            # source of T/B classification.
             T_markets = sorted(
-                [m for m in markets if m.get("bracket", "").startswith("T")],
-                key=lambda m: _bracket_val(m.get("bracket", "")) or 0,
+                [m for m in markets if _is_t(m)],
+                key=lambda m: _bracket_temp(m) if _bracket_temp(m) is not None else 0,
             )
             B_markets = sorted(
-                [m for m in markets if m.get("bracket", "").startswith("B")],
-                key=lambda m: _bracket_val(m.get("bracket", "")) or 0,
+                [m for m in markets if _is_b(m)],
+                key=lambda m: _bracket_temp(m) if _bracket_temp(m) is not None else 0,
             )
             all_markets = T_markets + B_markets
 
-            if len(T_markets) >= 2 and B_markets:
+            # Well-formedness check. A fresh HIGH market is T-B-B-B-B-T (6
+            # brackets, exactly 2 T). Signal A needs that full structure to
+            # read a directional lean. Fewer brackets normally means the
+            # market is already converging (outer brackets resolved and
+            # dropped from the open feed) — that is expected late-day and we
+            # skip quietly. But a market that has brackets yet an unexpected
+            # shape (e.g. 0 or 1 T, or a count that is neither 6 nor a clean
+            # convergence) is logged as an anomaly so a genuine data/API fault
+            # is never silently ignored.
+            n_total, n_t = len(markets), len(T_markets)
+            well_formed = (n_total == 6 and n_t == 2)
+            if not well_formed:
+                converging = (n_total < 6 and n_t <= 2)
+                if not converging:
+                    log.warning(
+                        "sweep: %s %s malformed market — %d brackets, %d T "
+                        "(expected 6 / 2); skipping Signal A",
+                        city, next_date, n_total, n_t,
+                    )
+
+            if well_formed:
                 t_low, t_high = T_markets[0], T_markets[-1]
                 b_adj_low     = B_markets[0]
                 b_adj_high    = B_markets[-1]
@@ -624,15 +710,15 @@ def run_scan(
                     if signal:
                         trigger_t, adj_b, t_no, b_no = signal
                         log.info("★ DIRECTIONAL [%s] %s | %s No=%.2f  adj-B %s No=%.2f",
-                                 city, next_date, trigger_t.get("bracket",""),
-                                 t_no, adj_b.get("bracket",""), b_no)
+                                 city, next_date, _code(trigger_t),
+                                 t_no, _code(adj_b), b_no)
                         orders = 0
                         for bracket_dict, label, tier in [
                             (trigger_t, "T-trigger", "tomorrow"),
                             (adj_b,     "adj-B",     "tomorrow"),
                         ]:
                             ticker = bracket_dict["ticker"]
-                            no_p   = float(bracket_dict.get("no_price", 0.0) or 0.0)
+                            no_p   = _no_price(bracket_dict)
                             if no_p <= 0.0 or no_p > NO_MAX_ENTRY:
                                 log.info("sweep: skip %s — No=%.2f out of range", ticker, no_p)
                                 continue
@@ -653,9 +739,9 @@ def run_scan(
                 dismissed = _check_dismissed(t_low, t_high, city)
                 if dismissed:
                     ticker = dismissed.get("ticker", "")
-                    no_p   = float(dismissed.get("no_price", 0.0) or 0.0)
+                    no_p   = _no_price(dismissed)
                     log.info("★ DISMISSED_T [%s] %s | %s No=%.2f",
-                             city, next_date, dismissed.get("bracket",""), no_p)
+                             city, next_date, _code(dismissed), no_p)
                     _place(client, ticker, city, no_p,
                            DISMISSED_CONTRACTS, "tomorrow_dismissed",
                            ["dismissed_t", f"no_price={no_p:.2f}"],
@@ -674,7 +760,7 @@ def run_scan(
                              city, next_date, len(gradient))
                     for b in gradient:
                         ticker = b.get("ticker", "")
-                        no_p   = float(b.get("no_price", 0.0) or 0.0)
+                        no_p   = _no_price(b)
                         _place(client, ticker, city, no_p,
                                DISMISSED_CONTRACTS, "tomorrow_dismissed",
                                ["gradient_open", f"no_price={no_p:.2f}"],
@@ -686,7 +772,7 @@ def run_scan(
             today_brackets = today_data.get("brackets", [])
             for candidate in _check_sweep(today_brackets, city):
                 ticker = candidate.get("ticker", "")
-                no_p   = float(candidate.get("no_price", 0.0) or 0.0)
+                no_p   = _no_price(candidate)
                 log.info("★ SWEEP [%s] %s | No=%.2f  %dc",
                          city, ticker.split("-")[-1], no_p, SWEEP_CONTRACTS)
                 _place(client, ticker, city, no_p,
@@ -701,9 +787,9 @@ def run_scan(
             today_brackets = today_data.get("brackets", [])
             for candidate in _check_dead(today_brackets, city, month, fcst_high):
                 ticker = candidate.get("ticker", "")
-                no_p   = float(candidate.get("no_price", 0.0) or 0.0)
-                bracket_code = candidate.get("bracket") or ticker.split("-")[-1]
-                btype = ("bottom_T" if _is_bottom_t(bracket_code, fcst_high)
+                no_p   = _no_price(candidate)
+                bracket_code = _code(candidate)
+                btype = ("bottom_T" if _is_bottom_t(candidate, fcst_high)
                          else "top_T" if bracket_code.startswith("T") else "B")
                 log.info("★ DEAD [%s] %s | No=%.3f  type=%s  %dc",
                          city, ticker.split("-")[-1], no_p, btype, DEAD_CONTRACTS)
