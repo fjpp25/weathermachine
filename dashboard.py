@@ -777,6 +777,7 @@ def api_status():
     engines = {}
     available = 0.0
     try:
+        import trader
         # Pass the client so the EngineCapital singleton refreshes its balance
         # against the live account. Without a client it defaults to $0 balance
         # -> all budgets $0 -> the capital strip shows empty. get_engine_capital
@@ -787,7 +788,12 @@ def api_status():
             bud = round(cap.budget(e), 2)
             engines[e] = {"remaining": rem, "budget": bud}
             available += rem
-    except Exception:
+    except Exception as _e:
+        # Keep the strip's empty-fallback behavior, but never fail silently —
+        # a blank capital strip previously masked a NameError here for a long
+        # time. Log so any future failure in this block is visible.
+        log.warning("dashboard /api/status: per-engine capital unavailable: %s", _e)
+        engines = {}
         available = 0.0
     pending     = get_pending()
     pend_cost   = round(sum(p.get("cost_total",0) for p in pending), 2)
