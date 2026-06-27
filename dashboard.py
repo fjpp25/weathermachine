@@ -890,8 +890,25 @@ def api_performance():
     if not enriched:
         return jsonify({"stats":{},"by_day":[],"chart":{"equity":[],"win_rate":[]},"all_settlements":[]})
 
-    total    = len(enriched); wins=[e for e in enriched if e["won"]]
-    win_rate = round(len(wins)/total*100,1) if total else 0
+    # Win/loss accounting.
+    # An EARLY EXIT is a position closed before settlement — it is neither a
+    # predictive win nor a predictive loss, so it is excluded from the win-rate
+    # denominator. Its realized PnL is still fully counted in net_pnl. We surface
+    # the exit count so every row reconciles: wins + losses + exits == total.
+    def _is_exit(e) -> bool:
+        return e.get("result") == "EARLY EXIT"
+
+    def _wr(items) -> float:
+        """Win rate over settled (non-exit) positions only: wins/(wins+losses)."""
+        settled = [t for t in items if not _is_exit(t)]
+        return round(sum(1 for t in settled if t["won"]) / len(settled) * 100, 1) \
+            if settled else 0.0
+
+    total    = len(enriched)
+    wins     = [e for e in enriched if e["won"] and not _is_exit(e)]
+    losses   = [e for e in enriched if not e["won"] and not _is_exit(e)]
+    exits    = [e for e in enriched if _is_exit(e)]
+    win_rate = _wr(enriched)
     net_pnl  = round(sum(e["net_pnl"] for e in enriched),2)
     fees     = round(sum(e["fee"]     for e in enriched),2)
     by_day: dict = defaultdict(list)
@@ -902,12 +919,15 @@ def api_performance():
 
     cum=0.0; day_rows=[]
     for day in sorted(by_day.keys()):
-        ts=by_day[day]; dw=[t for t in ts if t["won"]]
+        ts=by_day[day]
+        dw=[t for t in ts if t["won"] and not _is_exit(t)]
+        dl=[t for t in ts if not t["won"] and not _is_exit(t)]
+        dx=[t for t in ts if _is_exit(t)]
         dpnl=round(sum(t["net_pnl"] for t in ts),2); cum+=dpnl
         day_rows.append({"date":day,"trades":len(ts),"wins":len(dw),
-            "losses":sum(1 for t in ts if not t["won"] and t.get("result")!="EARLY EXIT"),
-            "stopped":sum(1 for t in ts if t.get("result")=="EARLY EXIT"),
-            "win_pct":f"{round(len(dw)/len(ts)*100,1)}%" if ts else "0%",
+            "losses":len(dl),
+            "stopped":len(dx),
+            "win_pct":f"{_wr(ts)}%",
             "net_pnl":dpnl,"cum_pnl":round(cum,2)})
     day_rows.reverse()
 
@@ -922,7 +942,10 @@ def api_performance():
         win_win.append(by_day[day])
         if len(win_win) > 7: win_win.popleft()
         dt_ = [t for batch in win_win for t in batch]
-        if dt_: wr_data.append({"x":day,"y":round(sum(1 for t in dt_ if t["won"])/len(dt_)*100,1)})
+        settled_ = [t for t in dt_ if not _is_exit(t)]
+        if settled_:
+            wr_data.append({"x":day,
+                "y":round(sum(1 for t in settled_ if t["won"])/len(settled_)*100,1)})
 
     def rl(e):
         if e.get("result")=="EARLY EXIT": return "EXIT ↩","yellow"
@@ -934,7 +957,9 @@ def api_performance():
         all_s.append({**e,"result_label":label,"result_class":cls,
             "market_label":_city_from_ticker(e["ticker"]) or e["ticker"]})
 
-    return jsonify({"stats":{"total":total,"win_rate":win_rate,"net_pnl":net_pnl,
+    return jsonify({"stats":{"total":total,"win_rate":win_rate,
+        "wins":len(wins),"losses":len(losses),"exits":len(exits),
+        "net_pnl":net_pnl,
         "total_fees":fees,"best_day":best_day,"worst_day":worst_day},
         "by_day":day_rows,"chart":{"equity":equity,"win_rate":wr_data},
         "all_settlements":all_s})
