@@ -535,10 +535,10 @@ def _place(
     cost = round(no_p * contracts, 4)
 
     try:
-        deployable = _trader.get_sweep_deployable()
-        if deployable < cost:
+        _cap = _trader.get_engine_capital()
+        if not _cap.can_deploy("sweep", cost):
             log.debug("sweep: %s — budget exhausted (cost=$%.2f remaining=$%.2f)",
-                      ticker, cost, deployable)
+                      ticker, cost, _cap.remaining("sweep"))
             return False
     except Exception as e:
         log.warning("sweep: capital check failed %s: %s", ticker, e)
@@ -571,7 +571,7 @@ def _place(
             "paper":        False,
             "entry_tier":   entry_tier,
         })
-        _trader.record_sweep_deployed(cost)
+        _trader.get_engine_capital().record("sweep", cost)
         _sweep_entered.add(ticker)
         return True
     except Exception as e:

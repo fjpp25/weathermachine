@@ -263,7 +263,6 @@ def _check_city(
                 )
                 try:
                     cap.record("econv", cost)
-                    _trader.record_econv_deployed(cost)
                 except Exception:
                     pass
                 _trader._append_trade_log({
