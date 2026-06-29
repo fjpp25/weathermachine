@@ -94,7 +94,7 @@ OUTPUT_DB   = Path("data/observations.db")
 #   False → DB only. The 185MB JSON rewrite stops; the portable CSV is then
 #           produced on demand from the DB by export_hourly_csv.py (kept for
 #           offline/train analysis).
-DUAL_WRITE = True
+DUAL_WRITE = False
 
 # hourly_observations table columns (must match migrate_hourly_to_sqlite.py).
 DB_COLUMNS = [
