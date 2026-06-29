@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 import time
 import argparse
 from datetime import datetime, timezone, timedelta
@@ -85,6 +86,26 @@ CURRENT_COND_CACHE_SECS = 15 * 60  # re-fetch current conditions every 15 min
 
 OUTPUT_JSON = Path("data/hourly_nyc_observations.json")
 OUTPUT_CSV  = Path("data/hourly_nyc_observations.csv")
+OUTPUT_DB   = Path("data/observations.db")
+
+# Dual-write safety flag (same pattern as lowt_observer):
+#   True  → append new rows to the DB AND keep writing the old JSON/CSV, so they
+#           can be compared for parity during cutover validation.
+#   False → DB only. The 185MB JSON rewrite stops; the portable CSV is then
+#           produced on demand from the DB by export_hourly_csv.py (kept for
+#           offline/train analysis).
+DUAL_WRITE = True
+
+# hourly_observations table columns (must match migrate_hourly_to_sqlite.py).
+DB_COLUMNS = [
+    "poll_time_utc", "market_ticker", "market_hour_edt", "minutes_to_close",
+    "accuweather_current_f", "accuweather_forecast_f", "market_direction",
+    "ticker", "threshold_f", "yes_bid", "yes_ask", "no_bid", "no_ask",
+    "spread", "volume", "open_interest",
+    "is_border", "current_resolves_yes", "forecast_resolves_yes",
+]
+_DB_BOOL_COLS = {"is_border", "current_resolves_yes", "forecast_resolves_yes"}
+_DB_INT_COLS  = {"market_hour_edt", "minutes_to_close"}
 
 CSV_FIELDS = [
     "poll_time_utc",           # ISO UTC timestamp of this poll
@@ -459,7 +480,14 @@ def _safe_float(val) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def load_observations() -> list[dict]:
-    """Load existing observations from JSON, or return an empty list."""
+    """Load existing observations from JSON, or return an empty list.
+
+    Only needed while DUAL_WRITE is on (the JSON rewrite needs full history in
+    memory). Once DB-only, poll_once just appends to the DB and never reads
+    history back, so we start empty — avoiding the 185MB JSON deserialize on
+    every startup."""
+    if not DUAL_WRITE:
+        return []
     if OUTPUT_JSON.exists():
         try:
             data = json.loads(OUTPUT_JSON.read_text())
@@ -508,7 +536,53 @@ def _append_csv_rows(rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def _db_cell(col, val):
+    if val is None or val == "":
+        return None
+    if col in _DB_BOOL_COLS:
+        if isinstance(val, bool):
+            return 1 if val else 0
+        s = str(val).strip().lower()
+        return 1 if s in ("true", "1") else 0 if s in ("false", "0") else None
+    if col in _DB_INT_COLS:
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return None
+    return val
+
+
+def _ensure_db():
+    OUTPUT_DB.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(OUTPUT_DB)
+    cols_ddl = ", ".join(
+        f"{c} {'INTEGER' if c in _DB_BOOL_COLS | _DB_INT_COLS else 'TEXT'}"
+        for c in DB_COLUMNS)
+    con.execute(f"CREATE TABLE IF NOT EXISTS hourly_observations ({cols_ddl})")
+    con.commit()
+    return con
+
+
+def _append_db_rows(rows: list[dict]) -> None:
+    """Append this poll's new rows to the hourly_observations table (no rewrite)."""
+    if not rows:
+        return
+    con = _ensure_db()
+    placeholders = ", ".join(["?"] * len(DB_COLUMNS))
+    sql = (f"INSERT INTO hourly_observations ({', '.join(DB_COLUMNS)}) "
+           f"VALUES ({placeholders})")
+    con.executemany(
+        sql,
+        [tuple(_db_cell(c, r.get(c)) for c in DB_COLUMNS) for r in rows])
+    con.commit()
+    con.close()
+
+
 def _save_json(observations: list[dict]) -> None:
+    # During dual-write, keep rewriting the JSON for parity validation.
+    # Once DUAL_WRITE is False this is a no-op — the 185MB-per-poll rewrite stops.
+    if not DUAL_WRITE:
+        return
     OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_JSON.write_text(json.dumps(observations, indent=2, default=str))
 
@@ -551,7 +625,9 @@ def poll_once(
             "minutes_to_close": mins_close,
         })
         observations.append(sentinel)
-        _append_csv_rows([sentinel])
+        _append_db_rows([sentinel])
+        if DUAL_WRITE:
+            _append_csv_rows([sentinel])
         print(f"  {_now_local()}  {evt_ticker}  NO MARKET")
         return 1
 
@@ -595,7 +671,9 @@ def poll_once(
         new_rows.append(row)
 
     observations.extend(new_rows)
-    _append_csv_rows(new_rows)
+    _append_db_rows(new_rows)
+    if DUAL_WRITE:
+        _append_csv_rows(new_rows)
 
     # ── Summary line ──────────────────────────────────────────────────────
     # Safe formatters: the Kalshi API may return floor_strike as a string,
