@@ -52,19 +52,34 @@ def local_hour(city: str) -> int:
 # ---------------------------------------------------------------------------
 
 def no_price(bracket: dict) -> float:
-    """Return the best available No price for a bracket, or 0.0."""
+    """Return the best available No price for a bracket, or 0.0.
+
+    The single-market `markets/{ticker}` endpoint returns prices only under
+    the v2 `_dollars`-suffixed names (no_bid_dollars / no_ask_dollars), while
+    the scanner snapshot uses the plain ob_* / no_* names. We read both; the
+    `_dollars` names are appended last so existing precedence is unchanged and
+    only the previously-0.0 (single-market fallback) cases gain a value.
+    Bid is preferred over ask, consistent with the existing order below.
+    """
     return float(
-        bracket.get("ob_no_bid") or bracket.get("ob_no_ask") or
-        bracket.get("no_ask")    or bracket.get("no_bid")    or
-        bracket.get("no_price")  or 0.0
+        bracket.get("ob_no_bid")      or bracket.get("ob_no_ask") or
+        bracket.get("no_ask")         or bracket.get("no_bid")    or
+        bracket.get("no_price")       or
+        bracket.get("no_bid_dollars") or bracket.get("no_ask_dollars") or 0.0
     )
 
 
 def yes_price(bracket: dict) -> float:
-    """Return the best available Yes price for a bracket, or 0.0."""
+    """Return the best available Yes price for a bracket, or 0.0.
+
+    As with no_price, the `_dollars` names from the single-market endpoint are
+    appended last so existing snapshot behaviour is unchanged and only the
+    fallback (previously 0.0) cases gain a value.
+    """
     return float(
-        bracket.get("ob_yes_ask") or bracket.get("ob_yes_bid") or
-        bracket.get("yes_ask")    or bracket.get("yes_price")  or 0.0
+        bracket.get("ob_yes_ask")      or bracket.get("ob_yes_bid") or
+        bracket.get("yes_ask")         or bracket.get("yes_price")  or
+        bracket.get("yes_bid_dollars") or bracket.get("yes_ask_dollars") or 0.0
     )
 
 
