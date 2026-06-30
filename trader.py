@@ -859,7 +859,7 @@ def test_order(client: KalshiClient):
 
     log.info("test step 2: cancelling order %s...", order_id)
     try:
-        cancel_result = client.delete(f"portfolio/events/orders/{order_id}")
+        cancel_result = client.delete(f"portfolio/orders/{order_id}")
         cancelled     = cancel_result.get("order", {})
         log.info('test: cancelled  status=%s', cancelled.get('status','?'))
         log.info("test PASSED — full round trip OK")
@@ -958,9 +958,16 @@ _main_entered:        set[str] = set()   # tickers entered by main engine this s
 # ---------------------------------------------------------------------------
 from datetime import date as _date
 
+_day_open_balance: float      = 0.0
+_day_open_date:    _date|None = None
+_deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
+_deployed_peak:    float      = 0.0   # peak scanner   — persists across polls, resets midnight
+_deployed_tomorrow: float     = 0.0   # retained for legacy log compat — budget now in sweep
+_deployed_sweep:    float      = 0.0   # unified sweep engine — persists across polls, resets midnight
+_deployed_econv:   float      = 0.0   # evening convergence — persists across polls, resets midnight
+_deployed_lowt:    float      = 0.0   # LOWT engine — persists across polls, resets midnight
 # ---------------------------------------------------------------------------
-# Engine capital allocation — proportional by proven EV/dollar.
-# Consumed by the EngineCapital class (budget = live_balance * share).
+# Engine capital allocation — proportional by proven EV/dollar
 # ---------------------------------------------------------------------------
 ENGINE_ALLOCATIONS: dict[str, float] = {
     "main":     0.10,   # HIGH main engine (post-dedup fix: ~$7/day actual need)
@@ -973,6 +980,129 @@ ENGINE_ALLOCATIONS: dict[str, float] = {
     "lowt":     0.12,   # LOWT structural elimination + forecast distance
     # 16% unallocated buffer
 }
+
+# Legacy constant retained for backward compat
+CASCADE_RESERVE:   float      = 30.00
+
+
+def _update_day_snapshot(current_balance: float) -> tuple[float, float]:
+    """
+    Refresh the daily snapshot if the date has changed.
+    Returns (main_deployable, cascade_reserve) based on day-open balance.
+
+    All per-engine _deployed_* trackers reset at midnight so budgets are
+    based on day-open balance — not disturbed by intraday winning settlements.
+    """
+    global _day_open_balance, _day_open_date, \
+           _deployed_cascade, _deployed_peak, _deployed_tomorrow, _deployed_econv,\
+           _deployed_lowt, _deployed_sweep
+    today = _date.today()
+    if _day_open_date != today or _day_open_balance == 0.0:
+        _day_open_balance   = current_balance
+        _day_open_date      = today
+        _deployed_cascade   = 0.0
+        _deployed_peak      = 0.0
+        _deployed_tomorrow  = 0.0
+        _deployed_econv     = 0.0
+        _deployed_lowt      = 0.0
+        _deployed_sweep     = 0.0
+        log.info(
+            "day snapshot: $%.2f  "
+            "(main=$%.2f  cascade=$%.2f  peak=$%.2f  sweep=$%.2f  econv=$%.2f  hourly=$%.2f)",
+            current_balance,
+            round(current_balance * ENGINE_ALLOCATIONS["main"],    2),
+            round(current_balance * ENGINE_ALLOCATIONS["cascade"], 2),
+            round(current_balance * ENGINE_ALLOCATIONS["peak"],    2),
+            round(current_balance * ENGINE_ALLOCATIONS["sweep"],   2),
+            round(current_balance * ENGINE_ALLOCATIONS["econv"],   2),
+            round(current_balance * ENGINE_ALLOCATIONS["hourly"],  2),
+        )
+
+    return 0.0, CASCADE_RESERVE   # main_deployable no longer used — EngineCapital governs
+
+
+def get_cascade_deployable() -> float:
+    """Remaining cascade budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["cascade"], 2)
+    return max(0.0, round(budget - _deployed_cascade, 2))
+
+
+def record_cascade_deployed(cost: float) -> None:
+    """Record capital deployed by the cascade engine."""
+    global _deployed_cascade
+    _deployed_cascade = round(_deployed_cascade + cost, 4)
+    log.debug("cascade deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_cascade, get_cascade_deployable())
+
+
+def get_peak_deployable() -> float:
+    """Remaining peak scanner budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["peak"], 2)
+    return max(0.0, round(budget - _deployed_peak, 2))
+
+
+def record_peak_deployed(cost: float) -> None:
+    """Record capital deployed by the peak scanner."""
+    global _deployed_peak
+    _deployed_peak = round(_deployed_peak + cost, 4)
+    log.debug("peak deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_peak, get_peak_deployable())
+
+
+def get_tomorrow_deployable(ticker: str = None) -> float:
+    """Remaining sweep budget for this session (legacy name retained for compat)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["sweep"], 2)
+    return max(0.0, round(budget - _deployed_sweep, 2))
+
+
+def record_tomorrow_deployed(cost: float, ticker: str = None) -> None:
+    """Record capital deployed by the tomorrow scanner."""
+    global _deployed_tomorrow
+    _deployed_tomorrow = round(_deployed_tomorrow + cost, 4)
+    log.debug("tomorrow deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_tomorrow, get_tomorrow_deployable())
+
+
+def get_econv_deployable() -> float:
+    """Remaining evening convergence budget for this session."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["econv"], 2)
+    return max(0.0, round(budget - _deployed_econv, 2))
+
+
+def record_econv_deployed(cost: float) -> None:
+    """Record capital deployed by the evening convergence engine."""
+    global _deployed_econv
+    _deployed_econv = round(_deployed_econv + cost, 4)
+    log.debug("econv deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_econv, get_econv_deployable())
+
+
+def get_lowt_deployable() -> float:
+    """Remaining LOWT budget for today (based on day-open balance, not live balance)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["lowt"], 2)
+    return max(0.0, round(budget - _deployed_lowt, 2))
+
+
+def record_lowt_deployed(cost: float) -> None:
+    """Record capital deployed by the LOWT engine."""
+    global _deployed_lowt
+    _deployed_lowt = round(_deployed_lowt + cost, 4)
+    log.debug("lowt deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_lowt, get_lowt_deployable())
+
+
+def get_sweep_deployable() -> float:
+    """Remaining sweep budget for today (based on day-open balance)."""
+    budget = round(_day_open_balance * ENGINE_ALLOCATIONS["sweep"], 2)
+    return max(0.0, round(budget - _deployed_sweep, 2))
+
+
+def record_sweep_deployed(cost: float) -> None:
+    """Record capital deployed by the unified sweep engine."""
+    global _deployed_sweep
+    _deployed_sweep = round(_deployed_sweep + cost, 4)
+    log.debug("sweep deployed: +$%.2f  (total=$%.2f  remaining=$%.2f)",
+              cost, _deployed_sweep, get_sweep_deployable())
 
 
 def _bracket_floor_ceiling(ticker: str) -> tuple[float | None, float | None]:
@@ -1193,8 +1323,11 @@ def _post_exit_scan(
 def manage_open_orders(
     client:          KalshiClient,
     kalshi_snapshot: dict = None,
-    no_min:          float = 0.85,   # must match NO_MIN_ENTRY_PRICE in hight_decision_engine
+    no_min:          float = 0.85,   # HIGH floor — matches NO_MIN_ENTRY_PRICE in hight_decision_engine
     no_max:          float = 0.94,   # must match NO_MAX_ENTRY_PRICE in hight_decision_engine
+    lowt_no_min:     float = 0.60,   # LOWT floor — LOWT-UP cascade enters down to 0.60 (backtested
+                                     # +EV across [0.60,0.85); a 0.85 floor wrongly cancels its
+                                     # highest-EV entries). Cancel only below 0.60 (thesis broken).
     paper:           bool  = False,
 ) -> None:
     """
@@ -1298,18 +1431,22 @@ def manage_open_orders(
             order_no_price = round(1.0 - yes_p, 4)
 
         # ── Decision ─────────────────────────────────────────────────────
-        out_of_range = (current_no < no_min or current_no >= no_max)
+        # LOWT orders use a wider floor: the LOWT-UP cascade legitimately enters
+        # down to 0.60 (backtested +EV), so a 0.85 floor would wrongly cancel its
+        # best trades. HIGH orders keep the 0.85 floor. Upper bound is shared.
+        eff_no_min = lowt_no_min if "LOWT" in ticker.upper() else no_min
+        out_of_range = (current_no < eff_no_min or current_no >= no_max)
         price_moved  = abs(current_no - order_no_price) >= 0.01
 
         if out_of_range:
             # Current price outside our entry criteria → cancel, do not replace
             log.info(
                 "manage_open_orders: CANCEL %s  no=%.2f outside [%.2f,%.2f)",
-                ticker, current_no, no_min, no_max,
+                ticker, current_no, eff_no_min, no_max,
             )
             if not paper:
                 try:
-                    client.delete(f"portfolio/events/orders/{order_id}")
+                    client.delete(f"portfolio/orders/{order_id}")
                     cancelled += 1
                 except Exception as e:
                     log.warning("manage_open_orders: cancel failed %s: %s",
@@ -1323,7 +1460,7 @@ def manage_open_orders(
             )
             if not paper:
                 try:
-                    client.delete(f"portfolio/events/orders/{order_id}")
+                    client.delete(f"portfolio/orders/{order_id}")
                     place_order(
                         client        = client,
                         ticker        = ticker,
@@ -1752,6 +1889,7 @@ def run_pipeline(
     nws_snapshot: dict = None,
 ):
     """Run HIGH and LOWT decision engines, then execute any actionable signals."""
+    global _deployed_cascade   # module-level tracker; += requires explicit global
     # ── HIGH markets ─────────────────────────────────────────────────────────
     evaluations, nws_snapshot, kalshi_results = decision_engine.run(
         city_filter     = city_filter,
@@ -1777,7 +1915,8 @@ def run_pipeline(
         log.warning("LOWT pipeline error (non-fatal): %s", e)
 
     try:
-        balance = get_balance(client)
+        balance                      = get_balance(client)
+        _, cascade_reserve           = _update_day_snapshot(balance)
         set_balance_cached(balance)
         cap = get_engine_capital(client)
         log.info(
@@ -1792,7 +1931,8 @@ def run_pipeline(
         )
     except Exception as e:
         log.warning("balance fetch failed: %s — using $0 cap", e)
-        balance = 0.0
+        balance          = 0.0
+        cascade_reserve  = 0.0
 
     try:
         live_positions = sync_from_kalshi(client)
@@ -1914,21 +2054,21 @@ def run_pipeline(
             else:
                 engine_key = "main"
             if engine_key == "cascade":
-                if not cap.can_deploy("cascade", cost):
-                    log.debug("skip %s — cascade budget exhausted (cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, cap.remaining("cascade"))
+                if get_cascade_deployable() < cost:
+                    log.debug("skip %s — cascade session budget exhausted (cost=$%.2f  remaining=$%.2f)",
+                              ticker, cost, get_cascade_deployable())
                     continue
             elif engine_key == "lowt":
-                if not cap.can_deploy("lowt", cost):
+                if get_lowt_deployable() < cost:
                     log.debug("skip %s — lowt budget exhausted "
                               "(cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, cap.remaining("lowt"))
+                              ticker, cost, get_lowt_deployable())
                     continue
             elif engine_key == "sweep":
-                if not cap.can_deploy("sweep", cost):
+                if get_sweep_deployable() < cost:
                     log.debug("skip %s — sweep budget exhausted "
                               "(cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, cap.remaining("sweep"))
+                              ticker, cost, get_sweep_deployable())
                     continue
             else:
                 if not cap.can_deploy("main", cost):
@@ -1960,7 +2100,13 @@ def run_pipeline(
                 held_city_map[city]    = held_city_map.get(city, 0) + 1
                 cap.record(engine_key, cost)
                 deployed += cost
-                if engine_key not in ("cascade", "lowt", "sweep"):
+                if engine_key == "cascade":
+                    _deployed_cascade += cost
+                elif engine_key == "lowt":
+                    record_lowt_deployed(cost)
+                elif engine_key == "sweep":
+                    record_sweep_deployed(cost)
+                else:
                     _main_entered.add(ticker)
                 executed += 1
                 _append_trade_log({
