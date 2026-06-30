@@ -91,6 +91,15 @@ class Trade:
         return band_label(self.entry_price)
 
     @property
+    def price_cent(self) -> str:
+        """Entry price as a 1-cent bucket label, e.g. '0.91'. Kalshi prices are
+        already cent-denominated, so this is a label, not new binning logic —
+        unlike `band` (5-cent buckets), it lets us see exactly where, within a
+        single engine's tradable range, EV crosses zero (e.g. main's 0.90-0.92
+        gate collapses into one 5-cent band; this resolves it to the cent)."""
+        return f"{round(self.entry_price, 2):.2f}"
+
+    @property
     def net_pnl(self) -> float | None:
         """Per-position PnL, fee-adjusted. None if unsettled."""
         if not self.settled:
@@ -207,6 +216,7 @@ AXES = {
     "engine": lambda t: t.engine,
     "city":   lambda t: t.city,
     "band":   lambda t: t.band,
+    "price_cent": lambda t: t.price_cent,
     "hour":   lambda t: t.entry_local_hour,
     "market": lambda t: t.market_type,
     "date":   lambda t: t.market_date,
