@@ -28,6 +28,7 @@ import csv
 import json
 import logging
 import os
+import sqlite3
 import sys
 import math
 import threading
@@ -66,6 +67,7 @@ DATA_DIR    = Path("data")
 TRADE_LOG   = DATA_DIR / "trade_log.json"
 BIAS_FILE   = DATA_DIR / "forecast_bias.json"
 OBS_FILE    = DATA_DIR / "lowt_observations.csv"
+OBS_DB      = DATA_DIR / "observations.db"
 CONFIG_FILE = DATA_DIR / "config.json"
 
 # ---------------------------------------------------------------------------
@@ -979,22 +981,31 @@ def api_city(city: str):
     except Exception: pass
 
     obs_hi=None; conv_hour: dict={}
+    # Previously this parsed the entire ~290MB lowt_observations.csv row-by-row
+    # on every page load, just to extract two things for one city. Now two
+    # indexed queries against observations.db (city / ticker indexes) return the
+    # same values in milliseconds.
     try:
-        if OBS_FILE.exists():
-            with open(OBS_FILE,newline="",encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row.get("city")!=city: continue
-                    try:
-                        oh=row.get("observed_high_f")
-                        if oh: obs_hi=float(oh)
+        if OBS_DB.exists():
+            con = sqlite3.connect(f"file:{OBS_DB}?mode=ro", uri=True)
+            # latest non-null observed high for this city
+            r = con.execute(
+                "SELECT observed_high_f FROM observations "
+                "WHERE city=? AND observed_high_f IS NOT NULL "
+                "ORDER BY rowid DESC LIMIT 1", (city,)).fetchone()
+            if r and r[0] is not None:
+                try: obs_hi=float(r[0])
+                except (ValueError,TypeError): pass
+            # first local_hour each ticker reached No>=0.97 (convergence hour)
+            for tk, lh in con.execute(
+                "SELECT ticker, local_hour FROM observations o "
+                "WHERE city=? AND no_price>=0.97 "
+                "AND rowid=(SELECT MIN(rowid) FROM observations "
+                "           WHERE ticker=o.ticker AND no_price>=0.97)", (city,)):
+                if tk and lh is not None and tk not in conv_hour:
+                    try: conv_hour[tk]=int(float(lh))
                     except (ValueError,TypeError): pass
-                    tk=row.get("ticker","")
-                    if tk and tk not in conv_hour:
-                        try:
-                            if float(row.get("no_price") or 0)>=0.97:
-                                lh=row.get("local_hour")
-                                if lh: conv_hour[tk]=int(float(lh))
-                        except (ValueError,TypeError): pass
+            con.close()
     except Exception: pass
 
     tlog_by_ticker = {t.get("ticker",""): t for t in trades if t.get("city")==city}
