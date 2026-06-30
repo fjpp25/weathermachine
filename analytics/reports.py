@@ -31,13 +31,21 @@ def render_cells(cells: list[Cell], by: list[str], min_n: int = 0,
         "-" * 79,
     ]
     tot = Cell(key=())
+    any_scar = False
     for c in shown:
         keystr = " | ".join(str(x) for x in c.key)
         wr = f"{c.wr*100:.0f}%" if c.wr is not None else "—"
         wl = f"{c.wilson*100:.0f}%" if c.wilson is not None else "—"
         ppc = f"${c.pnl_per_contract:+.3f}" if c.pnl_per_contract is not None else "—"
+        # Flag net-negative pockets whose loss is one-day-dominated (healed scar),
+        # so they aren't mistaken for chronic underperformance.
+        flag = ""
+        if c.is_scar:
+            any_scar = True
+            wd = c.worst_day
+            flag = f"  ⚠ {c.loss_concentration*100:.0f}% loss from {wd[0]}"
         out.append(f"{keystr:28}{f'{c.n_settled}/{c.n_total}':>9}{c.wins:>5}"
-                   f"{c.losses:>5}{wr:>6}{wl:>8}{c.pnl:>+9.2f}{ppc:>9}")
+                   f"{c.losses:>5}{wr:>6}{wl:>8}{c.pnl:>+9.2f}{ppc:>9}{flag}")
         tot.n_total += c.n_total; tot.n_settled += c.n_settled
         tot.wins += c.wins; tot.losses += c.losses
         tot.pnl += c.pnl; tot.contracts += c.contracts
@@ -46,6 +54,9 @@ def render_cells(cells: list[Cell], by: list[str], min_n: int = 0,
     twl = f"{tot.wilson*100:.0f}%" if tot.wilson is not None else "—"
     out.append(f"{'TOTAL':28}{f'{tot.n_settled}/{tot.n_total}':>9}{tot.wins:>5}"
                f"{tot.losses:>5}{twr:>6}{twl:>8}{tot.pnl:>+9.2f}")
+    if any_scar:
+        out.append("⚠ = net-negative but loss concentrated in one day "
+                   "(likely a healed event, not chronic — investigate before acting)")
     if min_n:
         out.append(f"(cells with < {min_n} settled hidden)")
     return "\n".join(out)

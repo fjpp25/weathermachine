@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import TRADE_LOG, OBS_DB
 from . import wm_time
@@ -149,6 +149,11 @@ class Cell:
     losses: int = 0
     pnl: float = 0.0
     contracts: int = 0
+    # Per-market-date LOSS pnl (only losing trades' negative pnl), for
+    # concentration analysis: distinguishes "one bad day" (a healed-bug scar) from
+    # "steady bleeding". A −$10 pocket from one day and from forty days look
+    # identical in pnl alone but demand opposite actions. This breaks that tie.
+    loss_by_day: dict = field(default_factory=dict)
 
     @property
     def wr(self) -> float | None:
@@ -161,6 +166,40 @@ class Cell:
     @property
     def pnl_per_contract(self) -> float | None:
         return self.pnl / self.contracts if self.contracts else None
+
+    @property
+    def n_loss_days(self) -> int:
+        return len(self.loss_by_day)
+
+    @property
+    def worst_day(self) -> tuple | None:
+        """(date, pnl) of the single worst loss-day, or None if no losses."""
+        if not self.loss_by_day:
+            return None
+        d = min(self.loss_by_day, key=lambda k: self.loss_by_day[k])
+        return (d, self.loss_by_day[d])
+
+    @property
+    def loss_concentration(self) -> float | None:
+        """Fraction of TOTAL loss dollars coming from the single worst day.
+        ~1.0 = essentially all losses are one day (scar); ~0 = diffuse.
+        None if the cell has no losses."""
+        total_loss = sum(v for v in self.loss_by_day.values())  # negative
+        if total_loss == 0:
+            return None
+        worst = self.worst_day[1]
+        return worst / total_loss  # both negative -> positive ratio in [0,1]
+
+    @property
+    def is_scar(self) -> bool:
+        """Heuristic: a net-negative cell whose loss is dominated by one day.
+        Flags the 'healed bug-day' pattern so it isn't mistaken for chronic
+        underperformance. Requires net-negative PnL, the worst day accounting for
+        >=70% of all loss dollars, and >=3 losses (so tiny cells don't trip it)."""
+        if self.pnl >= 0 or self.n_loss_days < 1:
+            return False
+        conc = self.loss_concentration
+        return conc is not None and conc >= 0.70 and self.losses >= 3
 
 
 # axis name -> extractor. Add axes here; reports & CLI pick them up automatically.
@@ -195,5 +234,8 @@ def aggregate(trades: list[Trade], by: list[str]) -> list[Cell]:
                 c.wins += 1
             else:
                 c.losses += 1
+                # record this loss against its market-date for concentration
+                d = t.market_date or "?"
+                c.loss_by_day[d] = c.loss_by_day.get(d, 0.0) + t.net_pnl
             c.pnl += t.net_pnl
     return list(cells.values())
