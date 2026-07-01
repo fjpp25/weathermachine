@@ -116,8 +116,37 @@ def main():
             print(f"  {ticker}  ({len(fills)} fill record(s))  first_seen={min(times)}")
         if n_tickers > 20:
             print(f"  ... and {n_tickers - 20} more distinct tickers")
+
+        # NEW: dollar-value summary, filtered to today — directly tests
+        # whether missing fills are large enough to explain a specific
+        # deployed-vs-logged gap (e.g. sweep's $5.43 unexplained deployed
+        # capital on 2026-07-01), using the confirmed real field names
+        # (count_fp, no_price_dollars) rather than the earlier wrong guesses.
+        from datetime import date as _date, datetime as _dt
+        today = str(_date.today())
+        today_total = 0.0
+        today_tickers = []
+        for ticker, fills in missing_by_ticker.items():
+            for f in fills:
+                ct = f.get("created_time", "")
+                try:
+                    if _dt.fromisoformat(ct.replace("Z", "+00:00")).date() != _date.today():
+                        continue
+                except ValueError:
+                    continue
+                count = float(f.get("count_fp", 0) or 0)
+                price = float(f.get("no_price_dollars", 0) or 0)
+                today_total += count * price
+                if ticker not in today_tickers:
+                    today_tickers.append(ticker)
+        print(f"\n  Missing fills dated TODAY ({today}): {len(today_tickers)} "
+              f"distinct ticker(s), ${today_total:.2f} total notional.")
+        print(f"  Compare against any known same-day deployed-vs-logged gap "
+              f"(e.g. via tools/audit_trade_log_today.py) — a close match is "
+              f"strong evidence those specific missing fills explain that gap.")
     else:
         print(f"\nNo mismatches found in the fills window Kalshi returned — "
+
               f"every 'no' fill has a matching trade_log.json entry. This is "
               f"reassuring for the checkable window, but per the rolling-cutoff "
               f"limitation above, doesn't clear the full historical period.")

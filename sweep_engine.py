@@ -660,8 +660,17 @@ def _place(
     effective_remaining = real_remaining - already_paper_spent
 
     if cost > 0 and effective_remaining < cost:
-        log.debug(
-            "sweep: %s — budget exhausted (paper=%s, cost=$%.2f "
+        # Was log.debug — invisible in the standard INFO-level journal, while
+        # the "★ SIGNAL" line that triggered this call fires at INFO with the
+        # same visual prominence as an actual placed order. Observed in
+        # production: 11 "★ SWEEP"/"★ DEAD" lines in one poll, all logged
+        # AFTER sweep's remaining budget had already hit $0.00 (visible only
+        # via a separate EngineCapital log line elsewhere), giving the false
+        # impression that 11 orders went out when the honest answer is
+        # probably close to 1. Upgraded to INFO so a rejection is exactly as
+        # visible as the signal that triggered it — no behavior change.
+        log.info(
+            "sweep: %s — SKIPPED, budget exhausted (paper=%s, cost=$%.2f "
             "real_remaining=$%.2f paper_spent_this_run=$%.2f)",
             ticker, paper, cost, real_remaining, already_paper_spent,
         )
