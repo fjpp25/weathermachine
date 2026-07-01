@@ -83,21 +83,39 @@ def main():
           f"({len(no_fills)} on the 'no' side — the only side these engines "
           f"place). Note the rolling cutoff — see module docstring.")
 
-    missing = []
+    if no_fills:
+        print(f"\nSample raw fill object (to verify field names below are "
+              f"correct, since prior guesses for count/price/time were wrong "
+              f"— they all printed as None):")
+        print(json.dumps(no_fills[0], indent=2))
+
+    # FIXED: previously iterated per raw fill record and flagged each one
+    # individually. A single placed order can generate MULTIPLE partial-fill
+    # records on Kalshi's side (filled by several different counterparties)
+    # while our side only ever writes ONE trade_log entry per placed order.
+    # The original version double/triple/quadruple-counted this as separate
+    # "missing" incidents — confirmed directly: of the first 20 raw rows
+    # printed in one run, only 15 were distinct tickers. Group by ticker
+    # first; report distinct-ticker count as the headline number, with the
+    # raw fill count as secondary context.
+    missing_by_ticker: dict[str, list] = {}
     for f in no_fills:
         ticker = f.get("ticker", "")
         if ticker and ticker not in logged_tickers:
-            missing.append(f)
+            missing_by_ticker.setdefault(ticker, []).append(f)
 
-    if missing:
-        print(f"\n*** {len(missing)} 'no' fill(s) on Kalshi with NO matching "
-              f"trade_log.json entry — evidence of lost write(s): ***")
-        for f in missing[:20]:
-            print(f"  {f.get('ticker')}  count={f.get('count')}  "
-                  f"price={f.get('yes_price') or f.get('price')}  "
-                  f"time={f.get('created_time') or f.get('created_at')}")
-        if len(missing) > 20:
-            print(f"  ... and {len(missing) - 20} more")
+    if missing_by_ticker:
+        n_tickers = len(missing_by_ticker)
+        n_raw = sum(len(v) for v in missing_by_ticker.values())
+        print(f"\n*** {n_tickers} DISTINCT ticker(s) with a 'no' fill on Kalshi "
+              f"but NO matching trade_log.json entry ({n_raw} raw fill records "
+              f"— some tickers have multiple partial fills, not separate "
+              f"incidents) — evidence of lost write(s): ***")
+        for ticker, fills in list(missing_by_ticker.items())[:20]:
+            times = [f.get("created_time", f.get("created_at", "?")) for f in fills]
+            print(f"  {ticker}  ({len(fills)} fill record(s))  first_seen={min(times)}")
+        if n_tickers > 20:
+            print(f"  ... and {n_tickers - 20} more distinct tickers")
     else:
         print(f"\nNo mismatches found in the fills window Kalshi returned — "
               f"every 'no' fill has a matching trade_log.json entry. This is "
