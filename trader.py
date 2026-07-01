@@ -38,6 +38,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Cross-platform advisory file lock. fcntl is POSIX-only (the Pi, where this
+# actually runs live) — msvcrt covers Windows dev-environment usage (the
+# stated Windows/PyCharm -> GitHub -> Pi workflow) so this module still
+# imports cleanly there even though real trading never happens there.
+try:
+    import fcntl
+
+    def _lock_file(f):
+        fcntl.flock(f, fcntl.LOCK_EX)
+
+    def _unlock_file(f):
+        fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:                                        # pragma: no cover
+    import msvcrt
+
+    def _lock_file(f):
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _unlock_file(f):
+        f.seek(0)
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+
 # Timestamps in positions table are shown in this timezone
 DISPLAY_TZ = ZoneInfo("Europe/Lisbon")
 
@@ -94,6 +120,51 @@ TRADE_LOG_FILE     = Path("data/trade_log.json")
 ENGINE_CAPITAL_FILE = Path("data/engine_capital_deployed.json")
 
 
+def _locked_json_rmw(path: Path, mutate_fn, default):
+    """
+    Read-modify-write a JSON file while holding an exclusive OS-level lock
+    for the WHOLE read+mutate+write cycle — not just the write.
+
+    WHY THIS EXISTS: scheduler.py runs 6 engines concurrently as threads in
+    one process via ThreadPoolExecutor(max_workers=6), every poll cycle —
+    not an occasional edge case, the normal operating mode. Manual
+    invocations (e.g. `python3 sweep_engine.py --paper`) add a fully
+    separate OS process on top of that. Every engine's _append_trade_log
+    call did an unsynchronized read-modify-write on the SAME file
+    (data/trade_log.json): read the whole list, append, write the whole
+    list back. If two callers' cycles overlap, the second writer's read
+    predates the first writer's write, so the second write silently
+    discards the first entry — a genuinely lost trade record, with no
+    trace left behind to detect it after the fact. flock() serializes the
+    whole cycle across threads AND processes (POSIX advisory locks are
+    respected process-wide, not just within one interpreter), closing that
+    window. See tools/audit_trade_log_today.py / audit_trade_log_vs_kalshi.py
+    for how to check whether this already caused a loss historically.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(json.dumps(default))
+
+    with open(path, "r+") as f:
+        _lock_file(f)
+        try:
+            f.seek(0)
+            raw = f.read()
+            try:
+                data = json.loads(raw) if raw.strip() else default
+            except (json.JSONDecodeError, ValueError):
+                data = default
+            data = mutate_fn(data)
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+            return data
+        finally:
+            _unlock_file(f)
+
+
 def _append_trade_log(entry: dict):
     """
     Append one trade entry to data/trade_log.json.
@@ -104,16 +175,16 @@ def _append_trade_log(entry: dict):
     Fields saved:
       ticker, city, side, market_type, score, score_detail,
       entry_price, contracts, placed_at (UTC ISO), paper (bool)
+
+    Locked end-to-end via _locked_json_rmw — see that function's docstring
+    for why this matters (concurrent engines were previously able to lose
+    each other's entries silently).
     """
-    TRADE_LOG_FILE.parent.mkdir(exist_ok=True)
-    existing: list = []
-    if TRADE_LOG_FILE.exists():
-        try:
-            existing = json.loads(TRADE_LOG_FILE.read_text())
-        except Exception:
-            existing = []
-    existing.append(entry)
-    TRADE_LOG_FILE.write_text(json.dumps(existing, indent=2, default=str))
+    def _mutate(existing: list) -> list:
+        existing.append(entry)
+        return existing
+
+    _locked_json_rmw(TRADE_LOG_FILE, _mutate, default=[])
 
 
 # ---------------------------------------------------------------------------
@@ -387,14 +458,44 @@ class EngineCapital:
         return {e: 0.0 for e in ENGINE_ALLOCATIONS}
 
     def _save_deployed(self) -> None:
-        """Persist today's deployed amounts to disk."""
+        """
+        Persist today's deployed amounts to disk.
+
+        Lock-protects the WRITE against torn/interleaved output if another
+        process writes concurrently. This is a narrower fix than
+        _append_trade_log's — within one process, all 6 scheduler threads
+        share the SAME EngineCapital instance and _deployed dict (it's a
+        module-level singleton via get_engine_capital()), so in-process
+        increments are already correctly accumulated before this is called.
+        The remaining gap is cross-PROCESS: two fully separate live (non-
+        paper) processes each holding their own independently-loaded
+        _deployed dict could still each write a version that doesn't
+        include the other's increments — the lock prevents a corrupted/
+        garbled file from concurrent writes, but doesn't merge two
+        divergent in-memory totals. That would need a real transactional
+        store (e.g. a SQLite row with an atomic UPDATE ... SET x = x + ?)
+        rather than a flat JSON snapshot — not done here; flagging it as a
+        known remaining limitation rather than claiming this fully closes
+        the gap for that specific scenario.
+        """
         from datetime import date as _date
         try:
             ENGINE_CAPITAL_FILE.parent.mkdir(parents=True, exist_ok=True)
-            ENGINE_CAPITAL_FILE.write_text(json.dumps({
-                "date":     str(_date.today()),
-                "deployed": self._deployed,
-            }))
+            if not ENGINE_CAPITAL_FILE.exists():
+                ENGINE_CAPITAL_FILE.write_text("{}")
+            with open(ENGINE_CAPITAL_FILE, "r+") as f:
+                _lock_file(f)
+                try:
+                    f.seek(0)
+                    f.truncate()
+                    json.dump({
+                        "date":     str(_date.today()),
+                        "deployed": self._deployed,
+                    }, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    _unlock_file(f)
         except Exception as e:
             log.warning("EngineCapital: could not save deployed to disk: %s", e)
 
