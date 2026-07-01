@@ -189,6 +189,19 @@ _sweep_entered: set[str] = set()
 _active_next_date: dict[str, str] = {}
 _fired_signals:    set[tuple[str, str]] = set()
 
+# Paper-mode-only capital simulation. In-memory, per-process, NEVER persisted
+# to disk. This is deliberately a SEPARATE mechanism from EngineCapital.record()
+# — that method writes to data/engine_capital_deployed.json, the SAME file the
+# live weathermachine service reads for real budget decisions. If paper mode
+# called .record() there, running --paper alongside the live service (which we
+# have direct evidence happens — see the 429 investigation) would silently
+# inflate the "deployed" figure the live engine uses to decide whether it can
+# still trade, throttling real trading based on phantom paper activity. This
+# dict simulates budget exhaustion realistically (starting from the REAL
+# remaining budget, which is a read-only, safe query) without ever writing
+# anything back.
+_paper_deployed: dict[str, float] = {}
+
 
 # ---------------------------------------------------------------------------
 # Date helpers
@@ -616,21 +629,63 @@ def _place(
     paper:      bool,
     _trader,
 ) -> bool:
-    """Place one No order and record it. Returns True on success."""
+    """
+    Place one No order and record it. Returns True on success.
+
+    BUGFIX (see conversation history): paper mode previously never wrote to
+    trade_log.json at all — it logged "[PAPER] would place ..." to the
+    console and returned, with no persisted record. That made any later
+    "let it run in paper mode for a few days and compare" plan impossible
+    to actually check, since there was nothing to query afterward except
+    raw console/journald output. Paper entries are now persisted with
+    "paper": True, same file, same schema as live entries.
+
+    Budget checking is intentionally NOT done via _cap.can_deploy() /
+    _cap.record() for the paper path — see _paper_deployed's module-level
+    comment for why (shared-file corruption risk if a manual --paper run
+    overlaps with the live service, which we have direct evidence happens).
+    Paper mode instead starts from the REAL remaining budget (read-only,
+    safe) and subtracts its own in-memory, non-persisted running total.
+    """
     cost = round(no_p * contracts, 4)
 
     try:
         _cap = _trader.get_engine_capital()
-        if not _cap.can_deploy("sweep", cost):
-            log.debug("sweep: %s — budget exhausted (cost=$%.2f remaining=$%.2f)",
-                      ticker, cost, _cap.remaining("sweep"))
-            return False
+        real_remaining = _cap.remaining("sweep")
     except Exception as e:
         log.warning("sweep: capital check failed %s: %s", ticker, e)
         return False
 
+    already_paper_spent = _paper_deployed.get("sweep", 0.0) if paper else 0.0
+    effective_remaining = real_remaining - already_paper_spent
+
+    if cost > 0 and effective_remaining < cost:
+        log.debug(
+            "sweep: %s — budget exhausted (paper=%s, cost=$%.2f "
+            "real_remaining=$%.2f paper_spent_this_run=$%.2f)",
+            ticker, paper, cost, real_remaining, already_paper_spent,
+        )
+        return False
+
     if paper:
         log.info("  [PAPER] would place No %dc @ $%.2f on %s", contracts, no_p, ticker)
+        try:
+            _trader._append_trade_log({
+                "ticker":       ticker,
+                "city":         city,
+                "side":         "no",
+                "market_type":  "high",
+                "score":        5,
+                "score_detail": score_detail,
+                "entry_price":  no_p,
+                "contracts":    contracts,
+                "placed_at":    datetime.now(timezone.utc).isoformat(),
+                "paper":        True,
+                "entry_tier":   entry_tier,
+            })
+        except Exception as e:
+            log.warning("sweep: paper trade_log write failed %s: %s", ticker, e)
+        _paper_deployed["sweep"] = round(already_paper_spent + cost, 4)
         _sweep_entered.add(ticker)
         return True
 
@@ -656,7 +711,7 @@ def _place(
             "paper":        False,
             "entry_tier":   entry_tier,
         })
-        _trader.get_engine_capital().record("sweep", cost)
+        _cap.record("sweep", cost)
         _sweep_entered.add(ticker)
         return True
     except Exception as e:
@@ -930,7 +985,15 @@ if __name__ == "__main__":
     load_config_env()
 
     import trader
-    client = trader.make_client()
+    # trader.make_client()'s confirmation prompt is gated on KALSHI_DEMO
+    # (production vs sandbox API) — it has no concept of --paper, so it was
+    # showing "*** LIVE TRADING MODE — real money at risk ***" even on
+    # --paper runs, where no order is ever submitted (see _place(): `if
+    # paper: ... return True` before _trader.place_order() is reached).
+    # That's a false alarm dressed as a real one — the kind of warning that
+    # eventually trains someone to click through it. Paper mode should read
+    # real production prices (not a thin sandbox book) without the scare.
+    client = trader.make_client(skip_confirmation=args.paper)
     initialise(client=client, city_filter=args.city)
     log_config()
     run_scan(client=client, city_filter=args.city, paper=args.paper)
