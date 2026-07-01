@@ -33,7 +33,15 @@ USAGE (on the Pi, from repo root):
     python3 tools/audit_trade_log_vs_kalshi.py
 """
 import json
+import sys
 from pathlib import Path
+
+# Running as `python3 tools/audit_trade_log_vs_kalshi.py` only puts tools/
+# on sys.path, not the repo root — `import trader` fails otherwise. Insert
+# the repo root explicitly rather than requiring PYTHONPATH=. or a
+# different invocation style, to stay consistent with how every other
+# tools/*.py script in this repo is actually run.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 TRADE_LOG = Path("data/trade_log.json")
 
