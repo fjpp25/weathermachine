@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
 """
-tools/probe_dead_on_arrival.py — v2
+tools/probe_dead_on_arrival.py — v3
 
-v2 CHANGES FROM v1
+v3 CHANGES FROM v2
 --------------------
-1. FIXED THE BIG ONE: v1 treated any bracket with yes_price <= threshold as
-   "dead on arrival". But observations.db stores yes_price/no_price via
-   `float(m.get("yes_bid_dollars") or 0)` — a bracket with NO quote yet
-   (brand-new market, no market-maker has posted a bid) is stored as
-   yes_price=0, no_price=0, IDENTICAL to a genuinely dead, liquid bracket.
-   sweep_engine.py's own live code already guards against this (_has_price(),
-   "we must not treat 'no data' as 'fully dismissed'") — that guard was
-   missing here. Evidence this was happening: v1 reported 582/1160 LOWT
-   market-days (50%!) with ALL 6 brackets simultaneously <= 0.05 Yes. Six
-   mutually exclusive, exhaustive outcomes can't all genuinely price at
-   <=5% (they'd sum to <=30%, not ~100%) — that's a no-quote artifact, not
-   a signal.
-
-   Fix: a snapshot's whole 6-bracket ladder is only trusted if
-   sum(yes_price) is within LADDER_SUM_BAND of 1.0 (a real priced market),
-   AND a candidate bracket is only counted as "dead" if its own
-   yes_price + no_price is within RUNG_SUM_BAND of 1.0 (a real two-sided
-   quote on THAT rung specifically, not just a plausible ladder-wide sum).
-2. FIXED: trade-log tier lookup wasn't filtered by ticker prefix per
-   --market, so a lowt run would (harmlessly, but incorrectly) check
-   against every "tomorrow_dismissed" ticker regardless of market. Now
-   filtered by KXHIGH*/KXLOWT* prefix matching --market.
-3. ADDED: reports how many candidate snapshots got REJECTED by the new
-   liquidity filters, at each threshold, so the size of the artifact from
-   v1 is visible rather than silently corrected away.
+1. ADDED: timing-gap diagnostic. v2 fixed the no-quote-artifact bug by
+   skipping ahead to the first poll with a trusted ladder sum, but never
+   reported HOW FAR ahead that skip typically goes. If it's usually the very
+   next poll (~15 min), "dead on arrival" is still a fair description. If
+   it's routinely hours later, we're measuring something further from real
+   market open than intended, and that needs to be said plainly rather than
+   assumed away.
+2. ADDED: miss-reason breakdown. Rather than assume DISMISSED_NO_MAX=0.94 is
+   why live coverage is thin, this classifies every MISSED candidate against
+   the actual live gates in sweep_engine.py:
+     - bracket type (T vs B) — _check_dismissed only ever looks at T brackets
+     - No price >= DISMISSED_NO_MAX (0.94) — excluded by the ceiling
+       regardless of type
+     - "other" — type-eligible (T) and under the ceiling, but still missed
+       (this bucket is the interesting one — it's neither the type gap nor
+       the price ceiling, so if it's non-trivial, something else is going on
+       and needs its own explanation before any threshold gets moved)
+3. ADDED: loss concentration check (same pattern as the earlier furthest-3
+   scar check) — at this win rate, losses are rare enough that a handful of
+   bad city-days could be doing most of the damage. Only meaningful once
+   n_settled is large enough per threshold; skipped otherwise.
 
 USAGE (on the Pi, from repo root):
     python3 tools/probe_dead_on_arrival.py
@@ -45,17 +41,16 @@ TRADE_LOG = "data/trade_log.json"
 
 THRESHOLDS = [0.05, 0.07, 0.10, 0.15]
 
-# A real, priced 6-bracket ladder should have yes_prices summing near 1.0
-# (mutually exclusive, exhaustive outcomes). Wide band because early-market
-# pricing is noisy, not because we want to be lenient about no-quote rows.
 LADDER_SUM_BAND = (0.70, 1.30)
-
-# A specific rung is only trusted as a genuine two-sided quote if its own
-# yes_price + no_price is close to 1.0 (real market, real spread) rather
-# than both sitting at/near 0 (no quote posted yet on that rung).
 RUNG_SUM_BAND = (0.85, 1.10)
 
 TICKER_PREFIX = {"high": "KXHIGH", "lowt": "KXLOWT"}
+
+# Mirrors sweep_engine.py's DISMISSED_NO_MAX — kept as a local constant
+# rather than imported, since this script must run standalone without the
+# live trading environment. If that constant changes in sweep_engine.py,
+# update it here too.
+DISMISSED_NO_MAX = 0.94
 
 
 def wilson_lower(wins, n, z=1.96):
@@ -77,12 +72,21 @@ def market_date(ticker):
     return parts[1] if len(parts) >= 2 else "?"
 
 
+def bracket_code_type(code):
+    """'T' or 'B' from the stored bracket code string, or None."""
+    if code and code[0] in ("T", "B"):
+        return code[0]
+    return None
+
+
 def load_tomorrow_opens(con, market_type):
     """
-    Returns dict (city, market_date) -> list of (ticker, code, yes_price,
-    no_price) at the EARLIEST poll with a complete 6-bracket ladder, PLUS
-    diagnostics on how many of those ladders look like real priced markets
-    vs. no-quote artifacts.
+    Returns:
+      opens: dict (city, market_date) -> (accepted_poll_time, rungs,
+             polls_skipped, first_poll_time)
+      incomplete: count of market-days that never had a complete ladder
+      total_days: count of market-days seen at all
+      ladder_sum_rejected: total rejected first-poll-onward attempts
     """
     mt = f"{market_type}_tomorrow"
     rows = con.execute("""
@@ -102,23 +106,26 @@ def load_tomorrow_opens(con, market_type):
     incomplete = 0
     ladder_sum_rejected = 0
     for key, polls in grouped.items():
-        for pt in sorted(polls):
+        sorted_polls = sorted(polls)
+        first_pt = sorted_polls[0] if sorted_polls else None
+        skipped = 0
+        for pt in sorted_polls:
             rungs = polls[pt]
-            if len(rungs) == 6:
-                ladder_sum = sum((yp or 0.0) for _, _, yp, _ in rungs)
-                if not (LADDER_SUM_BAND[0] <= ladder_sum <= LADDER_SUM_BAND[1]):
-                    ladder_sum_rejected += 1
-                    continue   # keep looking at later polls for this market-day
-                opens[key] = rungs
-                break
+            if len(rungs) != 6:
+                continue
+            ladder_sum = sum((yp or 0.0) for _, _, yp, _ in rungs)
+            if not (LADDER_SUM_BAND[0] <= ladder_sum <= LADDER_SUM_BAND[1]):
+                ladder_sum_rejected += 1
+                skipped += 1
+                continue
+            opens[key] = (pt, rungs, skipped, first_pt)
+            break
         else:
             incomplete += 1
     return opens, incomplete, len(grouped), ladder_sum_rejected
 
 
 def load_trade_log_tier_counts(market_type):
-    """ticker -> list of trade_log records with entry_tier in the
-    dismissed/gradient family, filtered to this market's ticker prefix."""
     try:
         raw = json.load(open(TRADE_LOG))
     except FileNotFoundError:
@@ -144,14 +151,34 @@ def main():
     opens, incomplete, total_days, ladder_rejected = load_tomorrow_opens(con, args.market)
     print(f"=== OPEN-LADDER COVERAGE ({args.market}_tomorrow) ===")
     print(f"  market-days seen (any data):        {total_days}")
-    print(f"  market-days with a trusted open ladder (sum-of-Yes in "
-          f"{LADDER_SUM_BAND}): {len(opens)}")
+    print(f"  market-days with a trusted open ladder: {len(opens)}")
     print(f"  market-days never had a complete 6-bracket ladder: {incomplete}")
-    print(f"  market-day FIRST snapshots rejected as no-quote artifacts "
-          f"(kept looking at later polls): {ladder_rejected}")
-    print("  ^ this last number is the size of the v1 bug — if it's large,")
-    print("    v1's 'market open' proxy was frequently a pre-liquidity moment,")
-    print("    not a real priced ladder.")
+    print(f"  total no-quote-artifact rejections across all market-days: {ladder_rejected}")
+
+    # --- NEW: timing gap diagnostic ---
+    print("\n=== TIMING GAP: how many polls before we trust the ladder? ===")
+    print("  (0 = the very first poll was already trustworthy; higher = we")
+    print("   skipped ahead — if this skews high, 'open' is later than we think)")
+    skip_hist = Counter(v[2] for v in opens.values())
+    for k in sorted(skip_hist):
+        print(f"    skipped {k} poll(s): {skip_hist[k]} market-days")
+    # wall-clock gap for the skipped cases
+    from datetime import datetime as _dt
+    gaps_min = []
+    for pt, rungs, skipped, first_pt in opens.values():
+        if skipped > 0 and first_pt:
+            try:
+                t1 = _dt.strptime(first_pt, "%Y-%m-%dT%H:%M:%SZ")
+                t2 = _dt.strptime(pt, "%Y-%m-%dT%H:%M:%SZ")
+                gaps_min.append((t2 - t1).total_seconds() / 60)
+            except Exception:
+                pass
+    if gaps_min:
+        gaps_min.sort()
+        n = len(gaps_min)
+        print(f"  wall-clock gap when we DID skip (minutes): "
+              f"median={gaps_min[n//2]:.0f}  p75={gaps_min[3*n//4]:.0f}  "
+              f"p95={gaps_min[int(n*0.95)]:.0f}  max={gaps_min[-1]:.0f}")
 
     by_ticker = load_trade_log_tier_counts(args.market)
     print(f"\n=== RE-ENTRY BUG CHECK (entry_tier='tomorrow_dismissed', "
@@ -162,23 +189,18 @@ def main():
     for tk, recs in list(repeats.items())[:10]:
         prices = [r.get("entry_price") for r in recs]
         print(f"    {tk}: {len(recs)}x  prices={prices}")
-    if not by_ticker:
-        print("  (no live entries under this tier for this market — expected "
-              "for LOWT, which has no dismissed/gradient signal implemented "
-              "at all yet)")
 
     live_tickers = set(by_ticker.keys())
 
     for thresh in THRESHOLDS:
         candidates = []
         rung_rejected = 0
-        for (city, md), rungs in opens.items():
+        for (city, md), (pt, rungs, skipped, first_pt) in opens.items():
             for ticker, code, yes_p, no_p in rungs:
                 if yes_p is None or no_p is None:
                     continue
                 if yes_p > thresh:
                     continue
-                # per-rung liquidity check: is this a real two-sided quote?
                 if not (RUNG_SUM_BAND[0] <= (yes_p + no_p) <= RUNG_SUM_BAND[1]):
                     rung_rejected += 1
                     continue
@@ -190,7 +212,8 @@ def main():
                 })
 
         n = len(candidates)
-        caught = sum(1 for c in candidates if c["caught_live"])
+        caught = [c for c in candidates if c["caught_live"]]
+        missed = [c for c in candidates if not c["caught_live"]]
         settled_c = [c for c in candidates if c["result"] in ("no", "yes")]
         wins = sum(1 for c in settled_c if c["result"] == "no")
         pnl = sum(
@@ -202,24 +225,44 @@ def main():
         wr = wins / n_settled * 100 if n_settled else 0
         lb = wilson_lower(wins, n_settled) * 100 if n_settled else 0
 
-        per_day = Counter()
-        for (city, md), rungs in opens.items():
-            cnt = sum(
-                1 for _, _, yp, np in rungs
-                if yp is not None and np is not None and yp <= thresh
-                and RUNG_SUM_BAND[0] <= (yp + np) <= RUNG_SUM_BAND[1]
-            )
-            per_day[cnt] += 1
+        # --- NEW: miss-reason breakdown ---
+        reason_counts = Counter()
+        for c in missed:
+            btype = bracket_code_type(c["code"])
+            over_ceiling = c["no_p"] >= DISMISSED_NO_MAX
+            if btype == "B":
+                reason_counts["B-bracket (dismissed_t is T-only)"] += 1
+            elif over_ceiling:
+                reason_counts["T-bracket, No >= 0.94 (excluded by ceiling)"] += 1
+            else:
+                reason_counts["T-bracket, under ceiling — UNEXPLAINED MISS"] += 1
 
         print(f"\n=== threshold Yes <= {thresh:.2f} ===")
-        print(f"  rung-level candidates REJECTED as no-quote artifacts: {rung_rejected}")
-        print(f"  candidates found (after liquidity filter):  {n}   "
-              f"caught live: {caught}   MISSED: {n - caught}")
+        print(f"  candidates: {n}   caught live: {len(caught)}   missed: {len(missed)}")
         print(f"  settled: {n_settled}  WR: {wr:.0f}%  Wilson_LB: {lb:.0f}%  "
-              f"PnL if we'd entered ALL of them: ${pnl:+.2f}")
-        print("  per-market-day count of qualifying (liquid) brackets:")
-        for cnt in sorted(per_day):
-            print(f"    {cnt} bracket(s)/day: {per_day[cnt]} market-days")
+              f"PnL if we'd entered ALL: ${pnl:+.2f}")
+        print("  miss reasons:")
+        for reason, cnt in reason_counts.most_common():
+            print(f"    {reason}: {cnt}")
+
+        # --- NEW: loss concentration, only if enough losses to be meaningful ---
+        losses = [c for c in settled_c if c["result"] == "yes"]
+        if len(losses) >= 5:
+            for axis_name, axis_fn in (("city", lambda c: c["city"]),
+                                        ("market_date", lambda c: c["market_date"])):
+                loss_by_key = defaultdict(float)
+                for c in losses:
+                    loss_by_key[axis_fn(c)] += (-c["no_p"] - fee(c["no_p"]))
+                total_loss = sum(loss_by_key.values())
+                worst_key = min(loss_by_key, key=lambda k: loss_by_key[k])
+                conc = loss_by_key[worst_key] / total_loss if total_loss else 0
+                print(f"  loss concentration by {axis_name}: worst={worst_key!r} "
+                      f"(${loss_by_key[worst_key]:+.2f}), "
+                      f"{len(loss_by_key)} distinct loss-{axis_name}s, "
+                      f"concentration={conc:.0%}"
+                      + ("  <-- SCAR-LIKE" if conc >= 0.5 and len(loss_by_key) >= 3 else ""))
+        else:
+            print(f"  ({len(losses)} losses — too few for a concentration check)")
 
     con.close()
 
