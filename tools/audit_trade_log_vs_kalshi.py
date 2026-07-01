@@ -78,10 +78,33 @@ def main():
         return
 
     fills = resp.get("fills", [])
-    no_fills = [f for f in fills if str(f.get("side", "")).lower() == "no"]
+
+    # FIXED: this previously filtered only on side=="no" (which side of the
+    # market — Yes vs No), completely ignoring "action" (buy vs sell). That
+    # silently mixed ENTRIES (buy No — what trade_log.json is meant to
+    # capture) with EXITS (sell No — closing an existing No position).
+    # Confirmed via source: trader.py's check_exits() calls place_order(...,
+    # action="sell", ...) with NO _append_trade_log() call anywhere nearby —
+    # exits are placed but never logged, by design. Comparing a sell fill
+    # against an entry-only log and calling the absence "evidence of a lost
+    # write" was a methodology error, not a real finding. Every "missing
+    # fills" number this script has reported so far may be inflated by an
+    # unknown amount from this — re-run and treat the corrected numbers as
+    # authoritative, not the earlier ones.
+    entry_fills = [f for f in fills
+                   if str(f.get("side", "")).lower() == "no"
+                   and str(f.get("action", "")).lower() == "buy"]
+    exit_fills_excluded = sum(
+        1 for f in fills
+        if str(f.get("side", "")).lower() == "no"
+        and str(f.get("action", "")).lower() != "buy"
+    )
     print(f"Kalshi /portfolio/fills: {len(fills)} total fills returned "
-          f"({len(no_fills)} on the 'no' side — the only side these engines "
-          f"place). Note the rolling cutoff — see module docstring.")
+          f"({len(entry_fills)} No-side BUY/entry fills, "
+          f"{exit_fills_excluded} No-side non-buy fills excluded — likely "
+          f"exits, which are never expected to have a trade_log.json entry). "
+          f"Note the rolling cutoff — see module docstring.")
+    no_fills = entry_fills   # keep the rest of the script's variable name
 
     if no_fills:
         print(f"\nSample raw fill object (to verify field names below are "
