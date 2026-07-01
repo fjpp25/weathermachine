@@ -37,6 +37,7 @@ from log_setup import get_logger
 import trader
 import hight_decision_engine as decision_engine
 import sweep_engine
+import cascade_engine
 import peak_scanner
 import last_bracket
 import evening_convergence
@@ -134,6 +135,20 @@ def run_scheduler(
         sweep_engine.initialise(client=client, city_filter=city_filter)
     except Exception as e:
         log.warning("sweep engine init error (non-fatal): %s", e)
+
+    # cascade_engine.py never had this — its six session dedup sets
+    # (_cascade_entered, _td_entered, _lowt_bu_entered, _lowt_td_entered,
+    # _ratchet_entered, _ovn_entered) were purely in-memory with no
+    # recovery on restart. Confirmed causing a real duplicate order in
+    # production: KXLOWTHOU-26JUL01-B75.5 was bought twice, once before a
+    # restart and once after, because cascade had no memory of the first
+    # entry once the process restarted. See cascade_engine.initialise()'s
+    # docstring for the full account.
+    log.info("initialising cascade engine...")
+    try:
+        cascade_engine.initialise(client=client, city_filter=city_filter)
+    except Exception as e:
+        log.warning("cascade engine init error (non-fatal): %s", e)
 
     sweep_engine.log_config()
     peak_scanner.log_config()

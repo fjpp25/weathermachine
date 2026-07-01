@@ -221,6 +221,68 @@ _ovn_yes_by_hour:  dict[str, dict[int, float]] = {}
 _ovn_entered:      set[str]                    = set()
 
 
+def initialise(client, city_filter: str = None) -> None:
+    """
+    Recover session state on startup.
+
+    WHY THIS WAS MISSING: sweep_engine.py has had this exact pattern for a
+    while (see its own initialise(), which populates _sweep_entered from
+    live positions so a restart never causes re-entry into an already-held
+    bracket). cascade_engine.py's SIX separate dedup sets (_cascade_entered,
+    _td_entered, _lowt_bu_entered, _lowt_td_entered, _ratchet_entered,
+    _ovn_entered) never had an equivalent — they were purely session-scoped,
+    in-memory, and silently wiped on every restart with no recovery at all.
+
+    CONCRETE EVIDENCE this was a real, not theoretical, gap: KXLOWTHOU-
+    26JUL01-B75.5 was bought twice in production — once at 05:17 UTC
+    (No=$0.85), tagged cascade_lowt_bu, then AGAIN at 19:13 UTC (No=$0.94,
+    a WORSE price) after a service restart at ~19:0x wiped _lowt_bu_entered
+    clean. cascade_engine.py had no memory of the earlier entry once the
+    process restarted, so the same signal logic fired again on the same
+    ticker.
+
+    CONSERVATIVE BY DESIGN: rather than trying to infer which of the six
+    signal types originally entered a given ticker (that information lives
+    in trade_log.json's entry_tier, not on the live position itself, and
+    guessing wrong would under-protect), every currently-held ticker is
+    added to ALL SIX sets. This means a restart makes cascade slightly more
+    conservative right after startup (it won't re-signal on anything
+    already held, regardless of which specific cascade variant would have
+    fired) rather than risk under-protecting any one of them. Matches the
+    same safety-over-precision choice sweep_engine.py already makes with
+    its own single unified set.
+    """
+    global _cascade_entered, _td_entered, _lowt_bu_entered, _lowt_td_entered
+    global _ratchet_entered, _ovn_entered
+
+    from log_setup import get_logger as _gl
+    _log = _gl("cascade_engine")
+
+    try:
+        import trader as _trader
+        live = _trader.get_positions(client)
+        recovered = 0
+        for pos in live:
+            ticker = pos.get("ticker", "")
+            if not ticker:
+                continue
+            if not (ticker.startswith("KXHIGH") or ticker.startswith("KXLOWT")):
+                continue
+            if float(pos.get("position_fp", 0) or 0) == 0:
+                continue
+            _cascade_entered.add(ticker)
+            _td_entered.add(ticker)
+            _lowt_bu_entered.add(ticker)
+            _lowt_td_entered.add(ticker)
+            _ratchet_entered.add(ticker)
+            _ovn_entered.add(ticker)
+            recovered += 1
+        _log.info("cascade: init — recovered %d held ticker(s) into all dedup sets",
+                   recovered)
+    except Exception as e:
+        _log.warning("cascade: init position recovery failed: %s", e)
+
+
 def _market_date(ticker: str) -> str:
     try:
         return ticker.split("-")[1]
