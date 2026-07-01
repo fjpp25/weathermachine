@@ -58,39 +58,73 @@ def main():
     else:
         print("no duplicate tickers today.")
 
-    # Break out by entry_tier prefix as a rough engine attribution.
+    # Break out by entry_tier, mapped to capital bucket.
     #
-    # CORRECTED (previous version guessed these tier names from memory
-    # instead of checking source — every one of that day's 19 entries
-    # ended up in "other(...)" as a result, since 4 of 5 guessed names were
-    # wrong). Verified directly against sweep_engine.py's actual _place()
-    # call sites: Signal A="tomorrow", dismissed-T/gradient-open both share
-    # "tomorrow_dismissed", dismissed-B="tomorrow_dismissed_b", Signal B
-    # (near-dead sweep)="tomorrow_sweep", Signal C (dead bracket)=
-    # "dead_sweep". ALL of these draw from the same "sweep" capital bucket
-    # regardless of which one fired — confirmed via the single _cap.record
-    # ("sweep", cost) call site inside _place()'s live branch.
+    # THIRD ATTEMPT at this mapping — the previous two were wrong (guessed
+    # tier names from memory; then left "peak" marked unverified despite
+    # having already confirmed it). This version is traced through actual
+    # call sites in trader.py, not guessed:
     #
-    # cascade_engine.py / lowt_decision_engine.py / hight_decision_engine.py
-    # (main) do NOT call EngineCapital.record() at all — they use a
-    # separate, IN-MEMORY-ONLY legacy tracking mechanism in trader.py
-    # (_deployed_cascade / _deployed_lowt / etc.) that never persists to
-    # engine_capital_deployed.json and resets on every process restart, not
-    # just at midnight. Their entries will NEVER reconcile against that
-    # file — that's an architecture fact, not evidence of a lost write.
-    SWEEP_TIERS = {"tomorrow", "tomorrow_dismissed", "tomorrow_dismissed_b",
-                   "tomorrow_sweep", "dead_sweep"}
-    NOT_DISK_TRACKED = {"cascade_lowt_bu", "cascade_ovn_dist", "cascade_tomorrow",
-                         "lowt_main", "lowt_a", "near_cap"}
+    #   - sweep_engine.py's _place() calls _cap.record("sweep", cost)
+    #     directly for ALL its own tiers: "tomorrow" (Signal A),
+    #     "tomorrow_dismissed" (dismissed-T + gradient-open),
+    #     "tomorrow_dismissed_b" (dismissed-B), "tomorrow_sweep" (Signal B),
+    #     "dead_sweep" (Signal C). Confirmed via direct source read.
+    #   - peak_scanner.py calls .record("peak", ...) directly (tier="peak").
+    #   - evening_convergence.py calls cap.record("econv", cost) directly
+    #     (tier="econv").
+    #   - trader.py's TOPUP function (~line 1950) calls
+    #     cap.record("topup", cost) directly (tier="topup").
+    #   - trader.py's _post_exit_scan function (~line 1400, tier=
+    #     "post_exit_scan") calls NEITHER cap.record() NOR any budget
+    #     check at all — not "legacy tracking", genuinely untracked. Verify
+    #     this is intentional (topup positions bounded by existing-position
+    #     headroom rather than fresh capital) before assuming it's a gap.
+    #   - main/cascade/lowt signals flow through trader.py's central
+    #     run_pipeline dispatcher (~line 2147), which derives engine_key
+    #     from the tier prefix:
+    #       tier.startswith("cascade")  -> "cascade"
+    #       tier.startswith("lowt")     -> "lowt"
+    #       tier.startswith("tomorrow") or tier in ("dead_sweep","sweep")
+    #                                    -> "sweep"  (this branch appears to
+    #          be dead code in current practice — decision_engine.run() and
+    #          lowt_decision_engine.run() are the only signal sources fed
+    #          into this dispatcher, sweep_engine.py bypasses it entirely —
+    #          but this is NOT proven with full certainty, just the best-
+    #          supported reading so far)
+    #       else                        -> "main"
+    #     and DOES call cap.record(engine_key, cost) for all of these —
+    #     contradicting what I told you last turn. If engine_capital_
+    #     deployed.json still shows $0 for cascade/lowt/main despite clear
+    #     trade_log evidence of their trades today, that's now a genuinely
+    #     open question (stale snapshot timing vs a real persistence gap in
+    #     the cross-thread capital write), not something to assume either
+    #     way without checking audit_trade_log_today.py fresh.
+    SWEEP_DIRECT_TIERS = {"tomorrow", "tomorrow_dismissed", "tomorrow_dismissed_b",
+                           "tomorrow_sweep", "dead_sweep"}
+    UNTRACKED_TIERS = {"post_exit_scan"}
+
+    def bucket_for(tier: str) -> str:
+        if tier in SWEEP_DIRECT_TIERS:
+            return "sweep"
+        if tier == "peak":
+            return "peak"
+        if tier == "econv":
+            return "econv"
+        if tier == "topup":
+            return "topup"
+        if tier in UNTRACKED_TIERS:
+            return f"{tier} [genuinely untracked — no .record() call anywhere for this tier]"
+        if tier.startswith("cascade"):
+            return "cascade"
+        if tier.startswith("lowt"):
+            return "lowt"
+        return "main"   # trader.py dispatcher's own fallback for anything else
+
     by_bucket = {}
     for e in todays:
         tier = e.get("entry_tier", "?")
-        if tier in SWEEP_TIERS:
-            bucket = "sweep"
-        elif tier in NOT_DISK_TRACKED:
-            bucket = f"{tier} [NOT in engine_capital_deployed.json — legacy in-memory tracking, don't expect this to reconcile]"
-        else:
-            bucket = f"{tier} [unverified — check source before trusting this attribution]"
+        bucket = bucket_for(tier)
         cost = float(e.get("entry_price", 0)) * float(e.get("contracts", 0))
         by_bucket.setdefault(bucket, [0.0, 0])
         by_bucket[bucket][0] += cost
