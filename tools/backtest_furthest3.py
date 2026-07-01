@@ -4,51 +4,61 @@ tools/backtest_furthest3.py — backtest: "at market open (earliest observed pol
 for a given city/market_date), rank all brackets by |distance to forecast|,
 enter the 3 furthest, hold to settlement."
 
-WHY THIS EXISTS
-----------------
-This is a variant of cascade_engine's OVN_DIST signal (rank >= OVN_MIN_RANK
-from forecast, entered pre-market) but with two differences that need to be
-measured, not assumed:
-  1. Fixed count (3) instead of a rank threshold. With HIGH markets always
-     6 brackets wide (T-B-B-B-B-T), "3 furthest" = HALF the ladder, not just
-     the tail — it will include at least one bracket that's only moderately
-     off-forecast.
-  2. NO price gate, NO forecast-confidence gate, NO adjacent-bracket check.
-     OVN_DIST requires max_yes_this <= 0.15, n1_avg_yes <= 0.30,
-     forecast_conf >= 0.45, No in [0.78, 0.95]. This replay enters at
-     whatever No price existed on the earliest poll, unconditionally — by
-     design, to test the raw idea as stated before adding any gates back in.
+v2 CHANGES FROM THE FIRST VERSION
+----------------------------------
+1. FIXED: n_missing_forecast_at_first_poll was incrementing once per SKIPPED
+   POLL, not once per market-day. Now counted per (city, market_date).
+2. ADDED: check_tomorrow_coverage() — queries the DB directly to confirm
+   (not assume from reading the source) whether market_type LIKE '%_tomorrow'
+   rows carry a forecast. If they do, this script can be pointed at them for
+   a real day-ahead test; if not (expected, per lowt_observer.py's own
+   comment that NWS fields are nulled for _tomorrow rows), this prints the
+   coverage numbers so that's verified against your actual data, not my
+   reading of the code.
+3. ADDED: loss_concentration() — same diagnostic your analytics/core.py
+   already uses (Cell.loss_by_day / worst_day / loss_concentration / is_scar)
+   to tell whether a net-negative result is a diffuse structural problem or
+   a "healed bug-day" scar concentrated in one or two dates/cities. Applied
+   before any WR/PnL number in this script should be read as a verdict on
+   the underlying idea.
 
-DATA CAVEATS (read before trusting the output)
+WHAT THIS SCRIPT ACTUALLY TESTS (re-read this before trusting any of the
+output)
+--------------------------------------------------------------------------
+market_type='high'/'lowt' rows in observations.db are the SAME-DAY market —
+the ticker resolving that calendar day, which (per the repo's own comments
+elsewhere) has typically already been open and trading since ~10am ET the
+PRIOR afternoon by the time we see it. This script's "earliest poll" proxy
+therefore does NOT capture true market-open / day-ahead entry — it captures
+whichever poll first had a populated NWS forecast for that ticker, which can
+be many hours into that ticker's trading life. The TRUE day-ahead ladder is
+stored under market_type='high_tomorrow'/'lowt_tomorrow', and as of this
+writing those rows have no forecast value attached at all (verify with
+--check-coverage below; don't take this on faith).
+
+Until the observer is patched to stamp a forecast on the _tomorrow rows and
+new data accumulates, this script measures a real but DIFFERENT idea:
+"enter the 3 furthest-from-forecast brackets in the same-day market, at
+whichever poll first has usable NWS data." Treat all output accordingly.
+
+DATA CAVEATS (unchanged from v1 — still apply)
 ------------------------------------------------
-- observations.db only logs the NWS forecast_high_f/forecast_low_f, not
-  AccuWeather (the live engine's primary source). This backtests "what if we
-  ran on raw NWS", not "what the live engine would have done".
-- observations.db does NOT store floor_strike/cap_strike, only the display
-  `bracket` code (e.g. B82.5, T83). market_utils.bracket_temp() needs strikes
-  to be authoritative and explicitly warns the code carries "display offsets"
-  without them. This script derives the representative temperature
-  POSITIONALLY instead of trusting the code in isolation:
-      - B bracket: code value IS the interval midpoint (validated elsewhere
-        in the repo against real floor/cap strikes for X.5-format codes).
-      - Lowest rung in a full 6-bracket ladder: T-bottom, edge = code - 0.5
-      - Highest rung in a full 6-bracket ladder: T-top,    edge = code + 0.5
-  This is only valid for a COMPLETE T-B-B-B-B-T ladder. Partial ladders
-  (observer downtime, mid-cutover, etc.) are excluded rather than guessed at
-  — see `n_incomplete_ladder` in the diagnostics.
-- "Market open" = earliest poll_time_utc for that (city, market_date). This
-  is only a good proxy if the observer was already running before Kalshi
-  opened next-day markets. The script prints the local-hour distribution of
-  the first poll so you can sanity-check this before trusting anything else.
-- Outcome is joined from the AUTHORITATIVE settlements table only, per
-  analytics/core.py's rule — never derived from observed temperature.
+- Only the NWS forecast is available here, not AccuWeather (the live
+  engine's primary source).
+- No floor_strike/cap_strike in this table, only the display `bracket` code.
+  Representative temperature is derived POSITIONALLY (lowest rung of a full
+  6-bracket ladder = T-bottom edge = code-0.5; highest = T-top edge =
+  code+0.5; the 4 middle rungs = B, code IS the midpoint). Only valid for a
+  complete T-B-B-B-B-T ladder — partial ladders are excluded, not guessed at.
+- Outcome is joined from the AUTHORITATIVE settlements table only, never
+  derived from observed temperature (per analytics/core.py's rule).
 
 USAGE (on the Pi, from repo root):
-    python3 tools/backtest_furthest3.py                  # HIGH markets (default)
-    python3 tools/backtest_furthest3.py --market lowt     # LOWT markets
-    python3 tools/backtest_furthest3.py --n 2             # furthest N instead of 3
-    python3 tools/backtest_furthest3.py --gate 0.85 0.94  # optional price gate,
-                                                            # to compare vs blind entry
+    python3 tools/backtest_furthest3.py --check-coverage    # run this FIRST
+    python3 tools/backtest_furthest3.py
+    python3 tools/backtest_furthest3.py --market lowt
+    python3 tools/backtest_furthest3.py --n 2
+    python3 tools/backtest_furthest3.py --gate 0.85 0.94
 """
 import argparse
 import math
@@ -59,8 +69,8 @@ DB = "data/observations.db"
 
 
 # ---------------------------------------------------------------------------
-# shared math (kept local so this runs standalone, same formulas as
-# analytics/core.py and tools/backtest_lowt_bu.py — do not let these drift)
+# shared math (kept local so this runs standalone — do not let these drift
+# from analytics/core.py / tools/backtest_lowt_bu.py)
 # ---------------------------------------------------------------------------
 
 def wilson_lower(wins, n, z=1.96):
@@ -95,9 +105,9 @@ def market_date(ticker):
 def rep_temps(rungs):
     """
     rungs: list of (code, ticker, no_price) for ONE market, any order.
-    Returns dict ticker -> representative temperature, using positional
-    T/B geometry (see module docstring). Returns {} if the ladder isn't a
-    complete, well-formed 6-bracket T-B-B-B-B-T (won't guess at partial data).
+    Returns dict ticker -> representative temperature using positional T/B
+    geometry. Returns {} if the ladder isn't a complete, well-formed
+    6-bracket T-B-B-B-B-T (won't guess at partial data).
     """
     parsed = [(bracket_val(code), code, tk, no) for code, tk, no in rungs]
     if any(v is None for v, *_ in parsed):
@@ -116,12 +126,33 @@ def rep_temps(rungs):
         elif i == len(parsed) - 1:
             out[tk] = val + 0.5          # T-top edge
         else:
-            out[tk] = val                # B midpoint (validated == code value)
+            out[tk] = val                # B midpoint
     return out
 
 
 # ---------------------------------------------------------------------------
-# load earliest poll per (city, market_date)
+# coverage check — verify against real data, don't assume from source
+# ---------------------------------------------------------------------------
+
+def check_tomorrow_coverage(con):
+    print("=== TOMORROW-ROW FORECAST COVERAGE (verify before trusting anything) ===")
+    for mt, fcol in (("high_tomorrow", "forecast_high_f"),
+                     ("lowt_tomorrow", "forecast_low_f")):
+        total, non_null = con.execute(f"""
+            SELECT COUNT(*), SUM(CASE WHEN {fcol} IS NOT NULL THEN 1 ELSE 0 END)
+            FROM observations WHERE market_type = ?
+        """, (mt,)).fetchone()
+        non_null = non_null or 0
+        pct = (non_null / total * 100) if total else 0.0
+        print(f"  {mt:15} total_rows={total:>8}  {fcol}_non_null={non_null:>8}  ({pct:.1f}%)")
+    print("  If both percentages are ~0%, the day-ahead idea cannot be backtested")
+    print("  from this table yet — the observer needs a code change first, and")
+    print("  historical days are unrecoverable regardless.\n")
+
+
+# ---------------------------------------------------------------------------
+# load earliest poll per (city, market_date) — see module docstring for what
+# "earliest poll" actually means here (NOT true market open)
 # ---------------------------------------------------------------------------
 
 def load_open_snapshots(con, market_type):
@@ -136,7 +167,7 @@ def load_open_snapshots(con, market_type):
     """, (market_type,)).fetchall()
 
     grouped = defaultdict(lambda: defaultdict(list))
-    meta = {}  # (city, md, poll_time) -> (local_hour, forecast)
+    meta = {}  # (key, poll_time) -> (local_hour, forecast)
     for city, pt, lh, ticker, code, no, fcst in rows:
         md = market_date(ticker)
         key = (city, md)
@@ -144,27 +175,36 @@ def load_open_snapshots(con, market_type):
         meta[(key, pt)] = (lh, fcst)
 
     diagnostics = Counter()
-    opens = {}  # (city, md) -> (poll_time, local_hour, forecast, rungs)
+    opens = {}
     for key, polls in grouped.items():
-        for pt in sorted(polls):        # first poll_time seen = proxy for open
+        found = False
+        for pt in sorted(polls):        # first poll_time seen for this market-day
             lh, fcst = meta[(key, pt)]
             rungs = polls[pt]
             if fcst is None:
-                diagnostics["n_missing_forecast_at_first_poll"] += 1
                 continue
             if len(rungs) != 6:
-                diagnostics["n_incomplete_ladder"] += 1
                 continue
             opens[key] = (pt, lh, fcst, rungs)
+            found = True
             break
-        else:
-            diagnostics["n_no_usable_open_poll"] += 1
+        if not found:
+            # figure out WHY, once per market-day (not once per skipped poll)
+            any_fcst = any(meta[(key, pt)][1] is not None for pt in polls)
+            any_full = any(len(polls[pt]) == 6 for pt in polls)
+            if not any_fcst:
+                diagnostics["market_days_never_got_a_forecast"] += 1
+            elif not any_full:
+                diagnostics["market_days_never_had_a_complete_ladder"] += 1
+            else:
+                diagnostics["market_days_no_poll_with_both"] += 1
     diagnostics["n_market_days_used"] = len(opens)
+    diagnostics["n_market_days_seen_total"] = len(grouped)
     return opens, diagnostics
 
 
 # ---------------------------------------------------------------------------
-# build entries: furthest-N-from-forecast at open
+# build entries: furthest-N-from-forecast at "open"
 # ---------------------------------------------------------------------------
 
 def build_entries(opens, settled, n_furthest, gate):
@@ -219,12 +259,58 @@ def summarize(entries, label):
         lb = f"{wilson_lower(win, n)*100:.0f}%" if n else "\u2014"
         mid = (lo + hi) / 2
         ev = f"${(win/n*(1-mid) - (1-win/n)*mid - fee(mid)):+.3f}" if n else "\u2014"
+        note = "  <-- thin sample, don't trust WR/EV" if 0 < n < 40 else ""
         print(f"[{lo:.2f},{hi:.2f}) {sig:>5}{n:>8}{win:>5}{loss:>5}"
-              f"{wr:>6}{lb:>7}{ev:>8}{pnl:>+9.2f}")
+              f"{wr:>6}{lb:>7}{ev:>8}{pnl:>+9.2f}{note}")
     N = tot["win"] + tot["loss"]
     print(f"{'TOTAL':14}{int(tot['sig']):>5}{int(N):>8}{int(tot['win']):>5}"
           f"{int(tot['loss']):>5}{(tot['win']/N*100 if N else 0):>5.0f}%"
           f"{wilson_lower(int(tot['win']), int(N))*100:>6.0f}%{'':>8}{tot['pnl']:>+9.2f}")
+
+
+def loss_concentration(entries, label):
+    """
+    Same diagnostic as analytics/core.py's Cell: is a net-negative result a
+    diffuse structural problem, or a scar concentrated in one day / one city?
+    Prints both axes since city concentration matters as much as date
+    concentration here (DC and Atlanta already have known scars in other
+    engines — worth checking whether this shows up as the same pattern
+    rather than a new independent finding).
+    """
+    settled = [e for e in entries if e["result"] in ("no", "yes")]
+    if not settled:
+        print(f"\n=== SCAR CHECK: {label} — no settled entries, skipping ===")
+        return
+
+    def net_pnl(e):
+        if e["result"] == "no":
+            return (1 - e["entry_no"]) - fee(e["entry_no"])
+        return -e["entry_no"] - fee(e["entry_no"])
+
+    total_pnl = sum(net_pnl(e) for e in settled)
+    print(f"\n=== SCAR CHECK: {label} (total PnL ${total_pnl:+.2f}) ===")
+    if total_pnl >= 0:
+        print("  Net positive — scar check is about explaining losses, not gains. Skipping.")
+        return
+
+    for axis_name, axis_fn in (("market_date", lambda e: e["market_date"]),
+                                ("city", lambda e: e["city"])):
+        loss_by_key = defaultdict(float)
+        for e in settled:
+            pnl = net_pnl(e)
+            if pnl < 0:
+                loss_by_key[axis_fn(e)] += pnl
+        total_loss = sum(loss_by_key.values())
+        if total_loss == 0:
+            continue
+        worst_key = min(loss_by_key, key=lambda k: loss_by_key[k])
+        worst_val = loss_by_key[worst_key]
+        conc = worst_val / total_loss
+        n_loss_keys = len(loss_by_key)
+        print(f"  by {axis_name:12}: worst={worst_key!r} (${worst_val:+.2f}), "
+              f"{n_loss_keys} distinct loss-{axis_name}s, "
+              f"concentration={conc:.0%}"
+              + ("  <-- SCAR-LIKE (>=70% from one)" if conc >= 0.70 and n_loss_keys >= 3 else ""))
 
 
 def main():
@@ -234,31 +320,39 @@ def main():
     ap.add_argument("--gate", type=float, nargs=2, default=None,
                      metavar=("MIN", "MAX"),
                      help="optional No-price gate, e.g. --gate 0.85 0.94")
+    ap.add_argument("--check-coverage", action="store_true",
+                     help="only run the tomorrow-row forecast coverage check, then exit")
     args = ap.parse_args()
 
     con = sqlite3.connect(DB)
+
+    if args.check_coverage:
+        check_tomorrow_coverage(con)
+        con.close()
+        return
+
     settled = dict(con.execute(
         "SELECT ticker, result FROM settlements WHERE result IN ('yes','no')"))
 
     opens, diag = load_open_snapshots(con, args.market)
-    print("=== DATA QUALITY DIAGNOSTICS ===")
+    print("=== DATA QUALITY DIAGNOSTICS (per market-day, not per poll) ===")
     for k, v in diag.items():
         print(f"  {k}: {v}")
 
     entries, open_hours = build_entries(opens, settled, args.n, args.gate)
 
-    print("\n=== 'market open' local-hour distribution (sanity check) ===")
-    print("  If this skews toward midday/afternoon, the earliest-poll proxy")
-    print("  isn't capturing true market open and results below are suspect.")
+    print("\n=== 'earliest usable poll' local-hour distribution ===")
+    print("  Read this as 'when did the same-day market first show a usable")
+    print("  forecast', NOT 'when did the market open' — see module docstring.")
     hc = Counter(open_hours)
     for h in sorted(hc):
         print(f"  hour {h:>2}: {hc[h]}")
 
     gate_label = f" gate={args.gate}" if args.gate else " (BLIND, no price gate)"
-    summarize(entries, f"furthest {args.n} of ladder, market={args.market}{gate_label}")
+    label = f"furthest {args.n} of ladder, market={args.market}{gate_label}"
+    summarize(entries, label)
+    loss_concentration(entries, label)
 
-    # entry price distribution — shows whether "furthest" already implies
-    # "already cheap" or "still genuinely priced with uncertainty"
     print("\n=== entry No-price distribution (all picks, incl. unsettled) ===")
     prices = sorted(e["entry_no"] for e in entries)
     if prices:

@@ -405,12 +405,26 @@ def _check_directional(
 
 
 def _check_dismissed(t_low: dict, t_high: dict, city: str) -> Optional[dict]:
-    """Dismissed-T signal: one T has collapsed to near-zero Yes."""
+    """Dismissed-T signal: one T has collapsed to near-zero Yes.
+
+    BUGFIX: this previously had no _sweep_entered check, unlike _check_sweep
+    and _check_dead. Since this is called on every poll with no session
+    "already fired" guard above it in run_scan (unlike Signal A, which checks
+    sig_key against _fired_signals first), an already-dismissed T bracket
+    would re-qualify on every subsequent poll and _place() would happily fire
+    again — capital-budget checks were the only thing stopping repeat entry
+    into the SAME ticker, which could exhaust a whole day's sweep allocation
+    on the first dead bracket seen and starve any other legitimate candidate
+    that day. Matching the dedup pattern already used by Signal B/C.
+    """
     from zoneinfo import ZoneInfo
     lh = datetime.now(ZoneInfo((_CITY_REGISTRY.get(city) or {}).get("tz", "UTC"))).hour
     if lh >= DISMISSED_HOUR_MAX:
         return None
     for dismissed, other in [(t_low, t_high), (t_high, t_low)]:
+        ticker = dismissed.get("ticker", "")
+        if not ticker or ticker in _sweep_entered:
+            continue
         # _yes_price returns 0.0 when no price data is available. For the
         # dismissed test we must not treat "no data" as "fully dismissed",
         # so fall back to 1.0 (not-dismissed) only when there is genuinely no
@@ -442,7 +456,13 @@ def _check_gradient(
     city: str,
     yes_override: float | None = None,
 ) -> list[dict]:
-    """Gradient-open signal: strong lean between top-3 and bottom-3 Yes prices."""
+    """Gradient-open signal: strong lean between top-3 and bottom-3 Yes prices.
+
+    BUGFIX: same missing _sweep_entered check as _check_dismissed — see that
+    function's docstring. Without this, a gradient candidate that's already
+    been entered keeps re-qualifying on every poll for as long as the lean
+    persists, which for a genuinely dead bracket is most of the day.
+    """
     from zoneinfo import ZoneInfo
     lh = datetime.now(ZoneInfo((_CITY_REGISTRY.get(city) or {}).get("tz", "UTC"))).hour
     if lh >= DISMISSED_HOUR_MAX:
@@ -468,7 +488,8 @@ def _check_gradient(
     yes_gate = yes_override if yes_override is not None else YES_DISMISSED
     return [
         b for b in far_end
-        if (_yes_price(b) if _has_price(b) else 1.0) <= yes_gate
+        if b.get("ticker", "") not in _sweep_entered
+        and (_yes_price(b) if _has_price(b) else 1.0) <= yes_gate
         and DISMISSED_NO_MIN <= _no_price(b) < DISMISSED_NO_MAX
     ]
 
