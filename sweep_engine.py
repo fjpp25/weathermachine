@@ -59,6 +59,31 @@ Dismissed-T and gradient-open signals
 Also absorbed from tomorrow_scanner. These fire on dismissed (Yes → near-0)
 T brackets and on gradient market opens (top-3 vs bottom-3 Yes lean).
 Both use the same budget and dedup set.
+
+Dismissed-B signal (added — see tools/probe_dead_on_arrival.py)
+-------------------------------------------------------------------
+_check_dismissed only ever covered T brackets. A retroactive probe against
+observations.db (market_type='high_tomorrow'/'lowt_tomorrow' rows, filtered
+for genuine two-sided liquidity — see that script's docstring for why the
+naive read of yes_price is unsafe) found this was the single largest source
+of missed dead-on-arrival brackets: consistently 1,200-2,300+ missed
+candidates per threshold tested, larger than the price-ceiling gap below.
+Excludes the day's current favourite (max-Yes) bracket, matching the same
+exclusion _check_sweep already uses, so this never bets No against the
+day's own most likely outcome. No "opposing bracket" guard is applied here
+(unlike dismissed-T) — with 4 B brackets per ladder rather than 2 tails,
+one being cheap doesn't imply the others are, so the T-only double-dismissal
+risk doesn't have a direct analogue here.
+
+DISMISSED_NO_MAX raised 0.94 -> 0.96 (see probe results): the ceiling was a
+CONSTANT ~1,465 (HIGH) / ~981 (LOWT) missed candidates at every threshold
+tested — i.e. a fixed population of very-dead T-brackets was being excluded
+regardless of how the Yes-side threshold was swept. Raised conservatively to
+0.96, not all the way to Signal C's 0.989 ceiling, since this fires on the
+less-liquid, not-yet-converged tomorrow market rather than Signal C's
+same-day, already-converged one — fill risk at the extreme end is less
+well understood here. Revisit after enough paper/live data accumulates
+under the new ceiling.
 """
 
 from __future__ import annotations
@@ -147,7 +172,7 @@ _CAUTION_SKIP: dict[str, frozenset[int]] = {
 YES_DISMISSED         = 0.07
 YES_DISMISSED_T_OTHER = 0.10
 DISMISSED_NO_MIN      = 0.75
-DISMISSED_NO_MAX      = 0.94
+DISMISSED_NO_MAX      = 0.96   # raised from 0.94 — see module docstring
 DISMISSED_HOUR_MAX    = 18
 OPEN_LEAN_MIN         = 0.10
 DISMISSED_CONTRACTS   = 3
@@ -494,6 +519,45 @@ def _check_gradient(
     ]
 
 
+def _check_dismissed_b(
+    b_markets: list[dict],
+    city: str,
+) -> list[dict]:
+    """
+    Dismissed-B signal: B brackets collapsed to near-zero Yes at open.
+
+    Extends _check_dismissed (T-only) to cover B brackets — per
+    tools/probe_dead_on_arrival.py, this was the single largest source of
+    missed dead-on-arrival brackets (consistently 1,200-2,300+ per threshold
+    tested, larger than the price-ceiling gap). See module docstring for the
+    full rationale, including why no "opposing bracket" guard is applied
+    here (unlike dismissed-T's other_yes check) — with 4 B brackets rather
+    than 2 tails, one being cheap doesn't imply the others are.
+
+    Excludes the day's current favourite (max-Yes) bracket, matching the
+    same exclusion _check_sweep uses, so this never bets No against the
+    day's own most likely outcome.
+    """
+    from zoneinfo import ZoneInfo
+    lh = datetime.now(ZoneInfo((_CITY_REGISTRY.get(city) or {}).get("tz", "UTC"))).hour
+    if lh >= DISMISSED_HOUR_MAX:
+        return []
+    if not b_markets:
+        return []
+
+    forecast_ticker = max(b_markets, key=lambda m: _yes_price(m)).get("ticker", "")
+    results = []
+    for b in b_markets:
+        ticker = b.get("ticker", "")
+        if not ticker or ticker == forecast_ticker or ticker in _sweep_entered:
+            continue
+        yes_p = _yes_price(b) if _has_price(b) else 1.0
+        no_p = _no_price(b)
+        if yes_p <= YES_DISMISSED and DISMISSED_NO_MIN <= no_p < DISMISSED_NO_MAX:
+            results.append(b)
+    return results
+
+
 def _check_sweep(markets: list[dict], city: str) -> list[dict]:
     """Signal B: near-dead sweep candidates in [SWEEP_FLOORS[city], SWEEP_CEILING)."""
     floor = SWEEP_FLOORS.get(city)
@@ -787,6 +851,20 @@ def run_scan(
                                ["gradient_open", f"no_price={no_p:.2f}"],
                                paper, _trader)
 
+                # Dismissed-B signal — see tools/probe_dead_on_arrival.py for
+                # why this was added (largest single miss-reason bucket).
+                dismissed_b = _check_dismissed_b(B_markets, city)
+                if dismissed_b:
+                    log.info("★ DISMISSED_B [%s] %s | %d bracket(s)",
+                             city, next_date, len(dismissed_b))
+                    for b in dismissed_b:
+                        ticker = b.get("ticker", "")
+                        no_p   = _no_price(b)
+                        _place(client, ticker, city, no_p,
+                               DISMISSED_CONTRACTS, "tomorrow_dismissed_b",
+                               ["dismissed_b", f"no_price={no_p:.2f}"],
+                               paper, _trader)
+
         # ── Signal B: near-dead sweep (today's markets) ───────────────────
         today_data = kalshi_snapshot.get(city, {})
         if not today_data.get("error"):
@@ -830,10 +908,12 @@ def log_config() -> None:
         "sweep_engine: "
         "A=directional[No %.2f-%.2f, %dc]  "
         "B=sweep[city_floor-%.2f, %dc, %d cities]  "
-        "C=dead[%.3f-%.3f, %dc, rank 4-5]",
+        "C=dead[%.3f-%.3f, %dc, rank 4-5]  "
+        "dismissed(T/B/gradient)=[No %.2f-%.2f, %dc, hour<%d]",
         NO_MIN_ENTRY, NO_MAX_ENTRY, DIRECTIONAL_CONTRACTS,
         SWEEP_CEILING, SWEEP_CONTRACTS, len(SWEEP_FLOORS),
         DEAD_FLOOR, DEAD_CEILING, DEAD_CONTRACTS,
+        DISMISSED_NO_MIN, DISMISSED_NO_MAX, DISMISSED_CONTRACTS, DISMISSED_HOUR_MAX,
     )
 
 
