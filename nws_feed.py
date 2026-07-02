@@ -203,6 +203,20 @@ def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
     analysis over historical data should still treat pre-fix LOWT rows as
     unreliable, and should not blend pre-fix and post-fix observations
     together when recalibrating.
+
+    HOTFIX (same day as the original fix): the first version of this used
+    datetime.isoformat(), which renders a UTC offset as "+00:00". An
+    unescaped "+" in a URL query string is standardly decoded as a SPACE
+    by the receiving server (application/x-www-form-urlencoded rules) —
+    turning "2026-07-02T05:00:00+00:00" into the invalid string
+    "2026-07-02T05:00:00 00:00" server-side. That made every single call
+    to this function fail, which _fetch_city()'s broad except swallowed —
+    wiping out observed_high_f/observed_low_f/forecast_high_f/
+    forecast_low_f/hazards for every city, everywhere the dashboard reads
+    from this feed. Fixed by using "Z"-suffixed UTC timestamps instead of
+    "+00:00" — same instant, zero characters that need escaping. Verified
+    by reproducing the exact query string through urllib.parse.parse_qs
+    before deploying this version.
     """
     # Use proper IANA timezone for DST-aware date boundary
     city_tz   = ZoneInfo(tz_name)
@@ -214,8 +228,12 @@ def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
     start_utc   = start_local.astimezone(timezone.utc)
     end_utc     = datetime.now(timezone.utc)
 
+    # "Z" suffix, not isoformat()'s "+00:00" — see HOTFIX note above.
+    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_str   = end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     url = (f"{API_BASE}/stations/{icao}/observations"
-           f"?start={start_utc.isoformat()}&end={end_utc.isoformat()}&limit=500")
+           f"?start={start_str}&end={end_str}&limit=500")
     data     = get(url)
     features = data.get("features", [])
 
