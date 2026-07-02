@@ -71,8 +71,8 @@ DUAL_WRITE = False
 # dropped it, which also broke the dashboard's d.get("current_temp_f")).
 DB_COLUMNS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
-    "observed_high_f", "forecast_high_f",
-    "observed_low_f",  "forecast_low_f",
+    "observed_high_f", "observed_high_at", "forecast_high_f",
+    "observed_low_f",  "observed_low_at",  "forecast_low_f",
     "forecast_issued_at", "hazards",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
@@ -81,8 +81,8 @@ DB_COLUMNS = [
 
 CSV_FIELDS = [
     "poll_time_utc", "city", "market_type", "local_time", "local_hour",
-    "observed_high_f", "forecast_high_f",
-    "observed_low_f",  "forecast_low_f",
+    "observed_high_f", "observed_high_at", "forecast_high_f",
+    "observed_low_f",  "observed_low_at",  "forecast_low_f",
     "forecast_issued_at", "hazards",
     "ticker", "bracket", "yes_price", "no_price",
     "spread", "volume", "open_interest",
@@ -116,6 +116,10 @@ def normalize_row(row: dict) -> dict:
             row = {**row, "forecast_issued_at": None}
         if "hazards" not in row:
             row = {**row, "hazards": []}
+        if "observed_high_at" not in row:
+            row = {**row, "observed_high_at": None}
+        if "observed_low_at" not in row:
+            row = {**row, "observed_low_at": None}
         return row
 
     # v1 row — promote observed_f / forecast_f to explicit fields
@@ -123,7 +127,8 @@ def normalize_row(row: dict) -> dict:
     obs_f  = row.get("observed_f")
     fcst_f = row.get("forecast_f")
 
-    upgraded = {**row, "forecast_issued_at": None, "hazards": []}
+    upgraded = {**row, "forecast_issued_at": None, "hazards": [],
+                "observed_high_at": None, "observed_low_at": None}
 
     if market_type == "high":
         upgraded["observed_high_f"] = obs_f
@@ -239,12 +244,32 @@ def _hazards_to_str(h) -> str:
 
 
 def _ensure_db():
-    """Create the observations table if the DB doesn't have it yet."""
+    """Create the observations table if the DB doesn't have it yet, and
+    migrate in any columns DB_COLUMNS has grown to include since the table
+    was created.
+
+    CREATE TABLE IF NOT EXISTS is a no-op against a table that already
+    exists — it does NOT add new columns to match a longer DB_COLUMNS list.
+    Without this migration step, adding a new column name to DB_COLUMNS
+    (e.g. observed_high_at/observed_low_at) would make every single INSERT
+    fail with 'no such column' starting on the very next poll after
+    deploying, since the INSERT statement references DB_COLUMNS but the
+    live table's actual schema wouldn't have caught up. Same migration
+    pattern as load_settlements_to_db.py's settlements table.
+    """
     OUTPUT_DB.parent.mkdir(exist_ok=True)
     con = sqlite3.connect(OUTPUT_DB)
     cols_ddl = ", ".join(f"{c} {'REAL' if c in _REAL_COLS else 'TEXT'}"
                          for c in DB_COLUMNS)
     con.execute(f"CREATE TABLE IF NOT EXISTS observations ({cols_ddl})")
+
+    existing_cols = {row[1] for row in con.execute("PRAGMA table_info(observations)")}
+    for c in DB_COLUMNS:
+        if c not in existing_cols:
+            coltype = "REAL" if c in _REAL_COLS else "TEXT"
+            con.execute(f"ALTER TABLE observations ADD COLUMN {c} {coltype}")
+            print(f"  [migrate] observations: added missing column {c} {coltype}")
+
     con.commit()
     return con
 
@@ -360,18 +385,22 @@ def poll_once(observations: list[dict]) -> int:
             # Use explicit per-type field names so rows are self-documenting.
             # Null out the other market type's fields for schema consistency.
             if market_type == "high":
-                observed_high_f = nws.get("observed_high_f")
-                forecast_high_f = nws.get("forecast_high_f")
-                observed_low_f  = None
-                forecast_low_f  = None
+                observed_high_f  = nws.get("observed_high_f")
+                observed_high_at = nws.get("observed_high_at")
+                forecast_high_f  = nws.get("forecast_high_f")
+                observed_low_f   = None
+                observed_low_at  = None
+                forecast_low_f   = None
                 if observed_high_f is None:
                     print(f"  [WARN] {city} HIGH: observed_high_f is None "
                           f"(NWS error: {nws.get('error')})")
             else:
-                observed_high_f = None
-                forecast_high_f = None
-                observed_low_f  = nws.get("observed_low_f")
-                forecast_low_f  = nws.get("forecast_low_f")
+                observed_high_f  = None
+                observed_high_at = None
+                forecast_high_f  = None
+                observed_low_f   = nws.get("observed_low_f")
+                observed_low_at  = nws.get("observed_low_at")
+                forecast_low_f   = nws.get("forecast_low_f")
                 if observed_low_f is None:
                     print(f"  [WARN] {city} LOWT: observed_low_f is None "
                           f"(NWS error: {nws.get('error')})")
@@ -393,8 +422,10 @@ def poll_once(observations: list[dict]) -> int:
                     "local_time":         local_time,
                     "local_hour":         local_hour,
                     "observed_high_f":    observed_high_f,
+                    "observed_high_at":   observed_high_at,
                     "forecast_high_f":    forecast_high_f,
                     "observed_low_f":     observed_low_f,
+                    "observed_low_at":    observed_low_at,
                     "forecast_low_f":     forecast_low_f,
                     "forecast_issued_at": forecast_issued_at,
                     "hazards":            hazards,
