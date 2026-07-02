@@ -22,23 +22,27 @@ METHOD
 ------
   HIGH:
     forecast reference = mean(forecast_high_f) over polls at local_hour in
-                          MORNING_HOURS (9-11) for that market_date. Matches
-                          bias_calculator.py's existing convention — this is
-                          the forecast the decision engine actually reads at
-                          entry time.
-    observed final      = max(observed_high_f) over ALL polls for that
-                          market_date (running max -> settles at/after the
-                          true high).
+                          MORNING_HOURS (9-11) for that market_date.
+    observed final      = observed_high_f from the LAST poll (by poll_time_utc)
+                          of that market_date. Validated against
+                          tools/probe_observed_final_method.py: this beats
+                          max-across-all-polls by +10.6pp average AuthMatch
+                          (17/20 cities improved). Reasoning: nws_feed.py's
+                          fetch_observed_high_low() recomputes max(temps)
+                          from only the ~48 most recent station observations
+                          each poll — NOT a running accumulator, NOT a full-day
+                          window (confirmed empirically: 48 records spanned
+                          just 3h39m for KSFO). The afternoon high is usually
+                          still inside that short window by the time the last
+                          poll of the day runs, so a single late read beats
+                          the max of many earlier, more glitch-exposed reads.
 
-  LOWT:
+  LOWT — ⚠ SEE CAVEAT BELOW, THIS METHOD IS KNOWN TO BE UNRELIABLE ⚠
     forecast reference = mean(forecast_low_f) over polls at local_hour in
-                          EVENING_HOURS (18-21) for that market_date — the
-                          same evening window RATCHET / Signal B trade
-                          against, so this lines up with what the engines
-                          see, not an arbitrary reference point.
+                          EVENING_HOURS (18-21) for that market_date.
     observed final      = min(observed_low_f) over ALL polls for that
-                          market_date (running min -> bottoms out at the
-                          true overnight low).
+                          market_date. This is the LESS-BAD of two bad
+                          options, not a validated method — see caveat.
 
   error = forecast_reference - observed_final
     Positive -> forecast ran WARM (overestimated)
@@ -49,20 +53,34 @@ per city — deliberately not done here so you can see the raw distribution,
 including forecast busts, per city before deciding whether trimming is
 appropriate).
 
-IMPORTANT CAVEAT — READ BEFORE TRUSTING THESE NUMBERS AT FACE VALUE
-----------------------------------------------------------------------
-"observed_final" here comes from the NWS ASOS feed recorded in
-observations.db, NOT from the Kalshi-authoritative settlement in the
-`settlements` table. Project history has already established these two
-sources agree only ~87.6% of the time (station mismatches, ASOS
-quantization, bracket-geometry parsing — see the open "canonical
-ticker/bracket-to-observation reconciliation" task). That means for
-cities/days where the NWS observation is wrong, this script is measuring
-"forecast vs NWS's own bad reading," not "forecast vs what actually
-happened." Run with --validate to see, per city, what fraction of days the
-NWS-derived observed value actually falls inside that day's Kalshi-
-authoritative winning-bracket range (from market_days). Treat any city with
-a low match rate skeptically — its bias number may be noise, not signal.
+============================================================================
+CONFIRMED CAVEAT — LOWT OBSERVED VALUES ARE NOT TRUSTWORTHY, EITHER METHOD
+============================================================================
+nws_feed.py's fetch_observed_high_low() computes max/min over only the last
+~48 station observations (confirmed empirically at ~3h39m of coverage for
+KSFO — likely varies by station/weather, but nowhere near a full day). For
+HIGH this is usually fine (the peak is typically only a few hours before the
+last poll of the day). For LOWT it is not: the overnight low happens 10+
+hours before the last poll, so by evening the window has completely
+forgotten it. tools/probe_observed_final_method.py confirmed this directly:
+switching LOWT to last-poll made match rates COLLAPSE (avg -38.8pp, some
+cities to ~15%), and tools/inspect_ticker_day.py showed observed_low_f
+rising by 20-40+ degrees across the day in concrete examples — mathematically
+impossible for a genuine running minimum.
+
+Practical effect: `all_polls` (current LOWT method) is the less-bad of two
+bad options, not a validated method. BOTH methods draw from the same
+undersized-window data. Treat every LOWT number below as directional at
+best, and do not use it to recalibrate anything live (this may also affect
+lowt_decision_engine.py's Signal A structural-elimination logic, which reads
+this same observed_low_f field — that is a live-trading-path question
+requiring its own dedicated review, out of scope for this script).
+
+Original ~87.6% NWS-vs-authoritative figure referenced in project history
+predates this finding and should not be assumed to still apply, particularly
+for LOWT — run --validate below and look at the numbers directly rather than
+citing the old headline figure.
+============================================================================
 
 USAGE (repo root, on the Pi, after fetch_settlements.py +
 load_settlements_to_db.py + tools/build_market_days.py have run):
@@ -99,14 +117,15 @@ MIN_DAYS_RELIABLE = 5
 # ---------------------------------------------------------------------------
 
 def _fetch_rows(con, market_type: str, fcst_col: str, obs_col: str):
-    """Pull raw rows for the given market_type. NOTE: each poll is written
-    once per bracket (6x), so this returns 6 identical (fcst, obs) values per
-    poll. That's wasteful but not wrong: MEAN/MAX/MIN over duplicated
-    identical values equals the same over deduplicated values, so the
-    aggregates below are unaffected. Not worth a DISTINCT-on-poll-time here
-    given the DB sizes involved."""
+    """Pull raw rows for the given market_type, including poll_time_utc so
+    HIGH can identify its last poll (see METHOD in module docstring). NOTE:
+    each poll is written once per bracket (6x), so this returns 6 identical
+    (poll_time, fcst, obs) rows per poll. Wasteful but not wrong for
+    MEAN/MAX/MIN aggregates; for the last-poll lookup, duplicate identical
+    timestamps resolve to the same value regardless of which duplicate wins
+    the max()."""
     q = f"""
-        SELECT city, ticker, local_hour, {fcst_col}, {obs_col}
+        SELECT city, ticker, local_hour, poll_time_utc, {fcst_col}, {obs_col}
         FROM observations
         WHERE market_type = ?
     """
@@ -117,11 +136,11 @@ def _compute(con, market_type: str, fcst_col: str, obs_col: str,
              ref_hours: set[int]) -> dict[str, dict]:
     rows = _fetch_rows(con, market_type, fcst_col, obs_col)
 
-    # city -> market_date -> {"fcst": [...], "obs": [...]}
+    # city -> market_date -> {"fcst": [...], "obs": [(poll_time_utc, value), ...]}
     by_city_date: dict[str, dict[str, dict]] = defaultdict(
         lambda: defaultdict(lambda: {"fcst": [], "obs": []}))
 
-    for city, ticker, local_hour, fcst, obs in rows:
+    for city, ticker, local_hour, poll_time, fcst, obs in rows:
         if not city or not ticker:
             continue
         market_date = market_date_iso(ticker)
@@ -131,7 +150,7 @@ def _compute(con, market_type: str, fcst_col: str, obs_col: str,
         if fcst is not None and local_hour in ref_hours:
             bucket["fcst"].append(float(fcst))
         if obs is not None:
-            bucket["obs"].append(float(obs))
+            bucket["obs"].append((poll_time, float(obs)))
 
     results: dict[str, dict] = {}
     for city, by_date in sorted(by_city_date.items()):
@@ -140,7 +159,14 @@ def _compute(con, market_type: str, fcst_col: str, obs_col: str,
             if not bucket["fcst"] or not bucket["obs"]:
                 continue
             fcst_ref = sum(bucket["fcst"]) / len(bucket["fcst"])
-            obs_final = max(bucket["obs"]) if market_type == "high" else min(bucket["obs"])
+            if market_type == "high":
+                # Last poll by poll_time_utc — see METHOD docstring for why
+                # this beats max-across-all-polls for HIGH specifically.
+                obs_final = max(bucket["obs"], key=lambda p: p[0])[1]
+            else:
+                # LOWT: min-across-all-polls, the less-bad of two bad
+                # options — see CONFIRMED CAVEAT in module docstring.
+                obs_final = min(v for _, v in bucket["obs"])
             day_errors.append({
                 "date": market_date,
                 "forecast": round(fcst_ref, 2),
@@ -208,6 +234,11 @@ def _validate(con, market_type: str, results: dict) -> dict:
 def display(results: dict, label: str, validation: dict | None = None):
     print(f"\n{'='*88}")
     print(f"  Forecast vs Observed — {label}  (source: observations.db)")
+    if label.upper().startswith("LOW"):
+        print(f"  \u26a0  KNOWN UNRELIABLE — see CONFIRMED CAVEAT in this script's docstring.")
+        print(f"  \u26a0  observed_low_f cannot see an overnight low from a same-day evening")
+        print(f"  \u26a0  poll (nws_feed.py's ~48-observation window is only ~3-4h wide).")
+        print(f"  \u26a0  Treat every number below as directional at best.")
     print(f"{'='*88}")
     hdr = f"  {'City':<16} {'MeanErr':>8}  {'MAE':>6}  {'StdDev':>7}  {'Days':>5}  {'Reliable':>9}"
     if validation is not None:
