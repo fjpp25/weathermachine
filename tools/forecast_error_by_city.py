@@ -75,7 +75,16 @@ from __future__ import annotations
 import argparse
 import math
 import sqlite3
+import sys
 from collections import defaultdict
+from pathlib import Path
+
+# Same fix as tools/build_market_days.py / tools/audit_trade_log_vs_kalshi.py —
+# running as `python3 tools/forecast_error_by_city.py` only puts tools/ on
+# sys.path, not the repo root, so `from analytics import ...` fails otherwise
+# (analytics/__init__.py itself adds the repo root to sys.path, but only
+# *after* it's been successfully imported — chicken-and-egg on first import).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analytics import OBS_DB
 from analytics.wm_time import market_date_iso

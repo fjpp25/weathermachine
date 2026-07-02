@@ -1421,6 +1421,47 @@ def _post_exit_scan(
 # Open order management
 # ---------------------------------------------------------------------------
 
+# Backstop only — the price-based reprice/cancel logic below should handle
+# almost everything within 1-2 poll cycles (~3-6 min at the observed
+# cadence). This just bounds worst-case staleness for anything that defeats
+# the price-based logic, known or not yet discovered.
+STALE_ORDER_MAX_AGE_MIN = 20
+
+def _no_ask_price(bracket: dict) -> float:
+    """
+    Ask-preferring price reference, used ONLY by manage_open_orders — NOT a
+    replacement for market_utils.no_price(), which correctly prefers bid for
+    every other caller (entry signal evaluation wants a conservative
+    reference price, which bid provides).
+
+    WHY THIS EXISTS: manage_open_orders uses its price reference to answer
+    "has the market moved past our resting order, and what would it cost to
+    chase it". For that specific decision, bid-preference has a dangerous
+    failure mode: once a partial fill consumes available ask-side liquidity,
+    OUR OWN remaining resting contracts can become the best (or only) bid on
+    the book. no_price() would then read our own stale order back as "the
+    current market price" — the reprice check compares our order's price
+    against itself, always finds zero movement, and the order is left
+    resting indefinitely. This is a plausible, code-confirmed mechanism for
+    hung orders: this exact market produces one-sided books routinely (see
+    hight_decision_engine's "One-sided book (no spread available)"
+    rejections, observed across multiple cities in the same poll on
+    2026-07-01). Reading the ASK side specifically — what it would actually
+    cost to get filled by chasing the market — avoids reading our own bid
+    back as the reference.
+
+    NOT YET CONFIRMED against a live hung order — this is a strong,
+    code-grounded hypothesis for the mechanism, not an observed fix. See
+    tools/check_resting_orders.py to verify before treating this as settled.
+    """
+    return float(
+        bracket.get("ob_no_ask") or
+        bracket.get("no_ask") or
+        bracket.get("no_ask_dollars") or
+        0.0
+    )
+
+
 def manage_open_orders(
     client:          KalshiClient,
     kalshi_snapshot: dict = None,
@@ -1488,13 +1529,15 @@ def manage_open_orders(
             continue
 
         # ── Current NO ask price ─────────────────────────────────────────
+        # Uses _no_ask_price (ask-preferring), NOT market_utils.no_price
+        # (bid-preferring) — see _no_ask_price's docstring for why this
+        # distinction matters specifically here.
         current_no = None
         if kalshi_snapshot:
             for city_data in kalshi_snapshot.values():
                 for bracket in city_data.get("brackets", []):
                     if bracket.get("ticker") == ticker:
-                        from market_utils import no_price as _no_price
-                        current_no = _no_price(bracket)
+                        current_no = _no_ask_price(bracket)
                         break
                 if current_no is not None:
                     break
@@ -1502,17 +1545,54 @@ def manage_open_orders(
         if current_no is None:
             try:
                 mkt = client.get(f"markets/{ticker}")
-                from market_utils import no_price as _no_price
-                current_no = _no_price(mkt.get("market", mkt))
+                current_no = _no_ask_price(mkt.get("market", mkt))
             except Exception as e:
                 log.debug("manage_open_orders: price fetch failed for %s: %s",
                           ticker, e)
                 continue
 
         if not current_no or current_no <= 0:
-            log.debug("manage_open_orders: %s — no usable price "
-                      "(snapshot miss + fallback=%.2f), skipping",
-                      ticker, current_no or 0.0)
+            # No usable ASK price at all — either a genuinely one-sided book
+            # with zero sell-side liquidity (nobody to trade with at any
+            # price, not a stale-reference problem), or some other gap in
+            # price data we haven't identified. Either way, the price-based
+            # logic below has nothing to work with. Backstop: cancel purely
+            # on age, regardless of price, so an order can't hang forever
+            # just because we couldn't determine what to reprice it to.
+            # created_time field name unconfirmed for this endpoint — same
+            # defensive multi-fallback pattern as the resting-contracts
+            # parsing above, since only fills' schema has been directly
+            # verified against a live sample so far, not resting orders'.
+            created_raw = (order.get("created_time") or order.get("created_at")
+                           or order.get("ts") or "")
+            age_min = None
+            try:
+                if isinstance(created_raw, (int, float)) or str(created_raw).isdigit():
+                    created_dt = datetime.fromtimestamp(float(created_raw), tz=timezone.utc)
+                else:
+                    created_dt = datetime.fromisoformat(
+                        str(created_raw).replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - created_dt).total_seconds() / 60
+            except (ValueError, TypeError, OSError):
+                pass
+
+            if age_min is not None and age_min >= STALE_ORDER_MAX_AGE_MIN:
+                log.info(
+                    "manage_open_orders: CANCEL %s — no usable ask price AND "
+                    "resting %.0f min (>= %d min backstop)",
+                    ticker, age_min, STALE_ORDER_MAX_AGE_MIN,
+                )
+                if not paper:
+                    try:
+                        client.delete(f"portfolio/orders/{order_id}")
+                        cancelled += 1
+                    except Exception as e:
+                        log.warning("manage_open_orders: backstop cancel failed %s: %s",
+                                    ticker, e)
+            else:
+                log.debug("manage_open_orders: %s — no usable price "
+                          "(age=%s min), skipping this poll",
+                          ticker, f"{age_min:.0f}" if age_min is not None else "unknown")
             continue
 
         # ── Order's placed NO price ──────────────────────────────────────
@@ -1574,7 +1654,40 @@ def manage_open_orders(
                 except Exception as e:
                     log.warning("manage_open_orders: reprice failed %s: %s",
                                 ticker, e)
-        # else: price unchanged and within range — leave the order resting
+        else:
+            # Price-based logic found no reason to act. Universal backstop:
+            # regardless of WHY the price check passed (genuinely stable
+            # price, or some other undiscovered self-reference issue beyond
+            # the specific bid-contamination mechanism _no_ask_price already
+            # guards against), an order shouldn't be allowed to rest forever.
+            created_raw = (order.get("created_time") or order.get("created_at")
+                           or order.get("ts") or "")
+            age_min = None
+            try:
+                if isinstance(created_raw, (int, float)) or str(created_raw).isdigit():
+                    created_dt = datetime.fromtimestamp(float(created_raw), tz=timezone.utc)
+                else:
+                    created_dt = datetime.fromisoformat(
+                        str(created_raw).replace("Z", "+00:00"))
+                age_min = (datetime.now(timezone.utc) - created_dt).total_seconds() / 60
+            except (ValueError, TypeError, OSError):
+                pass
+
+            if age_min is not None and age_min >= STALE_ORDER_MAX_AGE_MIN:
+                log.info(
+                    "manage_open_orders: CANCEL %s — price check found no "
+                    "movement but resting %.0f min (>= %d min backstop)",
+                    ticker, age_min, STALE_ORDER_MAX_AGE_MIN,
+                )
+                if not paper:
+                    try:
+                        client.delete(f"portfolio/orders/{order_id}")
+                        cancelled += 1
+                    except Exception as e:
+                        log.warning("manage_open_orders: backstop cancel failed %s: %s",
+                                    ticker, e)
+            # else: price unchanged, within range, and not yet stale enough
+            # to force-cancel — leave the order resting.
 
     if replaced or cancelled:
         log.info("manage_open_orders: %d repriced  %d cancelled",
