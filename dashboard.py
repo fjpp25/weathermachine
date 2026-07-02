@@ -343,8 +343,36 @@ def _fetch_settlements() -> tuple:
                 "contracts":nc,"avg_buy":round(ab,4),"avg_sell":round(ae,4),
                 "fee":round(fee,4),"net_pnl":round(ae*nc - ab*nc - fee,4)})
 
-        etickers = {e["ticker"] for e in exits}
-        temp = [s for s in temp if s["ticker"] not in etickers]
+        # BUGFIX (found via tools/inspect_ticker_fills.py, live audit against
+        # Kalshi's raw fills/settlement data): this used to remove a
+        # ticker's settlement record entirely from `temp` whenever ANY
+        # buy+sell pair was detected in fills — on the assumption that a
+        # visible sell fill meant the WHOLE position was closed early.
+        #
+        # That assumption breaks silently whenever fills predate Kalshi's
+        # fills-history retention window (see the "regardless of Kalshi's
+        # fills historical cutoff" comment below, on the settlement-
+        # enrichment step — the codebase already knew fills can be
+        # incomplete for old trades; this exits-detection step didn't
+        # account for it). Concretely verified example: KXHIGHTATL-
+        # 26JUN26-B93.5 showed only 5 buy contracts in fills (3 @ 11:45,
+        # 2 @ 20:12) and a 3-contract sell — but its settlement recorded
+        # 8 contracts held at close. 5 visible buys - 3 sold = 2, not 8;
+        # the other 6 buy contracts existed but had already aged out of
+        # the fills API. The position was TRIMMED by 3, not closed — the
+        # remaining 8 contracts rode to settlement and won ($8.00 revenue
+        # vs $7.63 cost) — and the old code deleted that entire win from
+        # `temp`, replacing it with only the -$0.04 trim as "EARLY EXIT",
+        # making a winning ticker look like a small loss with no win
+        # recorded at all.
+        #
+        # Fix: a settlement is now ALWAYS counted (it reflects Kalshi's
+        # own authoritative held-at-close quantity, which already nets out
+        # any earlier trims — no double-counting risk, since exit PnL
+        # below covers only the contracts that were sold before
+        # settlement, a disjoint pool from what's reflected in
+        # no_count_fp/yes_count_fp at settlement time). The exits list
+        # below is added ADDITIONALLY, not as a replacement.
 
         # enrich settled
         # Side and cost come from settlement fields (yes/no_count_fp,
