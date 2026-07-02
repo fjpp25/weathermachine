@@ -169,16 +169,55 @@ def fetch_current_observation(icao: str) -> dict:
 
 def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
     """
-    Fetch observations once and return (observed_high, observed_low) for today.
-    Uses the city's proper IANA timezone (tz_name) for DST-aware date filtering.
-    lst_offset retained for backward compatibility but no longer used.
-    """
-    data     = get(f"{API_BASE}/stations/{icao}/observations?limit=48")
-    features = data.get("features", [])
+    Fetch observations for today's local calendar date and return
+    (observed_high, observed_low). Uses the city's proper IANA timezone
+    (tz_name) for DST-aware date filtering. lst_offset retained for
+    backward compatibility but no longer used.
 
+    FIXED — see project history (weathermachine repo, forecast-error
+    analysis thread): this previously used `?limit=48` (the 48 MOST RECENT
+    observations), not a real full-day window. For a station reporting
+    every ~5 minutes, 48 records can span under 4 hours — confirmed
+    empirically for KSFO (48 records = 3h39m). By evening, a poll's
+    "observed low" could no longer see that morning's actual overnight
+    low at all; it would just be the min of whatever recent, already-
+    warmer readings remained in the truncated window. Two independent
+    ticker-day inspections (San Francisco, Denver) showed observed_low_f
+    rising 20-40+ degrees across the day — mathematically impossible for
+    a genuine running minimum, and a direct threat to
+    lowt_decision_engine.py's Signal A (obs_low_f > bracket cap ->
+    "physically eliminated, enter No"): a bracket the true overnight low
+    actually fell inside could look falsely eliminated once enough hours
+    had passed for the window to forget it.
+
+    Fix: query with explicit start/end bounds (local midnight through now,
+    converted to UTC) instead of a fixed record count, so the window
+    always covers the full elapsed day regardless of station reporting
+    frequency. limit=500 (the API's documented max for this endpoint) is
+    kept only as a safety cap — with a real date range in place it should
+    essentially never be the binding constraint.
+
+    NOTE: this fixes data collected FROM NOW ON. It does not retroactively
+    repair observed_high_f/observed_low_f already sitting in
+    observations.db from before this change — any bias/calibration
+    analysis over historical data should still treat pre-fix LOWT rows as
+    unreliable, and should not blend pre-fix and post-fix observations
+    together when recalibrating.
+    """
     # Use proper IANA timezone for DST-aware date boundary
     city_tz   = ZoneInfo(tz_name)
-    today_lst = datetime.now(city_tz).date()
+    now_local = datetime.now(city_tz)
+    today_lst = now_local.date()
+
+    start_local = datetime(today_lst.year, today_lst.month, today_lst.day,
+                            tzinfo=city_tz)
+    start_utc   = start_local.astimezone(timezone.utc)
+    end_utc     = datetime.now(timezone.utc)
+
+    url = (f"{API_BASE}/stations/{icao}/observations"
+           f"?start={start_utc.isoformat()}&end={end_utc.isoformat()}&limit=500")
+    data     = get(url)
+    features = data.get("features", [])
 
     temps_today = []
     for feature in features:
