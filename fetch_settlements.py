@@ -22,6 +22,18 @@ entry from an OLDER run of this script (result only, no strikes) will not have
 this flag set, so it is treated as still needing a fetch — geometry gets
 backfilled on the next run instead of silently staying null forever.
 
+CLOBBER GUARD (added after a real data-loss bug): a re-fetch that comes back
+empty/unsettled — e.g. a 404 because Kalshi delisted an old market — must NEVER
+overwrite an already-known yes/no result for that ticker, whether that result
+came from the cache or from an earlier batch in this same run. Without this
+guard, a single run that mixes "ticker I already know settled" with "ticker
+that has since been delisted" silently loses the known result the moment the
+delisted one's 404 gets merged in — defeating the entire stated purpose of this
+script (capturing settlements before Kalshi's delisting makes them
+unrecoverable). Geometry is still backfilled in this case if the failed fetch
+happened to carry any (it won't, for a 404, but the logic is symmetric with
+load_settlements_to_db.py's identical guard for consistency).
+
 USAGE (on the Pi, from the repo dir):
     python3 fetch_settlements.py --db data/observations.db \
         --cache settlements_full.json --out settlements_full.json
@@ -120,6 +132,24 @@ def _record_from_market(m: dict) -> dict:
     }
 
 
+def _merge(results: dict, t: str, r: dict):
+    """Merge one freshly-fetched record into `results`, in place. Never lets
+    a failed/unsettled re-fetch overwrite an already-known yes/no — see
+    CLOBBER GUARD in the module docstring. Still backfills geometry from the
+    new record if the previous one didn't have it and the new one does."""
+    prev = results.get(t)
+    if prev and prev.get("result") in ("yes", "no") and r.get("result") not in ("yes", "no"):
+        results[t] = {
+            "result": prev["result"],
+            "floor_strike": prev.get("floor_strike") if prev.get("floor_strike") is not None else r.get("floor_strike"),
+            "cap_strike": prev.get("cap_strike") if prev.get("cap_strike") is not None else r.get("cap_strike"),
+            "title": prev.get("title") if prev.get("title") is not None else r.get("title"),
+            "has_geometry": bool(prev.get("has_geometry")) or bool(r.get("has_geometry")),
+        }
+        return
+    results[t] = r
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("observations_csv", nargs="?",
@@ -161,9 +191,12 @@ def main():
     client = trader.make_client(skip_confirmation=True)
     print(f"Client base: {client.base_url}")
 
-    results = dict(cache)            # start from cache
+    results = dict(cache)            # start from cache — see _merge for the
+                                      # guard that protects these from being
+                                      # clobbered by a failed re-fetch below.
     fetched = 0
     failures = []
+    clobbers_prevented = 0
 
     for batch in chunks(todo, args.batch_size):
         got = {}
@@ -189,7 +222,10 @@ def main():
                           "title": None, "has_geometry": False}
 
         for t, r in got.items():
-            results[t] = r
+            prev_result = results.get(t, {}).get("result")
+            _merge(results, t, r)
+            if prev_result in ("yes", "no") and r.get("result") not in ("yes", "no"):
+                clobbers_prevented += 1
         fetched += len(batch)
 
         if fetched % args.checkpoint_every < args.batch_size:
@@ -204,6 +240,9 @@ def main():
     with_geometry = sum(1 for v in results.values() if v["has_geometry"])
     print(f"\nDone. {len(results)} tickers, {settled} settled, "
           f"{unsettled} unsettled/empty, {with_geometry} with geometry captured.")
+    if clobbers_prevented:
+        print(f"  {clobbers_prevented} failed re-fetches (delisted/404) would have "
+              f"overwritten an already-known yes/no result — prevented.")
     if failures:
         print(f"  {len(failures)} fetch failures (left empty, has_geometry=False — "
               f"will retry next run). First few: {failures[:3]}")

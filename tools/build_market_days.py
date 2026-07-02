@@ -21,6 +21,21 @@ floor_strike/cap_strike (see those files' docstrings), this script builds
 the single derived table every future probe should join against instead of
 re-inferring anything.
 
+DATE FORMAT FIX (post-hoc): market_date was originally stored as the raw
+ticker segment (e.g. "26JUN30"), parsed locally in this file. Every other
+consumer of "market_date" in this codebase — including
+tools/forecast_error_by_city.py's --validate join — uses the canonical
+analytics.wm_time.market_date_iso() converter, which returns ISO
+("2026-06-30"). The mismatch meant a join against this table on market_date
+silently matched ZERO rows, ever, for any city — not a "no violations
+found" result, a "the key format never matched" result. Fixed by using the
+same canonical converter here. Because this whole table is 100%
+re-derivable from `settlements` on every run (never incrementally
+maintained from any other source), the table is now dropped and rebuilt
+from scratch each run instead of INSERT-ON-CONFLICT — a data-format change
+like this one can never again leave stale rows from an old format sitting
+alongside rows in the new one.
+
 WHAT THIS DOES NOT FIX
 ------------------------
 This is a settlement/geometry table, not a price-liquidity table. It would
@@ -29,11 +44,15 @@ arrival.py (v1) — that was an entry-PRICE problem in observations.db, not an
 outcome problem. It would NOT have caught the sweep_engine.py dedup bug —
 that was live trading logic. Don't treat this table as a general fix for
 "the issues we had"; it fixes the specific, real risk of inferring bracket
-geometry positionally instead of reading it.
+geometry positionally instead of reading it (and, as of this update, the
+specific risk of a non-canonical date format silently breaking joins).
 
 SCHEMA (table: market_days)
 -----------------------------
-  city, market_date, market_type   — identity (matches ticker parsing)
+  city, market_date, market_type   — identity (market_date is canonical ISO,
+                                      via analytics.wm_time.market_date_iso —
+                                      matches every other consumer of
+                                      "market_date" in this codebase)
   winning_ticker, winning_code     — the bracket that settled 'yes'
   bracket_type                     — 'T-bottom' | 'T-top' | 'B'
   floor_strike, cap_strike         — REAL strikes from Kalshi, not inferred
@@ -62,6 +81,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cities import CITIES
+from analytics.wm_time import market_date_iso
 
 DB = "data/observations.db"
 
@@ -77,11 +97,16 @@ for _city, _meta in CITIES.items():
 
 
 def parse_ticker(ticker: str):
-    """KXHIGHATL-26JUN15-B82.5 -> (series, market_date, code)."""
+    """KXHIGHATL-26JUN15-B82.5 -> (series, market_date_iso, code).
+    market_date is the CANONICAL ISO date (analytics.wm_time.market_date_iso),
+    not the raw ticker segment — see module docstring's DATE FORMAT FIX."""
     parts = ticker.split("-")
     if len(parts) < 3:
         return None
-    series, market_date, code = parts[0], parts[1], parts[-1]
+    series, code = parts[0], parts[-1]
+    market_date = market_date_iso(ticker)
+    if market_date is None:
+        return None
     return series, market_date, code
 
 
@@ -106,9 +131,14 @@ def geometry(floor_strike, cap_strike):
     return None, None, None
 
 
-def ensure_table(con):
+def rebuild_table(con):
+    """Drop and recreate market_days. Safe: the table is 100% re-derived
+    from `settlements` every run — nothing else writes to it, and nothing
+    incrementally accumulates here. See DATE FORMAT FIX in the module
+    docstring for why a clean rebuild (vs INSERT-ON-CONFLICT) matters."""
+    con.execute("DROP TABLE IF EXISTS market_days")
     con.execute("""
-        CREATE TABLE IF NOT EXISTS market_days (
+        CREATE TABLE market_days (
             city               TEXT,
             market_date        TEXT,
             market_type        TEXT,
@@ -128,7 +158,7 @@ def ensure_table(con):
 
 def main():
     con = sqlite3.connect(DB)
-    ensure_table(con)
+    rebuild_table(con)
 
     rows = con.execute("""
         SELECT ticker, result, floor_strike, cap_strike
@@ -173,9 +203,6 @@ def main():
                      winning_code, bracket_type, floor_strike, cap_strike,
                      settle_lo, settle_hi, n_brackets_settled, n_yes)
                 VALUES (?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
-                ON CONFLICT(city, market_date, market_type) DO UPDATE SET
-                    n_brackets_settled = excluded.n_brackets_settled,
-                    n_yes = excluded.n_yes
             """, (city, market_date, market_type, n_settled, n_yes))
             inserted += 1
             continue
@@ -195,16 +222,6 @@ def main():
                  winning_code, bracket_type, floor_strike, cap_strike,
                  settle_lo, settle_hi, n_brackets_settled, n_yes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(city, market_date, market_type) DO UPDATE SET
-                winning_ticker      = excluded.winning_ticker,
-                winning_code        = excluded.winning_code,
-                bracket_type        = excluded.bracket_type,
-                floor_strike        = excluded.floor_strike,
-                cap_strike          = excluded.cap_strike,
-                settle_lo           = excluded.settle_lo,
-                settle_hi           = excluded.settle_hi,
-                n_brackets_settled  = excluded.n_brackets_settled,
-                n_yes               = excluded.n_yes
         """, (city, market_date, market_type, ticker, code, btype,
               floor_strike, cap_strike, lo, hi, n_settled, n_yes))
         inserted += 1
@@ -224,8 +241,9 @@ def main():
     print(f"  clean winner but NO geometry captured yet "
           f"(re-run fetch_settlements.py): {flagged_no_geometry}")
     if unmapped_series:
-        print(f"  WARNING: {len(unmapped_series)} series tickers not found in "
-              f"cities.py — {sorted(unmapped_series)[:10]}")
+        print(f"  NOTE: {len(unmapped_series)} series tickers not found in "
+              f"cities.py (expected for non-HIGH/LOWT series, e.g. NYC "
+              f"hourly): {sorted(unmapped_series)[:10]}")
 
 
 if __name__ == "__main__":
