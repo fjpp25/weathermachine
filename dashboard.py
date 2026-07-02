@@ -834,6 +834,31 @@ def api_positions():
     return jsonify(out)
 
 # ---------------------------------------------------------------------------
+# City-box timestamp formatting — added alongside the Observed/Forecast
+# timestamp rework. Europe/Lisbon (Xico's own timezone), not a hardcoded
+# UTC+1 offset — Portugal is UTC+0 (WET) in winter, so a literal "+1"
+# would go quietly wrong every year from ~late Oct to late Mar. Using the
+# real IANA zone means the displayed abbreviation (WEST in summer, WET in
+# winter) is always correct instead of always saying "UTC+1" whether or
+# not that's still true.
+# ---------------------------------------------------------------------------
+LISBON_TZ = ZoneInfo("Europe/Lisbon")
+
+def _hhmm(iso_str, tz=None, with_zone=False):
+    """Format an ISO8601 timestamp as HH:MM, optionally converting to `tz`
+    first. Returns None on missing/unparseable input, matching every other
+    '—'-on-missing-data convention already used elsewhere in this file."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+    if tz is not None:
+        dt = dt.astimezone(tz)
+    return dt.strftime("%H:%M %Z") if with_zone else dt.strftime("%H:%M")
+
+# ---------------------------------------------------------------------------
 # API — /api/cities
 # ---------------------------------------------------------------------------
 @app.route("/api/cities")
@@ -848,6 +873,14 @@ def api_cities():
         out.append({"city":city,"local_time":now.strftime("%H:%M"),"tz_abbr":now.strftime("%Z"),
             "local_hour":h,"obs_hi":d.get("observed_high_f"),"fcst_hi":d.get("forecast_high_f"),
             "obs_lo":d.get("observed_low_f"),"fcst_lo":d.get("forecast_low_f"),
+            # Observed timestamps are already in the CITY's own local tz
+            # (nws_feed.py computes them via .astimezone(city_tz)) — no
+            # further conversion, this IS the city's local recording time.
+            "obs_hi_at":_hhmm(d.get("observed_high_at")),
+            "obs_lo_at":_hhmm(d.get("observed_low_at")),
+            # Forecast issuance timestamp is UTC from NWS — convert to
+            # Xico's own timezone for display, per the city-box rework.
+            "fcst_issued_at":_hhmm(d.get("forecast_issued_at"), LISBON_TZ, with_zone=True),
             "now":d.get("current_temp_f"),
             "window":win,"high_active":ha,"lowt_active":la})
     return jsonify(out)
@@ -1446,6 +1479,7 @@ td.center{text-align:center}
 .stat-k{color:var(--sec);font-size:9px;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
 /* Weather-tab label override — larger + bold for readability (city modal only) */
 .stat-k-wx{font-size:12px;font-weight:700;letter-spacing:1.5px;color:#a8c4e0}
+.stat-sub{font-size:10px;color:var(--sec);margin-top:4px;letter-spacing:0.3px}
 .stat-v{font-size:22px;font-weight:600}
 
 /* ── City modal ── */
@@ -2216,18 +2250,24 @@ function _cityWeatherHTML(city) {
     return '<div class="empty">No live weather snapshot yet — '
          + 'the map is still loading. Try again in a moment.</div>';
   }
+  // [label, value, sub-line or null]. Sub-line shows WHEN that number was
+  // recorded (Observed — the city's own local time) or issued (Forecast —
+  // Xico's local time, WEST/WET as applicable). Row order: Now+LocalTime,
+  // then Observed/Forecast High, then Observed/Forecast Low.
   const cells = [
-    ['Now',          f1(w.now)],
-    ['Observed High', f1(w.obs_hi)],
-    ['Observed Low',  f1(w.obs_lo)],
-    ['Forecast High', f1(w.fcst_hi)],
-    ['Forecast Low',  f1(w.fcst_lo)],
-    ['Local Time',   (w.local_time || '—') + (w.tz_abbr ? ' ' + w.tz_abbr : '')],
+    ['Now',           f1(w.now), null],
+    ['Local Time',    (w.local_time || '—') + (w.tz_abbr ? ' ' + w.tz_abbr : ''), null],
+    ['Observed High', f1(w.obs_hi),  w.obs_hi_at ? `recorded ${w.obs_hi_at}` : null],
+    ['Forecast High', f1(w.fcst_hi), w.fcst_issued_at ? `issued ${w.fcst_issued_at}` : null],
+    ['Observed Low',  f1(w.obs_lo),  w.obs_lo_at ? `recorded ${w.obs_lo_at}` : null],
+    ['Forecast Low',  f1(w.fcst_lo), w.fcst_issued_at ? `issued ${w.fcst_issued_at}` : null],
   ];
   return `<div class="stat-grid" style="grid-template-columns:repeat(2,1fr);margin-bottom:4px">
-    ${cells.map(([k,v]) =>
+    ${cells.map(([k,v,sub]) =>
       `<div class="stat-card"><div class="stat-k stat-k-wx">${k}</div>`
-      + `<div class="stat-v" style="font-size:18px">${v}</div></div>`).join('')}
+      + `<div class="stat-v" style="font-size:18px">${v}</div>`
+      + (sub ? `<div class="stat-sub">${sub}</div>` : '')
+      + `</div>`).join('')}
   </div>
   <div style="font-size:10px;color:var(--sec);margin-top:10px">
     Window: ${w.window || '—'} · snapshot shared with map markers</div>`;

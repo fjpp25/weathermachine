@@ -217,6 +217,18 @@ def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
     "+00:00" — same instant, zero characters that need escaping. Verified
     by reproducing the exact query string through urllib.parse.parse_qs
     before deploying this version.
+
+    EXTENDED (dashboard rework): now also returns WHEN each extreme was
+    recorded, not just its value — needed to show "recorded at HH:MM" on
+    the dashboard. Returns a 4-tuple:
+        (observed_high, observed_high_at, observed_low, observed_low_at)
+    observed_high_at / observed_low_at are ISO8601 timestamps in the
+    city's own local timezone (tz_name), or None if no observations were
+    available for today. If the true extreme was held flat across several
+    consecutive readings (e.g. an overnight low plateauing for a few
+    hours, as seen in the San Francisco / Denver ticker-day inspections),
+    the EARLIEST reading to reach it is reported — matching the standard
+    convention of reporting when an extreme first occurred, not last.
     """
     # Use proper IANA timezone for DST-aware date boundary
     city_tz   = ZoneInfo(tz_name)
@@ -237,7 +249,7 @@ def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
     data     = get(url)
     features = data.get("features", [])
 
-    temps_today = []
+    temps_today: list[tuple[datetime, float]] = []
     for feature in features:
         props  = feature.get("properties", {})
         ts     = props.get("timestamp")
@@ -246,11 +258,20 @@ def fetch_observed_high_low(icao: str, tz_name: str, lst_offset: int) -> tuple:
             continue
         obs_time_lst = datetime.fromisoformat(ts).astimezone(city_tz)
         if obs_time_lst.date() == today_lst:
-            temps_today.append(c_to_f(temp_c))
+            temps_today.append((obs_time_lst, c_to_f(temp_c)))
 
-    if temps_today:
-        return max(temps_today), min(temps_today)
-    return None, None
+    if not temps_today:
+        return None, None, None, None
+
+    # Chronological order first, so max()/min() ties resolve to the
+    # EARLIEST observation reaching that value — Python's max()/min()
+    # return the first-encountered item among ties, so sorting
+    # chronologically first makes "first encountered" mean "earliest".
+    temps_today.sort(key=lambda p: p[0])
+    high_time, high_val = max(temps_today, key=lambda p: p[1])
+    low_time,  low_val  = min(temps_today, key=lambda p: p[1])
+
+    return high_val, high_time.isoformat(), low_val, low_time.isoformat()
 
 
 def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
@@ -386,11 +407,13 @@ def _fetch_city(city: str, meta: dict, grid_cache: dict) -> tuple[str, dict]:
         obs = fetch_current_observation(meta["icao"])
         result.update(obs)
 
-        obs_hi, obs_lo = fetch_observed_high_low(
+        obs_hi, obs_hi_at, obs_lo, obs_lo_at = fetch_observed_high_low(
             meta["icao"], meta["tz"], meta["lst_offset"]
         )
-        result["observed_high_f"] = obs_hi
-        result["observed_low_f"]  = obs_lo
+        result["observed_high_f"]  = obs_hi
+        result["observed_high_at"] = obs_hi_at
+        result["observed_low_f"]   = obs_lo
+        result["observed_low_at"]  = obs_lo_at
 
         forecast_url = get_forecast_url(city, meta, grid_cache)
         if forecast_url:
