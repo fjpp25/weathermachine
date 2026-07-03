@@ -229,6 +229,23 @@ def main():
     if unparseable:
         print(f"Unparseable poll_time (excluded from either bucket): {len(unparseable)}")
 
+    # Full distribution, not just the binary threshold check — a "0 blocked"
+    # result could mean "genuinely quiet days" (mostly 0-other-ticker cases)
+    # or "lots of near-misses" (mostly 1-other-ticker cases, one short of the
+    # cap) — those tell very different stories about how fragile this result
+    # is, and the binary check alone can't distinguish them.
+    from collections import Counter as _Counter
+    n_other_dist = _Counter()
+    for city, mdate, ticker, poll_time, n_other, others in (would_be_capped + clear):
+        n_other_dist[n_other] += 1
+    print(f"\nFull distribution of 'other same-city HIGH tickers already open' count "
+          f"across all {len(would_be_capped) + len(clear)} NEW opportunities:")
+    for n in sorted(n_other_dist):
+        count = n_other_dist[n]
+        pct = 100.0 * count / (len(would_be_capped) + len(clear))
+        flag = " (at/above cap)" if n >= MAX_NO_PER_CITY else ""
+        print(f"  {n} other ticker(s) open:  {count:4d}  ({pct:5.1f}%){flag}")
+
     print(f"\nTrue genuinely-incremental estimate: {len(clear)} / {len(qualifying_opportunities)} "
           f"({100.0*len(clear)/len(qualifying_opportunities):.1f}% of all 180 opportunities)")
 
