@@ -21,25 +21,36 @@
 #      an empty result here is INCONCLUSIVE, not damning, so it's reported
 #      separately from the ECONV check above.
 #
+# NOTE: journal output is captured to a temp file once, then queried from
+# there. Piping journalctl directly into head/tail under `set -o pipefail`
+# causes journalctl to receive SIGPIPE when head/tail close the pipe early,
+# which makes `set -e` abort the whole script silently — that was a real
+# bug in the previous version of this script.
+#
 # Usage (on the Pi, from repo root):
 #   bash tools/check_econv_live_activity.sh
 
 set -euo pipefail
 
+TMPFILE=$(mktemp)
+trap 'rm -f "$TMPFILE"' EXIT
+
+journalctl -u weathermachine --since "30 days ago" > "$TMPFILE"
+
 echo "=== 1. Journal retention window for weathermachine.service ==="
-FIRST_LINE=$(journalctl -u weathermachine --since "30 days ago" | head -1)
-LAST_LINE=$(journalctl -u weathermachine --since "30 days ago" | tail -1)
-echo "First line: $FIRST_LINE"
-echo "Last line:  $LAST_LINE"
+LINE_COUNT=$(wc -l < "$TMPFILE")
+echo "Total lines in window: $LINE_COUNT"
+echo "First line: $(head -1 "$TMPFILE")"
+echo "Last line:  $(tail -1 "$TMPFILE")"
 echo ""
 
 echo "=== 2. ECONV detection-line check (exact literal, full 30-day window) ==="
-COUNT=$(journalctl -u weathermachine --since "30 days ago" | grep -c "ECONV  " || true)
+COUNT=$(grep -c "ECONV  " "$TMPFILE" || true)
 echo "Matches: $COUNT"
 if [ "$COUNT" -gt 0 ]; then
     echo ""
     echo "-- all matches --"
-    journalctl -u weathermachine --since "30 days ago" | grep "ECONV  "
+    grep "ECONV  " "$TMPFILE"
 else
     echo "No matches — evening_convergence has never detected a qualifying setup"
     echo "in the retained journal window (see retention window above before"
@@ -48,7 +59,7 @@ fi
 echo ""
 
 echo "=== 3. Scheduler invocation check (debug-level; empty result is inconclusive, not damning) ==="
-DEBUG_COUNT=$(journalctl -u weathermachine --since "30 days ago" | grep -c "evening_convergence\] starting" || true)
+DEBUG_COUNT=$(grep -c "evening_convergence\] starting" "$TMPFILE" || true)
 echo "Matches: $DEBUG_COUNT"
 if [ "$DEBUG_COUNT" -eq 0 ]; then
     echo "Zero matches likely just means debug logging isn't enabled for this"
