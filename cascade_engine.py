@@ -1199,6 +1199,20 @@ def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
     result["signals"].extend(_lowt_td_signals(city, brackets))
     result["signals"].extend(_ratchet_signals(city, brackets))
 
+    # _make_signal() does not stamp market_type on individual signals, and
+    # trader.py reads signal.get("market_type", "high") per-signal (not from
+    # this result dict) when logging trades and deciding which per-city cap
+    # (HIGH vs LOWT) applies. Without this, every LOWT cascade signal
+    # (cascade_lowt_bu, cascade_lowt_td, cascade_ratchet) silently defaults
+    # to "high": it gets logged as a HIGH trade and its per-city cap check
+    # is enforced against decision_engine.MAX_NO_PER_CITY / held_high_per_city
+    # instead of lowt_decision_engine.MAX_NO_PER_CITY / held_lowt_per_city.
+    # Confirmed against trade_log.json: 54 historical trades (50
+    # cascade_lowt_bu, 4 cascade_ratchet) were mislabeled market_type=high
+    # despite having KXLOWT... tickers.
+    for s in result["signals"]:
+        s["market_type"] = "lowt"
+
     return result
 
 
