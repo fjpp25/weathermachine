@@ -85,7 +85,18 @@ def main():
     econv_qualifying_polls = 0
     examples = []
 
+    # This is the number that actually matters: evening_convergence.py's
+    # _fired set means the live engine attempts at most ONE entry per
+    # (city, ticker) per service session — not once per poll. A bracket
+    # sitting in the qualifying price range for a 3-hour evening window,
+    # polled every ~15 minutes, shows up as ~12 rows in the raw poll count
+    # but is exactly ONE real trading opportunity. Counting raw polls
+    # overstates opportunity volume by roughly (window_length / poll_interval).
+    qualifying_opportunities = set()   # {(city, market_date, ticker)}
+    first_qualifying_poll = {}          # (city, market_date, ticker) -> (poll_time, no_price)
+
     for key, brackets in groups.items():
+        city, mdate, poll_time = key
         active = [(t, y, n) for (t, y, n) in brackets if not is_resolved(n, y)]
         active_count_dist[len(active)] += 1
 
@@ -105,6 +116,10 @@ def main():
                 continue
             if NO_MIN_ENTRY <= n <= NO_MAX_ENTRY:
                 econv_qualifying_polls += 1
+                opp_key = (city, mdate, t)
+                if opp_key not in qualifying_opportunities:
+                    qualifying_opportunities.add(opp_key)
+                    first_qualifying_poll[opp_key] = (poll_time, n)
                 if len(examples) < 15:
                     examples.append((key, t, n))
 
@@ -118,14 +133,19 @@ def main():
 
     print(f"\nTotal (city, date, poll) groups examined: {total}")
     print(f"Groups with exactly 3 active brackets:     {exactly_3}  ({pct:.2f}%)")
-    print(f"Of those, poll-signals passing econv's full gate (B-only, non-forecast, "
-          f"No in [{NO_MIN_ENTRY},{NO_MAX_ENTRY}]): {econv_qualifying_polls}")
+    print(f"Raw qualifying POLLS (B-only, non-forecast, No in [{NO_MIN_ENTRY},{NO_MAX_ENTRY}]): "
+          f"{econv_qualifying_polls}  <- inflated, one bracket counted once per poll")
+    print(f"DISTINCT qualifying opportunities (city, market_date, ticker), first-touch only: "
+          f"{len(qualifying_opportunities)}  <- this is the number to compare against "
+          f"'0 live econv trades ever'")
 
-    if examples:
-        print("\nSample qualifying poll-signals (up to 15):")
-        for key, t, n in examples:
-            city, mdate, poll_time = key
-            print(f"  {city} {mdate} {poll_time}  {t}  no={n:.2f}")
+    if first_qualifying_poll:
+        print("\nSample distinct opportunities (up to 15, first poll each qualified):")
+        for i, (opp_key, (poll_time, n)) in enumerate(sorted(first_qualifying_poll.items())):
+            if i >= 15:
+                break
+            city, mdate, t = opp_key
+            print(f"  {city} {mdate}  {t}  first_qualified_at={poll_time}  no={n:.2f}")
 
 
 if __name__ == "__main__":
