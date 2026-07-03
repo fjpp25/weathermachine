@@ -71,8 +71,7 @@ def main():
         groups[(city, mdate, poll_time_utc)].append((ticker, obs_high, no_p))
 
     reachable_polls = 0                      # intra_pos >= 0.80 reached, regardless of price
-    qualifying_opportunities = set()         # (city, market_date, target_ticker) passing full gate
-    examples = []
+    qualifying_opportunities = {}            # (city, market_date, target_ticker) -> (poll_time, no_p, intra_pos)
 
     for key, brackets in groups.items():
         city, mdate, poll_time = key
@@ -123,9 +122,7 @@ def main():
             if NEAR_CAP_NO_MIN <= no_p <= NEAR_CAP_NO_MAX:
                 opp_key = (city, mdate, t_ticker)
                 if opp_key not in qualifying_opportunities:
-                    qualifying_opportunities.add(opp_key)
-                    if len(examples) < 15:
-                        examples.append((key, t_ticker, no_p, intra_pos))
+                    qualifying_opportunities[opp_key] = (poll_time, no_p, intra_pos)
 
     total_groups = len(groups)
     print(f"Total pre-noon (city, date, poll) groups examined: {total_groups}")
@@ -134,14 +131,66 @@ def main():
     print(f"DISTINCT qualifying opportunities (city, market_date, target_ticker) passing "
           f"the full gate (structural + No price): {len(qualifying_opportunities)}")
 
-    if examples:
-        print("\nSample qualifying opportunities (up to 15):")
-        for (city, mdate, poll_time), t, no_p, intra in examples:
-            print(f"  {city} {mdate} {poll_time}  {t}  no={no_p:.2f}  intra_pos={intra:.2f}")
+    if not qualifying_opportunities:
+        print("\nNo qualifying opportunities found at all — worth checking whether the "
+              ">=80%-before-noon condition is close to structurally unreachable given how "
+              "US daily highs typically develop (afternoon peak, not morning).")
+        return
+
+    # Split by whether each opportunity falls within the last 30 days (the same
+    # window the "journalctl --since 30 days ago" NEAR_CAP log check covered).
+    # If every opportunity predates that window, zero live detections is fully
+    # explained by rarity — not a bug. If any fall inside the window, that's
+    # unexplained and needs the same follow-up as econv's "should have gone
+    # through" bucket.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    cutoff = now - datetime.timedelta(days=30)
+
+    def parse_poll_time(pt: str):
+        pt = pt.replace("Z", "+00:00")
+        try:
+            return datetime.datetime.fromisoformat(pt).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+    in_window = []
+    out_of_window = []
+    unparseable = []
+    for (city, mdate, ticker), (poll_time, no_p, intra) in qualifying_opportunities.items():
+        dt = parse_poll_time(poll_time)
+        if dt is None:
+            unparseable.append((city, mdate, ticker, poll_time, no_p, intra))
+        elif dt >= cutoff:
+            in_window.append((city, mdate, ticker, poll_time, no_p, intra))
+        else:
+            out_of_window.append((city, mdate, ticker, poll_time, no_p, intra))
+
+    print(f"\n'Now' assumed as {now.isoformat()}Z, 30-day cutoff = {cutoff.isoformat()}Z "
+          f"(matches the journalctl --since \"30 days ago\" NEAR_CAP check run earlier).")
+    print(f"Qualifying opportunities WITHIN the last 30 days (should have produced a live "
+          f"NEAR_CAP log line if the code is working): {len(in_window)}")
+    print(f"Qualifying opportunities BEFORE the last 30 days (rarity alone explains their "
+          f"absence from the recent log check): {len(out_of_window)}")
+    if unparseable:
+        print(f"Unparseable timestamps (couldn't classify): {len(unparseable)}")
+
+    if in_window:
+        print("\n*** THESE ARE UNEXPLAINED — real opportunities inside the checked window "
+              "with zero corresponding NEAR_CAP log line: ***")
+        for city, mdate, ticker, poll_time, no_p, intra in sorted(in_window, key=lambda r: r[3]):
+            print(f"  {city} {mdate} {poll_time}  {ticker}  no={no_p:.2f}  intra_pos={intra:.2f}")
     else:
-        print("\nNo qualifying opportunities found at all in this window — worth checking "
-              "whether the >=80%-before-noon condition is close to structurally unreachable "
-              "given how US daily highs typically develop (afternoon peak, not morning).")
+        print("\nNo qualifying opportunities fall inside the last-30-day window — consistent "
+              "with rarity alone explaining zero live NEAR_CAP detections. Not evidence of a "
+              "bug on its own.")
+
+    print(f"\nAll {len(qualifying_opportunities)} qualifying opportunities (full list, oldest first):")
+    all_sorted = sorted(in_window + out_of_window + unparseable, key=lambda r: r[3])
+    for city, mdate, ticker, poll_time, no_p, intra in all_sorted:
+        flag = "IN-WINDOW" if (city, mdate, ticker, poll_time, no_p, intra) in in_window else \
+               ("UNPARSEABLE" if (city, mdate, ticker, poll_time, no_p, intra) in unparseable else "older")
+        print(f"  [{flag:11s}] {city} {mdate} {poll_time}  {ticker}  no={no_p:.2f}  intra_pos={intra:.2f}")
 
 
 if __name__ == "__main__":
