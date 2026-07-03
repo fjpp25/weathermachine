@@ -48,6 +48,33 @@ NEAR_CAP_NO_MAX    = 0.95
 
 TICKER_B_RE = re.compile(r"-B(\d+(?:\.\d+)?)$")
 
+_MONTH_ABBR = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04", "MAY": "05", "JUN": "06",
+    "JUL": "07", "AUG": "08", "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+_TICKER_DATE_RE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})$")
+
+
+def ticker_date_to_iso(ticker_date: str):
+    """
+    Convert a raw ticker date segment (e.g. '26APR07') to the ISO format
+    market_days.market_date actually uses (e.g. '2026-04-07').
+
+    This is the exact format mismatch documented as already fixed once in
+    build_market_days.py ("original raw-segment format caused zero
+    AuthMatch matches across all cities") — reproducing it here in a probe
+    script was a real bug, not a data-coverage gap, confirmed via
+    tools/diagnose_market_days_join.py against live data.
+    """
+    m = _TICKER_DATE_RE.match(ticker_date)
+    if not m:
+        return None
+    yy, mon, dd = m.groups()
+    month_num = _MONTH_ABBR.get(mon)
+    if month_num is None:
+        return None
+    return f"20{yy}-{month_num}-{dd}"
+
 HOUR_BUCKETS = [
     (0, 6,  "00-06 (overnight)"),
     (6, 12, "06-12 (morning, matches live gate)"),
@@ -192,7 +219,8 @@ def main():
     no_settlement_examples = []
 
     for (city, mdate, target_ticker), (poll_time, no_p, intra_pos, local_hour) in qualifying_opportunities.items():
-        winning_ticker = winning_ticker_by_day.get((city, mdate))
+        iso_date = ticker_date_to_iso(mdate)
+        winning_ticker = winning_ticker_by_day.get((city, iso_date)) if iso_date else None
         if winning_ticker is None:
             no_settlement += 1
             if len(no_settlement_examples) < 10:
