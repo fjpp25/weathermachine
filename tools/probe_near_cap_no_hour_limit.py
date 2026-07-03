@@ -217,21 +217,26 @@ def main():
     wins, losses, no_settlement = 0, 0, 0
     loss_examples = []
     no_settlement_examples = []
+    by_bucket = defaultdict(lambda: {"wins": 0, "losses": 0, "no_settlement": 0})
 
     for (city, mdate, target_ticker), (poll_time, no_p, intra_pos, local_hour) in qualifying_opportunities.items():
+        bucket = bucket_for_hour(local_hour)
         iso_date = ticker_date_to_iso(mdate)
         winning_ticker = winning_ticker_by_day.get((city, iso_date)) if iso_date else None
         if winning_ticker is None:
             no_settlement += 1
+            by_bucket[bucket]["no_settlement"] += 1
             if len(no_settlement_examples) < 10:
                 no_settlement_examples.append((city, mdate, target_ticker))
             continue
         if winning_ticker == target_ticker:
             losses += 1
+            by_bucket[bucket]["losses"] += 1
             if len(loss_examples) < 10:
                 loss_examples.append((city, mdate, target_ticker, poll_time, no_p, intra_pos, local_hour))
         else:
             wins += 1
+            by_bucket[bucket]["wins"] += 1
 
     decided = wins + losses
     wr = (100.0 * wins / decided) if decided else 0.0
@@ -240,6 +245,37 @@ def main():
     print(f"Losses (target bracket DID win):    {losses}")
     print(f"No settlement data available:       {no_settlement}")
     print(f"Win rate (of decided outcomes only): {wr:.1f}%  (n={decided})")
+
+    print(f"\n--- Win rate BY HOUR BUCKET (this is the number that actually matters for the "
+          f"'is this a genuinely new signal or just overlapping existing engines' question) ---")
+    print(f"{'Bucket':38s}  {'W':>4s}  {'L':>4s}  {'NoSettle':>8s}  {'WR':>7s}")
+    orig_gate_w, orig_gate_l = 0, 0
+    rest_w, rest_l = 0, 0
+    for lo, hi, label in HOUR_BUCKETS:
+        b = by_bucket.get(label, {"wins": 0, "losses": 0, "no_settlement": 0})
+        b_decided = b["wins"] + b["losses"]
+        b_wr = (100.0 * b["wins"] / b_decided) if b_decided else float("nan")
+        wr_str = f"{b_wr:5.1f}%" if b_decided else "  n/a"
+        print(f"  {label:36s}  {b['wins']:4d}  {b['losses']:4d}  {b['no_settlement']:8d}  {wr_str:>7s}")
+        if label == "06-12 (morning, matches live gate)":
+            orig_gate_w += b["wins"]
+            orig_gate_l += b["losses"]
+        else:
+            rest_w += b["wins"]
+            rest_l += b["losses"]
+
+    orig_decided = orig_gate_w + orig_gate_l
+    rest_decided = rest_w + rest_l
+    orig_wr = (100.0 * orig_gate_w / orig_decided) if orig_decided else float("nan")
+    rest_wr = (100.0 * rest_w / rest_decided) if rest_decided else float("nan")
+    print(f"\nOriginal gate window (06-12, matches live NEAR_CAP_HOUR_MAX):  "
+          f"{orig_gate_w}W / {orig_gate_l}L  "
+          f"(WR={orig_wr:.1f}%, n={orig_decided})" if orig_decided else
+          f"\nOriginal gate window (06-12): no decided outcomes yet (n={orig_decided})")
+    print(f"Everything outside that window (12h+):                          "
+          f"{rest_w}W / {rest_l}L  "
+          f"(WR={rest_wr:.1f}%, n={rest_decided})" if rest_decided else
+          f"Everything outside that window (12h+): no decided outcomes yet (n={rest_decided})")
 
     if loss_examples:
         print("\nLoss examples (up to 10):")
