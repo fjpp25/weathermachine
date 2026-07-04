@@ -33,6 +33,7 @@ import time
 import base64
 import argparse
 import uuid
+import threading
 import cascade_engine
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,11 +96,53 @@ PROD_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 # Max contracts per single order — hard safety cap
 MAX_CONTRACTS_PER_ORDER = 10
 
-# Global cap: maximum total contracts held across ALL engines on any single ticker.
-# Applies in run_pipeline before every order regardless of engine.
-# Allows multi-signal confirmation (e.g. tomorrow_sweep + main) while preventing
-# unintentional concentration. Revisit when scaling contract sizes.
+# Global cap: maximum total contracts held across ALL engines on any single
+# ticker, regardless of side (a 5-contract NO position and a 3-contract YES
+# position on the same ticker count as 8 combined, not two separate pools).
+#
+# BUG FOUND (this session): this comment used to claim the cap "applies in
+# run_pipeline before every order regardless of engine" — that was never
+# true. run_pipeline (HIGH+LOWT combined pipeline) is the ONLY one of six
+# concurrently-running engines (see scheduler.py's ThreadPoolExecutor:
+# run_pipeline, sweep_engine, peak_scanner, evening_convergence,
+# cascade_engine, hourly_nyc) that ever checked this constant. The other
+# four call place_order() directly, each with their own small per-signal
+# cap (3-4 contracts) but zero awareness of this constant, zero awareness
+# of each other, and zero awareness of what run_pipeline is doing in a
+# different thread at the same moment. Four engines each independently and
+# correctly respecting their OWN 3-4 contract limit can still sum to well
+# past this "global" cap if they all like the same bracket in the same poll
+# cycle — confirmed directly against live fills: KXHIGHTSEA-26JUN08-B61.5
+# (5 orders, 22 contracts, 68 seconds) and KXHIGHAUS-26JUN21-B92.5 (5
+# orders, 20 contracts, ~2 minutes).
+#
+# FIX: place_order() itself now enforces this, under _order_lock, using
+# _session_contracts_committed as the shared running total. Since all six
+# engines are threads in one process (not separate processes), a plain
+# threading.Lock is sufficient — no cross-process coordination needed.
+# This protects every engine automatically, including the four that never
+# checked this constant before, without requiring any change to their
+# code. run_pipeline's own pre-existing live-position + resting-order check
+# is left in place as a second, independent layer — it catches persisted
+# resting orders across a scheduler restart, which this in-memory counter
+# (reset to empty on every process start) has no way to see.
 GLOBAL_MAX_CONTRACTS_PER_TICKER = 7
+
+# Shared, cross-engine order-placement lock and running-total tracker.
+# ALL writes to _session_contracts_committed must happen while holding
+# _order_lock — see place_order()'s enforcement block below. Cleared only
+# by process restart; harmless to accumulate dead tickers over a session's
+# lifetime (each is one string key + one int, and temperature-market
+# tickers are never reused across days).
+#
+# Two separate counters, real and paper, sharing the same lock and the same
+# cap logic: paper orders must never affect real headroom or vice versa,
+# but paper mode still needs to exercise the ACTUAL enforcement code path
+# (not skip it) so it can be used to verify this fix against live capital
+# risk before deploying to real trading.
+_order_lock = threading.Lock()
+_session_contracts_committed: dict[str, int] = {}
+_paper_contracts_committed:   dict[str, int] = {}
 
 # Default contracts per signal
 BASE_CONTRACTS = 1
@@ -845,7 +888,58 @@ def place_order(
     action: "buy"  to open a new position
             "sell" to close an existing position (exit trades must use this)
     price:  limit price in dollars ($0.01-$0.99)
+
+    CROSS-ENGINE CAP ENFORCEMENT (added this session — see
+    GLOBAL_MAX_CONTRACTS_PER_TICKER's comment above for the full incident
+    writeup): this is the ONE function every engine's order eventually
+    passes through, so it's the one place a genuinely global cap can live.
+    For "buy" actions, contracts are clamped to whatever headroom remains
+    under GLOBAL_MAX_CONTRACTS_PER_TICKER — combined across BOTH sides of
+    the ticker, tracked across ALL engines, reserved atomically under
+    _order_lock before any network call is made. A successful "sell"
+    releases headroom (reduces the committed total) since it shrinks real
+    exposure.
+
+    paper=True orders use a SEPARATE counter (_paper_contracts_committed,
+    never _session_contracts_committed) — paper exposure must never
+    consume or release real headroom, or vice versa. But paper orders DO
+    go through the same cap logic as real ones, deliberately: this is what
+    makes it possible to verify this exact enforcement mechanism, against
+    the real code path, using paper mode — no code path is skipped for
+    paper other than the final Kalshi API call itself. A rejected real
+    order rolls back its reservation; a paper order can't be "rejected"
+    (there's no real order to reject), so paper sells release headroom
+    immediately and paper buys are never rolled back.
     """
+    contracts      = int(contracts)
+    reserved       = 0
+    committed_dict = _paper_contracts_committed if paper else _session_contracts_committed
+
+    if action == "buy" and contracts > 0:
+        with _order_lock:
+            committed = committed_dict.get(ticker, 0)
+            headroom  = GLOBAL_MAX_CONTRACTS_PER_TICKER - committed
+            if headroom <= 0:
+                log.warning(
+                    "place_order: BLOCKED %s%s — global cap reached "
+                    "(%d/%d contracts already committed this session, "
+                    "requested %d more)",
+                    "[PAPER] " if paper else "", ticker, committed,
+                    GLOBAL_MAX_CONTRACTS_PER_TICKER, contracts,
+                )
+                return {"blocked": True, "reason": "global_cap_reached",
+                        "committed": committed, "cap": GLOBAL_MAX_CONTRACTS_PER_TICKER}
+            if contracts > headroom:
+                log.info(
+                    "place_order: REDUCED %s%s from %d to %d contracts "
+                    "(global cap: %d/%d already committed)",
+                    "[PAPER] " if paper else "", ticker, contracts, headroom,
+                    committed, GLOBAL_MAX_CONTRACTS_PER_TICKER,
+                )
+                contracts = headroom
+            reserved = contracts
+            committed_dict[ticker] = committed + reserved
+
     # ── Kalshi v2 order API ─────────────────────────────────────────────────
     # Everything is quoted from the YES side:
     #   bid = buy YES  (holding YES position)
@@ -870,22 +964,58 @@ def place_order(
     }
 
     if paper:
+        if action == "sell" and contracts > 0:
+            # Paper mode has no real API call to succeed/fail against — a
+            # paper sell always "succeeds", so release its headroom here,
+            # not after a client.post() call that will never happen for
+            # this branch. This MUST happen before the early return below.
+            with _order_lock:
+                _paper_contracts_committed[ticker] = max(
+                    0, _paper_contracts_committed.get(ticker, 0) - contracts
+                )
         log.info("[PAPER] %s %s %dx %s @ $%.2f", action.upper(), side.upper(), contracts, ticker, price_dollars)
         return {"paper": True, "order": order}
 
     try:
         raw = client.post("portfolio/events/orders", order)
+
+        if action == "sell" and contracts > 0:
+            # Confirmed success only — a rejected sell (caught below) must
+            # NOT release headroom, since nothing was actually reduced.
+            with _order_lock:
+                _session_contracts_committed[ticker] = max(
+                    0, _session_contracts_committed.get(ticker, 0) - contracts
+                )
+
         # v2 response is flat {order_id, fill_count, remaining_count, ...}
         # Wrap in {"order": ...} for backwards compatibility with callers
         if "order_id" in raw and "order" not in raw:
             return {"order": raw}
         return raw
     except requests.exceptions.HTTPError as e:
+        if reserved:
+            # Buy was rejected at Kalshi — release the reservation so it
+            # doesn't permanently eat into headroom it never actually used.
+            with _order_lock:
+                _session_contracts_committed[ticker] = max(
+                    0, _session_contracts_committed.get(ticker, 0) - reserved
+                )
+            log.info("place_order: rolled back reservation of %d for %s "
+                      "after order failure", reserved, ticker)
         try:
             detail = e.response.json()
         except Exception:
             detail = e.response.text
         raise RuntimeError(f"Order failed {e.response.status_code}: {detail}") from e
+    except Exception:
+        if reserved:
+            with _order_lock:
+                _session_contracts_committed[ticker] = max(
+                    0, _session_contracts_committed.get(ticker, 0) - reserved
+                )
+            log.info("place_order: rolled back reservation of %d for %s "
+                      "after unexpected failure", reserved, ticker)
+        raise
 
 
 def test_order(client: KalshiClient):
