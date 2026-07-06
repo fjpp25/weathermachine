@@ -37,12 +37,18 @@ METHOD
                           poll of the day runs, so a single late read beats
                           the max of many earlier, more glitch-exposed reads.
 
-  LOWT — ⚠ SEE CAVEAT BELOW, THIS METHOD IS KNOWN TO BE UNRELIABLE ⚠
+  LOWT — ⚠ SEE CAVEAT BELOW, THIS METHOD IS KNOWN TO BE UNRELIABLE PRE-FIX ⚠
     forecast reference = mean(forecast_low_f) over polls at local_hour in
                           EVENING_HOURS (18-21) for that market_date.
     observed final      = min(observed_low_f) over ALL polls for that
-                          market_date. This is the LESS-BAD of two bad
-                          options, not a validated method — see caveat.
+                          market_date. Pre-fix this was the less-bad of two
+                          bad options, not a validated method — see caveat.
+                          Post-fix (see PRE/POST-FIX section below), nws_feed.py
+                          bounds the query window to local-midnight-through-now,
+                          so min-across-all-polls should now be a genuine
+                          running minimum rather than a window artifact — but
+                          this has NOT yet been independently re-validated
+                          with a large post-fix sample. Use --since to check.
 
   error = forecast_reference - observed_final
     Positive -> forecast ran WARM (overestimated)
@@ -54,39 +60,57 @@ including forecast busts, per city before deciding whether trimming is
 appropriate).
 
 ============================================================================
-CONFIRMED CAVEAT — LOWT OBSERVED VALUES ARE NOT TRUSTWORTHY, EITHER METHOD
+CONFIRMED CAVEAT — LOWT OBSERVED VALUES WERE NOT TRUSTWORTHY PRE-FIX
 ============================================================================
-nws_feed.py's fetch_observed_high_low() computes max/min over only the last
-~48 station observations (confirmed empirically at ~3h39m of coverage for
-KSFO — likely varies by station/weather, but nowhere near a full day). For
-HIGH this is usually fine (the peak is typically only a few hours before the
-last poll of the day). For LOWT it is not: the overnight low happens 10+
-hours before the last poll, so by evening the window has completely
-forgotten it. tools/probe_observed_final_method.py confirmed this directly:
-switching LOWT to last-poll made match rates COLLAPSE (avg -38.8pp, some
-cities to ~15%), and tools/inspect_ticker_day.py showed observed_low_f
-rising by 20-40+ degrees across the day in concrete examples — mathematically
-impossible for a genuine running minimum.
+nws_feed.py's fetch_observed_high_low() used to compute max/min over only the
+last ~48 station observations (confirmed empirically at ~3h39m of coverage
+for KSFO — likely varies by station/weather, but nowhere near a full day).
+For HIGH this was usually fine (the peak is typically only a few hours
+before the last poll of the day). For LOWT it was not: the overnight low
+happens 10+ hours before the last poll, so by evening the window had
+completely forgotten it. tools/probe_observed_final_method.py confirmed this
+directly: switching LOWT to last-poll made match rates COLLAPSE (avg
+-38.8pp, some cities to ~15%), and tools/inspect_ticker_day.py showed
+observed_low_f rising by 20-40+ degrees across the day in concrete examples —
+mathematically impossible for a genuine running minimum.
 
-Practical effect: `all_polls` (current LOWT method) is the less-bad of two
-bad options, not a validated method. BOTH methods draw from the same
-undersized-window data. Treat every LOWT number below as directional at
-best, and do not use it to recalibrate anything live (this may also affect
-lowt_decision_engine.py's Signal A structural-elimination logic, which reads
-this same observed_low_f field — that is a live-trading-path question
-requiring its own dedicated review, out of scope for this script).
+This was fixed in commit bde2629 (2026-07-02 15:54 local / 14:54 UTC — bounds
+the query to local-midnight-through-now instead of a fixed record count),
+then a same-day URL-encoding hotfix in commit 49cf2a4 (2026-07-02 18:33
+local / 17:33:09 UTC — between these two commits observed_low_f was NULL for
+every poll, so those rows simply drop out of the queries below rather than
+corrupting anything).
 
-Original ~87.6% NWS-vs-authoritative figure referenced in project history
-predates this finding and should not be assumed to still apply, particularly
-for LOWT — run --validate below and look at the numbers directly rather than
-citing the old headline figure.
 ============================================================================
+PRE/POST-FIX CONTAMINATION WARNING
+============================================================================
+The fix only repairs data collected from 2026-07-02T17:33:09Z forward. It
+does NOT retroactively repair rows already in observations.db from before
+that instant. Running this script (or --validate) with no --since filter
+blends months of pre-fix, window-truncated LOWT rows together with a
+handful of post-fix days — and given the fix landed only a few days ago,
+an unfiltered run is measuring the OLD bug almost exclusively, not current
+reality. The original ~87.6% NWS-vs-authoritative figure referenced in
+project history, and any AuthMatch number produced without --since, should
+be read the same way: mostly a description of the old bug, not of where
+things stand now. Pass --since 2026-07-02T17:35:00Z to isolate the
+post-fix-only picture (note: as of early July 2026 this will only be a
+handful of days per city — treat post-fix numbers as a small, growing
+sample, not a final verdict, until more days accumulate).
+============================================================================
+
+Separately, even a clean post-fix AuthMatch number only confirms our
+MEASUREMENT is trustworthy (does observed_low_f agree with Kalshi's
+settlement). It says nothing about whether the market's No/Yes PRICE at
+entry time was a good bet given the true outcome distribution — that is a
+distinct pricing-efficiency question this script does not answer.
 
 USAGE (repo root, on the Pi, after fetch_settlements.py +
 load_settlements_to_db.py + tools/build_market_days.py have run):
     python3 tools/forecast_error_by_city.py
     python3 tools/forecast_error_by_city.py --market high
     python3 tools/forecast_error_by_city.py --market lowt --validate
+    python3 tools/forecast_error_by_city.py --market lowt --validate --since 2026-07-02T17:35:00Z
 """
 from __future__ import annotations
 
@@ -111,30 +135,44 @@ MORNING_HOURS = {9, 10, 11}       # HIGH: pre-market forecast reference window
 EVENING_HOURS = {18, 19, 20, 21}  # LOWT: evening-before forecast reference window
 MIN_DAYS_RELIABLE = 5
 
+# The instant nws_feed.py's window fix became genuinely effective (commit
+# 49cf2a4, "fixed nws feed" — the URL-encoding hotfix on top of bde2629's
+# original window fix). Rows before this are pre-fix or mid-outage; do not
+# blend them with post-fix rows when judging current reliability.
+KNOWN_FIX_CUTOVER_UTC = "2026-07-02T17:33:09Z"
+
 
 # ---------------------------------------------------------------------------
 # Core computation
 # ---------------------------------------------------------------------------
 
-def _fetch_rows(con, market_type: str, fcst_col: str, obs_col: str):
+def _fetch_rows(con, market_type: str, fcst_col: str, obs_col: str, since: str | None):
     """Pull raw rows for the given market_type, including poll_time_utc so
     HIGH can identify its last poll (see METHOD in module docstring). NOTE:
     each poll is written once per bracket (6x), so this returns 6 identical
     (poll_time, fcst, obs) rows per poll. Wasteful but not wrong for
     MEAN/MAX/MIN aggregates; for the last-poll lookup, duplicate identical
     timestamps resolve to the same value regardless of which duplicate wins
-    the max()."""
+    the max().
+
+    If `since` is given, only rows with poll_time_utc >= since are returned —
+    see PRE/POST-FIX CONTAMINATION WARNING in the module docstring for why
+    this matters for LOWT."""
     q = f"""
         SELECT city, ticker, local_hour, poll_time_utc, {fcst_col}, {obs_col}
         FROM observations
         WHERE market_type = ?
     """
-    return con.execute(q, (market_type,)).fetchall()
+    params: list = [market_type]
+    if since:
+        q += " AND poll_time_utc >= ?"
+        params.append(since)
+    return con.execute(q, params).fetchall()
 
 
 def _compute(con, market_type: str, fcst_col: str, obs_col: str,
-             ref_hours: set[int]) -> dict[str, dict]:
-    rows = _fetch_rows(con, market_type, fcst_col, obs_col)
+             ref_hours: set[int], since: str | None) -> dict[str, dict]:
+    rows = _fetch_rows(con, market_type, fcst_col, obs_col, since)
 
     # city -> market_date -> {"fcst": [...], "obs": [(poll_time_utc, value), ...]}
     by_city_date: dict[str, dict[str, dict]] = defaultdict(
@@ -164,8 +202,10 @@ def _compute(con, market_type: str, fcst_col: str, obs_col: str,
                 # this beats max-across-all-polls for HIGH specifically.
                 obs_final = max(bucket["obs"], key=lambda p: p[0])[1]
             else:
-                # LOWT: min-across-all-polls, the less-bad of two bad
-                # options — see CONFIRMED CAVEAT in module docstring.
+                # LOWT: min-across-all-polls. Pre-fix this was the less-bad
+                # of two bad options; post-fix (bounded local-midnight-to-now
+                # window) it should be a genuine running minimum — see
+                # CONFIRMED CAVEAT / PRE-POST-FIX WARNING in module docstring.
                 obs_final = min(v for _, v in bucket["obs"])
             day_errors.append({
                 "date": market_date,
@@ -194,7 +234,11 @@ def _compute(con, market_type: str, fcst_col: str, obs_col: str,
 def _validate(con, market_type: str, results: dict) -> dict:
     """Cross-check each day's NWS-derived observed value against the
     authoritative winning-bracket range in market_days. Read-only sanity
-    check — does not touch `results`. Returns per-city match-rate stats."""
+    check — does not touch `results`. Returns per-city match-rate stats.
+
+    No separate `since` filtering needed here: `results` already only
+    contains days whose observations passed through _compute()'s (possibly
+    since-filtered) query, so this naturally inherits the same window."""
     rows = con.execute(
         "SELECT city, market_date, settle_lo, settle_hi "
         "FROM market_days WHERE market_type = ? AND n_yes = 1",
@@ -231,14 +275,20 @@ def _validate(con, market_type: str, results: dict) -> dict:
 # Display
 # ---------------------------------------------------------------------------
 
-def display(results: dict, label: str, validation: dict | None = None):
+def display(results: dict, label: str, validation: dict | None = None,
+            since: str | None = None):
     print(f"\n{'='*88}")
     print(f"  Forecast vs Observed — {label}  (source: observations.db)")
-    if label.upper().startswith("LOW"):
-        print(f"  \u26a0  KNOWN UNRELIABLE — see CONFIRMED CAVEAT in this script's docstring.")
-        print(f"  \u26a0  observed_low_f cannot see an overnight low from a same-day evening")
-        print(f"  \u26a0  poll (nws_feed.py's ~48-observation window is only ~3-4h wide).")
-        print(f"  \u26a0  Treat every number below as directional at best.")
+    if since:
+        print(f"  Window: poll_time_utc >= {since}")
+    else:
+        print(f"  Window: ALL HISTORY — pre-fix and post-fix data are BLENDED.")
+        print(f"  (nws_feed.py fix cutover was {KNOWN_FIX_CUTOVER_UTC} — pass")
+        print(f"   --since {KNOWN_FIX_CUTOVER_UTC} for post-fix-only numbers.)")
+    if label.upper().startswith("LOW") and not since:
+        print(f"  \u26a0  UNFILTERED — see PRE/POST-FIX CONTAMINATION WARNING in docstring.")
+        print(f"  \u26a0  This mostly reflects the OLD ~48-observation window bug, not")
+        print(f"  \u26a0  current reality. Re-run with --since before acting on this.")
     print(f"{'='*88}")
     hdr = f"  {'City':<16} {'MeanErr':>8}  {'MAE':>6}  {'StdDev':>7}  {'Days':>5}  {'Reliable':>9}"
     if validation is not None:
@@ -266,6 +316,7 @@ def display(results: dict, label: str, validation: dict | None = None):
         print(f"\n  AuthMatch = % of days where the NWS-observed value used above actually falls")
         print(f"  inside that day's Kalshi-authoritative winning-bracket range (market_days).")
         print(f"  Low match rate -> the bias number for that city is measuring noise. Discount it.")
+        print(f"  NOTE: AuthMatch confirms MEASUREMENT accuracy only, not market pricing efficiency.")
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +330,11 @@ def main():
     parser.add_argument("--validate", action="store_true",
                          help="cross-check observed values against authoritative market_days "
                               "(requires tools/build_market_days.py to have been run)")
+    parser.add_argument("--since", default=None,
+                         help="ISO8601 UTC timestamp (e.g. 2026-07-02T17:35:00Z). "
+                              "Only include observations polled at/after this time. "
+                              f"Known nws_feed.py post-fix cutover: {KNOWN_FIX_CUTOVER_UTC}. "
+                              "Omit to use ALL history (pre+post fix blended — see warning above).")
     args = parser.parse_args()
 
     if not OBS_DB.exists():
@@ -294,16 +350,18 @@ def main():
               "run tools/build_market_days.py first. Skipping validation.\n")
 
     if args.market in ("high", "both"):
-        high_results = _compute(con, "high", "forecast_high_f", "observed_high_f", MORNING_HOURS)
+        high_results = _compute(con, "high", "forecast_high_f", "observed_high_f",
+                                 MORNING_HOURS, args.since)
         high_validation = (_validate(con, "high", high_results)
                             if (args.validate and has_market_days) else None)
-        display(high_results, "HIGH", high_validation)
+        display(high_results, "HIGH", high_validation, args.since)
 
     if args.market in ("lowt", "both"):
-        lowt_results = _compute(con, "lowt", "forecast_low_f", "observed_low_f", EVENING_HOURS)
+        lowt_results = _compute(con, "lowt", "forecast_low_f", "observed_low_f",
+                                 EVENING_HOURS, args.since)
         lowt_validation = (_validate(con, "lowt", lowt_results)
                             if (args.validate and has_market_days) else None)
-        display(lowt_results, "LOW", lowt_validation)
+        display(lowt_results, "LOW", lowt_validation, args.since)
 
     con.close()
 
