@@ -33,6 +33,13 @@ This script pulls the raw fills and settlement for one ticker directly from
 Kalshi — no classification logic applied — so we can see ground truth before
 trusting either the dashboard's label or the theory above.
 
+ADDED: also pulls the ticker's ORDER history (not just fills) and checks
+data/trade_log.json for a matching entry. This matters because a resting
+limit order's created_time (when we placed it) can be well before its
+fill's created_time (when it actually matched) — if you're trying to find
+which engine placed a trade by searching journald around a timestamp,
+search around the ORDER's created_time, not the fill's.
+
 USAGE (repo root, on the Pi):
     python3 tools/inspect_ticker_fills.py KXHIGHTATL-26JUN26-B93.5
 """
@@ -116,6 +123,63 @@ def fetch_settlement_for_ticker(client, ticker: str) -> list:
     return matches
 
 
+def fetch_orders_for_ticker(client, ticker: str) -> list:
+    """
+    Fetch ALL orders (any status — executed, resting, canceled) for one
+    ticker. This is the actual order-placement record, distinct from
+    fills: a resting limit order can sit for a while before it fills, so
+    an order's created_time can be well before its matching fill's
+    created_time. When cross-referencing against journald to find which
+    engine placed a trade, this is the timestamp to search around — NOT
+    the fill's created_time.
+
+    Same server-side-filter-then-fallback pattern as fetch_fills_for_ticker,
+    since it's unverified whether the orders endpoint honours a ticker
+    filter server-side either.
+    """
+    all_o, cursor = [], None
+    for _ in range(5):
+        p = {"limit": 200, "ticker": ticker}
+        if cursor:
+            p["cursor"] = cursor
+        d = client.get("portfolio/orders", params=p)
+        b = d.get("orders", [])
+        all_o.extend(b)
+        cursor = d.get("cursor")
+        if not cursor or len(b) < 200:
+            break
+
+    if all_o:
+        return all_o
+
+    print("  (server-side ticker filter returned nothing for orders — "
+          "falling back to an unfiltered pull, client-side filtered; slower)")
+    all_o, cursor = [], None
+    for _ in range(15):
+        p = {"limit": 200}
+        if cursor:
+            p["cursor"] = cursor
+        d = client.get("portfolio/orders", params=p)
+        b = d.get("orders", [])
+        all_o.extend([o for o in b if o.get("ticker") == ticker])
+        cursor = d.get("cursor")
+        if not cursor or len(b) < 200:
+            break
+    return all_o
+
+
+def check_trade_log(ticker: str) -> list:
+    """Return every data/trade_log.json entry for this exact ticker, if any."""
+    path = Path("data/trade_log.json")
+    if not path.exists():
+        return []
+    try:
+        entries = json.loads(path.read_text())
+    except Exception:
+        return []
+    return [e for e in entries if e.get("ticker") == ticker]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("ticker", help="e.g. KXHIGHTATL-26JUN26-B93.5")
@@ -124,6 +188,24 @@ def main():
     load_credentials()
     import trader
     client = trader.make_client(skip_confirmation=True)
+
+    print(f"\n{'='*80}\n  ORDERS — {args.ticker}\n{'='*80}")
+    orders = fetch_orders_for_ticker(client, args.ticker)
+    if not orders:
+        print("  No orders found for this ticker at all — this ticker was "
+              "never submitted as an order by this account. If a fill "
+              "exists for it (see below), that fill must belong to an "
+              "order placed for a DIFFERENT ticker that got matched here, "
+              "or the orders endpoint's retention window doesn't reach "
+              "this far back.")
+    for o in sorted(orders, key=lambda x: x.get("created_time", "")):
+        print(
+            f"\n  order_id={o.get('order_id')}  status={o.get('status')}  "
+            f"side={o.get('side')}  action={o.get('action')}  "
+            f"created={o.get('created_time')}  "
+            f"yes_price=${o.get('yes_price_dollars')}  "
+            f"count={o.get('initial_count') or o.get('remaining_count')}"
+        )
 
     print(f"\n{'='*80}\n  RAW FILLS — {args.ticker}\n{'='*80}")
     fills = fetch_fills_for_ticker(client, args.ticker)
@@ -143,9 +225,19 @@ def main():
     for s in settlements:
         print(json.dumps(s, indent=2))
 
+    print(f"\n{'='*80}\n  data/trade_log.json — {args.ticker}\n{'='*80}")
+    tl_matches = check_trade_log(args.ticker)
+    if not tl_matches:
+        print("  No trade_log.json entry for this ticker.")
+    for e in tl_matches:
+        print(json.dumps(e, indent=2))
+
     print(f"\n{'='*80}")
-    print(f"  {len(fills)} fill(s), {len(settlements)} settlement record(s) "
-          f"— compare against what dashboard.py's classification concluded.")
+    print(f"  {len(orders)} order(s), {len(fills)} fill(s), "
+          f"{len(settlements)} settlement record(s), "
+          f"{len(tl_matches)} trade_log.json entr(ies) "
+          f"— the earliest order's created_time above is what to search "
+          f"journald around, not the fill's created_time.")
 
 
 if __name__ == "__main__":
