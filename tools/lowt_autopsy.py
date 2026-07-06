@@ -298,13 +298,34 @@ def main():
             print(
                 f"  {r.get('entry_time_utc', '?'):<26}  {r['city']:<14}  "
                 f"{r['ticker']:<28}  tier={r['entry_tier']:<16}  "
-                f"entry=${r['entry_price']:.2f}  nws={r['nws_window']:<8}  "
-                f"mislabel={r['mislabel_window']:<8}  pnl=${r['net_pnl']:.2f}"
+                f"contracts={r.get('contracts', '?'):<4}  entry=${r['entry_price']:.2f}  "
+                f"nws={r['nws_window']:<8}  mislabel={r['mislabel_window']:<8}  "
+                f"pnl=${r['net_pnl']:.2f}"
             )
     else:
         print("\n  No SETTLED_LOSS records in this window. If Xico's "
               "impression of a bad run comes from OPEN or WOULD_HAVE_LOST "
               "positions, re-run once those settle, or widen --since.")
+
+    # Unmatched records are the more urgent signal here: they mean
+    # trade_log.json has NO entry for a trade Kalshi confirms happened. Print
+    # all of them (not just losses) so clustering around a specific date —
+    # e.g. before the trade_log race-condition fix (commit b8a9616,
+    # 2026-07-01T18:54 UTC commit time) was actually deployed to the Pi —
+    # is visible at a glance. A cluster there points to lost writes; a
+    # spread across the whole window points to something else (e.g. an
+    # entry_tier this script doesn't know about yet).
+    unmatched = [r for r in records if r["entry_tier"] == "unmatched"]
+    if unmatched:
+        print(f"\n{'─'*78}\n  All unmatched records ({len(unmatched)}) — "
+              f"no trade_log.json entry found for these tickers\n{'─'*78}")
+        for r in sorted(unmatched, key=lambda x: x.get("entry_time_utc", "")):
+            print(
+                f"  {r.get('entry_time_utc', '?'):<26}  {r['city']:<14}  "
+                f"{r['ticker']:<28}  contracts={r.get('contracts', '?'):<4}  "
+                f"entry=${r['entry_price']:.2f}  outcome={r['outcome']:<16}  "
+                f"pnl=${r['net_pnl']:.2f}"
+            )
 
     if args.csv:
         out = Path("data/lowt_autopsy.csv")
