@@ -1090,9 +1090,12 @@ def test_order(client: KalshiClient):
 
     log.info("test step 2: cancelling order %s...", order_id)
     try:
-        cancel_result = client.delete(f"portfolio/orders/{order_id}")
-        cancelled     = cancel_result.get("order", {})
-        log.info('test: cancelled  status=%s', cancelled.get('status','?'))
+        cancel_result = client.delete(f"portfolio/events/orders/{order_id}")
+        # V2 response is flat — {"order_id": ..., "reduced_by": ..., "ts_ms": ...} —
+        # NOT nested under an "order" key. Verified 2026-07-07 via
+        # tools/test_cancel_isolated.py against a live order.
+        log.info('test: cancelled  reduced_by=%s',
+                 cancel_result.get('reduced_by', '?'))
         log.info("test PASSED — full round trip OK")
     except Exception as e:
         log.error("test: cancel failed: %s", e)
@@ -1635,6 +1638,12 @@ def _recover_fill_after_cancel_failure(
         return False
 
     if not matches:
+        log.info(
+            "manage_open_orders: cancel-failure for %s (order %s) verified "
+            "clean — no matching fill found, order was genuinely gone, not "
+            "a hidden position.",
+            ticker, order_id,
+        )
         return False
 
     total_contracts = sum(float(f.get("count_fp", 0) or 0) for f in matches)
@@ -1806,7 +1815,7 @@ def manage_open_orders(
                 )
                 if not paper:
                     try:
-                        client.delete(f"portfolio/orders/{order_id}")
+                        client.delete(f"portfolio/events/orders/{order_id}")
                         cancelled += 1
                     except Exception as e:
                         log.warning("manage_open_orders: backstop cancel failed %s: %s",
@@ -1850,7 +1859,7 @@ def manage_open_orders(
             )
             if not paper:
                 try:
-                    client.delete(f"portfolio/orders/{order_id}")
+                    client.delete(f"portfolio/events/orders/{order_id}")
                     cancelled += 1
                 except Exception as e:
                     log.warning("manage_open_orders: cancel failed %s: %s",
@@ -1865,7 +1874,7 @@ def manage_open_orders(
             )
             if not paper:
                 try:
-                    client.delete(f"portfolio/orders/{order_id}")
+                    client.delete(f"portfolio/events/orders/{order_id}")
                     place_order(
                         client        = client,
                         ticker        = ticker,
@@ -1906,7 +1915,7 @@ def manage_open_orders(
                 )
                 if not paper:
                     try:
-                        client.delete(f"portfolio/orders/{order_id}")
+                        client.delete(f"portfolio/events/orders/{order_id}")
                         cancelled += 1
                     except Exception as e:
                         log.warning("manage_open_orders: backstop cancel failed %s: %s",
