@@ -14,6 +14,17 @@ so the only thing we've seen so far is the generic requests.HTTPError
 string — never Kalshi's actual JSON error body, which likely has a
 specific error `code` explaining what's really going on.
 
+RESOLVED (2026-07-07): running this script against a real stuck order
+surfaced Kalshi's actual error body — {"code": "deprecated_v1_order_endpoint",
+"message": "Please switch to the V2 endpoints"}. The single-order cancel
+route this script (and trader.py) used, DELETE /portfolio/orders/{id}, is
+deprecated. The current endpoint is DELETE /portfolio/events/orders/{id}.
+trader.py's manage_open_orders() and its other cancel call sites have
+been updated to match. This script now targets the corrected endpoint too
+— re-run it against a real stuck order to confirm the fix actually works
+before trusting it in production, since the V2 route's exact
+success-response shape hasn't been independently verified yet.
+
 This script:
   1. GETs the order directly right before attempting anything, to confirm
      its exact current status.
@@ -73,8 +84,8 @@ def main():
 
     print(f"\n{'='*80}\n  DELETE — raw response, bypassing raise_for_status\n{'='*80}")
     import requests
-    path = client._api_path(f"portfolio/orders/{args.order_id}")
-    url = client.base_url + "/" + f"portfolio/orders/{args.order_id}"
+    path = client._api_path(f"portfolio/events/orders/{args.order_id}")
+    url = client.base_url + "/" + f"portfolio/events/orders/{args.order_id}"
     headers = client._headers("DELETE", path)
     try:
         raw = requests.request("DELETE", url, headers=headers, timeout=15)
