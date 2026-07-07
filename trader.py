@@ -1592,6 +1592,98 @@ def _no_ask_price(bracket: dict) -> float:
     )
 
 
+def _recover_fill_after_cancel_failure(
+    client: "KalshiClient", order_id: str, ticker: str, order_no_price: float,
+) -> bool:
+    """
+    Called whenever a cancel request inside manage_open_orders() fails. A
+    failed cancel most often means the order no longer exists on Kalshi's
+    side — which can mean it was already FILLED (a real, unbooked
+    position) moments before our cancel request landed, or that it was
+    already canceled/expired for some unrelated reason. The pre-existing
+    code treated every cancel failure identically (log a warning, move on)
+    without ever checking which of these it actually was.
+
+    This checks Kalshi's own fill history for this order_id to tell the
+    two apart. If a fill is found:
+      - logs loudly at ERROR (this is real, previously-invisible exposure)
+      - appends a trade_log.json entry tagged "manage_open_orders_orphan"
+        so it's at least visible to every analytics/audit tool that reads
+        trade_log.json going forward
+
+    Deliberately does NOT touch open_contracts / held_city_map / any
+    capital cap here — manage_open_orders() doesn't carry those shared
+    structures in scope, and silently wiring a surprise fill into live
+    capital-cap accounting inside an exception handler is a risk decision,
+    not a logging decision. That wiring is a separate, explicit follow-up.
+
+    Returns True if a fill was found and logged, False otherwise (nothing
+    found — the original cancel-failure really was benign, or the
+    verification lookup itself failed, in which case this fails loud
+    rather than silently swallowing the ambiguity).
+    """
+    try:
+        resp = client.get("portfolio/fills", params={"limit": 50, "ticker": ticker})
+        matches = [f for f in resp.get("fills", []) if f.get("order_id") == order_id]
+    except Exception as e:
+        log.error(
+            "manage_open_orders: cancel failed for %s (order %s) AND could "
+            "not verify whether it actually filled: %s — check manually "
+            "via: python3 tools/inspect_ticker_fills.py %s",
+            ticker, order_id, e, ticker,
+        )
+        return False
+
+    if not matches:
+        return False
+
+    total_contracts = sum(float(f.get("count_fp", 0) or 0) for f in matches)
+    if total_contracts <= 0:
+        return False
+    avg_no_price = sum(
+        float(f.get("no_price_dollars", 0) or 0) * float(f.get("count_fp", 0) or 0)
+        for f in matches
+    ) / total_contracts
+
+    try:
+        from cities import SERIES_TO_CITY as _SERIES_TO_CITY
+        city_name = _SERIES_TO_CITY.get(ticker.split("-")[0], "")
+    except Exception:
+        city_name = ""
+
+    log.error(
+        "manage_open_orders: ORPHAN FILL — cancel for %s (order %s) failed "
+        "because it had ALREADY FILLED (%d contract(s) @ $%.2f avg) before "
+        "the cancel request landed. This position is NOT reflected in "
+        "open_contracts, held_city_map, or any capital cap — only logged "
+        "to trade_log.json here. Review capital exposure for this ticker "
+        "manually.",
+        ticker, order_id, int(total_contracts), avg_no_price,
+    )
+
+    try:
+        _append_trade_log({
+            "ticker":      ticker,
+            "city":        city_name,
+            "side":        "no",
+            "market_type": "lowt" if "LOWT" in ticker.upper() else "high",
+            "entry_price": round(avg_no_price, 4),
+            "contracts":   int(total_contracts),
+            "placed_at":   datetime.now(timezone.utc).isoformat(),
+            "paper":       False,
+            "entry_tier":  "manage_open_orders_orphan",
+        })
+    except Exception as e:
+        log.error(
+            "manage_open_orders: orphan fill detected for %s but the "
+            "trade_log.json write ALSO failed: %s — this position is now "
+            "invisible everywhere except Kalshi's own fill history.",
+            ticker, e,
+        )
+
+    return True
+
+
 def manage_open_orders(
     client:          KalshiClient,
     kalshi_snapshot: dict = None,
@@ -1719,6 +1811,7 @@ def manage_open_orders(
                     except Exception as e:
                         log.warning("manage_open_orders: backstop cancel failed %s: %s",
                                     ticker, e)
+                        _recover_fill_after_cancel_failure(client, order_id, ticker, current_no or 0.0)
             else:
                 log.debug("manage_open_orders: %s — no usable price "
                           "(age=%s min), skipping this poll",
@@ -1762,6 +1855,7 @@ def manage_open_orders(
                 except Exception as e:
                     log.warning("manage_open_orders: cancel failed %s: %s",
                                 ticker, e)
+                    _recover_fill_after_cancel_failure(client, order_id, ticker, order_no_price)
 
         elif price_moved:
             # Price has shifted → cancel and replace at current ask
@@ -1784,6 +1878,7 @@ def manage_open_orders(
                 except Exception as e:
                     log.warning("manage_open_orders: reprice failed %s: %s",
                                 ticker, e)
+                    _recover_fill_after_cancel_failure(client, order_id, ticker, order_no_price)
         else:
             # Price-based logic found no reason to act. Universal backstop:
             # regardless of WHY the price check passed (genuinely stable
@@ -1816,6 +1911,7 @@ def manage_open_orders(
                     except Exception as e:
                         log.warning("manage_open_orders: backstop cancel failed %s: %s",
                                     ticker, e)
+                        _recover_fill_after_cancel_failure(client, order_id, ticker, order_no_price)
             # else: price unchanged, within range, and not yet stale enough
             # to force-cancel — leave the order resting.
 
