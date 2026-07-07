@@ -62,25 +62,31 @@ def render_cells(cells: list[Cell], by: list[str], min_n: int = 0,
     return "\n".join(out)
 
 
-def standard_report(market_type: str | None = None) -> str:
+def standard_report(market_type: str | None = None,
+                    engine: str | None = None) -> str:
     """The periodic health check: per-engine, per-city, per-band at a glance."""
-    trades = load_trades(market_type=market_type)
+    trades = load_trades(market_type=market_type, engine=engine)
     n_set = sum(1 for t in trades if t.settled)
     out = [
         "Weather Machine — analytics (authoritative settlement)",
         f"trades: {len(trades)} total, {n_set} settled, "
         f"{len(trades)-n_set} unsettled"
-        + (f"  [market={market_type}]" if market_type else ""),
+        + (f"  [market={market_type}]" if market_type else "")
+        + (f"  [engine={engine}]" if engine else ""),
         "",
     ]
-    for by in (["engine"], ["city"], ["band"]):
+    # With a single engine already isolated, grouping by "engine" again is a
+    # no-op cell — drop it from the axis list in that case.
+    axes = (["city"], ["band"]) if engine else (["engine"], ["city"], ["band"])
+    for by in axes:
         out.append(render_cells(aggregate(trades, by), by, sort="pnl"))
         out.append("")
     return "\n".join(out)
 
 
 def one_report(by: list[str], market_type: str | None = None,
+               engine: str | None = None,
                min_n: int = 0, sort: str = "pnl") -> str:
-    """A single ad-hoc slice (1-D or 2-D)."""
-    trades = load_trades(market_type=market_type)
+    """A single ad-hoc slice (1-D or 2-D), optionally pre-filtered to one engine."""
+    trades = load_trades(market_type=market_type, engine=engine)
     return render_cells(aggregate(trades, by), by, min_n=min_n, sort=sort)

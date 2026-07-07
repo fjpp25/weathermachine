@@ -111,9 +111,16 @@ class Trade:
 
 
 def load_trades(market_type: str | None = None,
-                include_paper: bool = False) -> list[Trade]:
+                include_paper: bool = False,
+                engine: str | None = None) -> list[Trade]:
     """Load trade log, join to authoritative settlements, return enriched trades.
-    Paths come from the package (anchored to repo root, not cwd)."""
+    Paths come from the package (anchored to repo root, not cwd).
+
+    engine: filter to a single entry_tier (e.g. "lowt_a", "cascade_lowt_bu").
+    Matches the same value that appears in the 'engine' axis/column — this is
+    what makes a drill-down like "band x city, but ONLY within lowt_a"
+    possible, instead of only being able to group by engine, never isolate
+    one."""
     raw = json.loads(TRADE_LOG.read_text())
     con = sqlite3.connect(f"file:{OBS_DB}?mode=ro", uri=True)
     settled = dict(con.execute(
@@ -131,10 +138,13 @@ def load_trades(market_type: str | None = None,
         mt = t.get("market_type", "")
         if market_type and mt != market_type:
             continue
+        eng = t.get("entry_tier") or "main"
+        if engine and eng != engine:
+            continue
         city = t.get("city", "")
         trades.append(Trade(
             ticker=ticker,
-            engine=t.get("entry_tier") or "main",
+            engine=eng,
             city=city,
             market_type=mt,
             market_date=wm_time.market_date_iso(ticker),

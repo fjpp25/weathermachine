@@ -6,6 +6,10 @@ analytics.__main__ — CLI entry point.
     python3 -m analytics --by engine city     # 2D interaction slice
     python3 -m analytics --by band --market lowt --min-n 30
     python3 -m analytics --by hour --sort key
+    python3 -m analytics --by band city --market lowt --engine lowt_a --min-n 3
+        # drill-down: isolate ONE engine first, then slice that engine by
+        # any two axes — e.g. "is lowt_a's cheap-band weakness concentrated
+        # in one city, or spread across all of them?"
 
 Run from the repo root. The package anchors its own paths to the repo root, so
 it also works when imported by a process with a different cwd (the dashboard).
@@ -23,16 +27,20 @@ def main():
     ap.add_argument("--by", nargs="+", default=None,
                     help=f"axes to group by (1 or 2 of: {' '.join(sorted(AXES))})")
     ap.add_argument("--market", choices=["high", "lowt"], default=None)
+    ap.add_argument("--engine", default=None,
+                    help="pre-filter to a single entry_tier (e.g. lowt_a, "
+                         "cascade_lowt_bu) before applying --by. Use this to "
+                         "drill into one engine instead of only grouping by it.")
     ap.add_argument("--min-n", type=int, default=0,
                     help="hide cells with fewer than N settled trades")
     ap.add_argument("--sort", choices=["pnl", "wr", "n", "key"], default="pnl")
     args = ap.parse_args()
 
     if args.by:
-        print(one_report(args.by, market_type=args.market,
+        print(one_report(args.by, market_type=args.market, engine=args.engine,
                          min_n=args.min_n, sort=args.sort))
     else:
-        print(standard_report(market_type=args.market))
+        print(standard_report(market_type=args.market, engine=args.engine))
 
 
 if __name__ == "__main__":
