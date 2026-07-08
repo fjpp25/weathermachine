@@ -32,13 +32,12 @@ WAS NOT (untagged) — 3 total contracts on Kalshi, 1 in trade_log.json.
 This script now compares CONTRACT COUNTS per ticker, not just presence,
 which catches partial losses the old version was structurally blind to.
 
-LOGIC: fetch recent "no"-side BUY fills (entries only — sells are exits,
-which are never expected to have a trade_log.json entry, see FIXED note
-below). For each ticker, sum Kalshi's fill contracts and compare against
-the sum of trade_log.json's logged contracts for that same ticker:
-  - Kalshi has the ticker, trade_log.json has NOTHING for it  → fully missing
-  - Kalshi's contract count > trade_log.json's logged count   → partially missing
-  - trade_log.json's count > Kalshi's                          → over-logged (flagged, lower priority)
+LOGIC: fetch recent fills. Keep only outcome_side=="no" fills (confirmed via
+trader.py's check_exits() that NO-side exits are fully disabled — the only
+active exit path is YES-side stop-loss, which produces outcome_side=="yes"
+fills, already excluded by this filter for a real reason, not a guess).
+Every remaining fill is a genuine entry or top-up. Sum contracts per ticker
+and compare against trade_log.json's logged contracts for that ticker.
 
 READ-ONLY: only GET /portfolio/fills is called. No orders are placed or
 modified.
@@ -105,31 +104,29 @@ def main():
 
     fills = resp.get("fills", [])
 
-    # FIXED: this previously filtered only on side=="no" (which side of the
-    # market — Yes vs No), completely ignoring "action" (buy vs sell). That
-    # silently mixed ENTRIES (buy No — what trade_log.json is meant to
-    # capture) with EXITS (sell No — closing an existing No position).
-    # Confirmed via source: trader.py's check_exits() calls place_order(...,
-    # action="sell", ...) with NO _append_trade_log() call anywhere nearby —
-    # exits are placed but never logged, by design. Comparing a sell fill
-    # against an entry-only log and calling the absence "evidence of a lost
-    # write" was a methodology error, not a real finding. Every "missing
-    # fills" number this script has reported so far may be inflated by an
-    # unknown amount from this — re-run and treat the corrected numbers as
-    # authoritative, not the earlier ones.
-    entry_fills = [f for f in fills
-                   if str(f.get("side", "")).lower() == "no"
-                   and str(f.get("action", "")).lower() == "buy"]
-    exit_fills_excluded = sum(
-        1 for f in fills
-        if str(f.get("side", "")).lower() == "no"
-        and str(f.get("action", "")).lower() != "buy"
-    )
+    # FIXED AGAIN (2026-07-08): the action=="buy" check below was WRONG, not
+    # just incomplete. Confirmed directly in trader.py's check_exits(): the
+    # exit-placing code under `if side == "no":` is fully commented out
+    # ("Exit anchor DISABLED" — the May 2026 finding that exits were net
+    # -$93 vs holding to settlement). The ONLY active exit path left is
+    # YES-side stop-loss, in the `else:` branch — which places orders with
+    # side="yes", i.e. outcome_side="yes" on the resulting fill, not "no".
+    # So there is no such thing as a NO-side exit fill in this codebase at
+    # all right now — every outcome_side=="no" fill, regardless of whether
+    # Kalshi labels the action "buy" or "sell", is a genuine entry or
+    # top-up. Confirmed directly: KXLOWTNYC-26JUL06-B63.5's correctly-
+    # logged 1-contract lowt_a entry has action=="sell" on the raw fill,
+    # and was being wrongly excluded by the old filter as a "likely exit".
+    # Filtering on outcome_side alone is both simpler AND actually correct,
+    # unlike the buy/sell guess it replaces.
+    entry_fills = [f for f in fills if str(f.get("outcome_side", "")).lower() == "no"]
+    exit_fills_excluded = len(fills) - len(entry_fills)
     print(f"Kalshi /portfolio/fills: {len(fills)} total fills returned "
-          f"({len(entry_fills)} No-side BUY/entry fills, "
-          f"{exit_fills_excluded} No-side non-buy fills excluded — likely "
-          f"exits, which are never expected to have a trade_log.json entry). "
-          f"Note the rolling cutoff — see module docstring.")
+          f"({len(entry_fills)} No-outcome fills — all treated as entries/"
+          f"top-ups, since NO-side exits are confirmed disabled in "
+          f"check_exits(); {exit_fills_excluded} Yes-outcome fills excluded "
+          f"— those would be YES-side stop-loss exits, the only exit path "
+          f"still active). Note the rolling cutoff — see module docstring.")
 
     if entry_fills:
         print(f"\nSample raw fill object (to verify field names below are "
