@@ -19,12 +19,26 @@ not "no evidence of loss ever" — the older history is not checkable this
 way, and isn't checkable at all if it was never captured (same lesson as
 observations.db's historical gaps).
 
-LOGIC: fetch recent "no"-side fills. For each fill's ticker, check whether
-ANY trade_log.json entry mentions that exact ticker with paper=False. A
-fill with NO matching entry, from ANY engine, is direct, unambiguous
-evidence of a lost trade_log.json write — this doesn't require knowing
-which engine's entry_tier maps to which capital bucket (unlike the
-today-only script), since it only checks ticker presence, not attribution.
+UPGRADED (2026-07-08): this used to only check ticker PRESENCE — "does
+trade_log.json have at least one entry for this ticker". That misses a
+real, confirmed failure mode: a ticker can have MULTIPLE separate entry
+fills over time (e.g. an initial lowt_a entry, then a later, larger
+cascade entry on the same bracket), where only SOME of those entries make
+it into trade_log.json. Presence-only checking calls that ticker "clean"
+because *an* entry exists, even though Kalshi shows more contracts bought
+than we ever logged. Confirmed real case: KXLOWTNYC-26JUL06-B63.5 had a
+1-contract fill that WAS logged (lowt_a) and a later 2-contract fill that
+WAS NOT (untagged) — 3 total contracts on Kalshi, 1 in trade_log.json.
+This script now compares CONTRACT COUNTS per ticker, not just presence,
+which catches partial losses the old version was structurally blind to.
+
+LOGIC: fetch recent "no"-side BUY fills (entries only — sells are exits,
+which are never expected to have a trade_log.json entry, see FIXED note
+below). For each ticker, sum Kalshi's fill contracts and compare against
+the sum of trade_log.json's logged contracts for that same ticker:
+  - Kalshi has the ticker, trade_log.json has NOTHING for it  → fully missing
+  - Kalshi's contract count > trade_log.json's logged count   → partially missing
+  - trade_log.json's count > Kalshi's                          → over-logged (flagged, lower priority)
 
 READ-ONLY: only GET /portfolio/fills is called. No orders are placed or
 modified.
@@ -63,13 +77,25 @@ def main():
     import trader
     client = trader.make_client(skip_confirmation=True)
 
-    logged_tickers = set()
+    # Per-ticker LOGGED CONTRACT TOTALS, not just presence — a ticker can
+    # legitimately have more than one trade_log.json entry (topup, a second
+    # tier firing on the same bracket), so sum across all of them.
+    logged_contracts: dict[str, float] = {}
+    logged_entries_count: dict[str, int] = {}
     if TRADE_LOG.exists():
         for e in json.loads(TRADE_LOG.read_text()):
-            if not e.get("paper", False):
-                logged_tickers.add(e.get("ticker", ""))
+            if e.get("paper", False):
+                continue
+            ticker = e.get("ticker", "")
+            if not ticker:
+                continue
+            logged_contracts[ticker] = (
+                logged_contracts.get(ticker, 0.0) + float(e.get("contracts", 1) or 1)
+            )
+            logged_entries_count[ticker] = logged_entries_count.get(ticker, 0) + 1
 
-    print(f"trade_log.json: {len(logged_tickers)} distinct non-paper tickers logged.")
+    print(f"trade_log.json: {len(logged_contracts)} distinct non-paper tickers logged "
+          f"({sum(logged_entries_count.values())} total entries).")
 
     try:
         resp = client.get("portfolio/fills", params={"limit": 200})
@@ -104,53 +130,105 @@ def main():
           f"{exit_fills_excluded} No-side non-buy fills excluded — likely "
           f"exits, which are never expected to have a trade_log.json entry). "
           f"Note the rolling cutoff — see module docstring.")
-    no_fills = entry_fills   # keep the rest of the script's variable name
 
-    if no_fills:
+    if entry_fills:
         print(f"\nSample raw fill object (to verify field names below are "
               f"correct, since prior guesses for count/price/time were wrong "
               f"— they all printed as None):")
-        print(json.dumps(no_fills[0], indent=2))
+        print(json.dumps(entry_fills[0], indent=2))
 
-    # FIXED: previously iterated per raw fill record and flagged each one
-    # individually. A single placed order can generate MULTIPLE partial-fill
-    # records on Kalshi's side (filled by several different counterparties)
-    # while our side only ever writes ONE trade_log entry per placed order.
-    # The original version double/triple/quadruple-counted this as separate
-    # "missing" incidents — confirmed directly: of the first 20 raw rows
-    # printed in one run, only 15 were distinct tickers. Group by ticker
-    # first; report distinct-ticker count as the headline number, with the
-    # raw fill count as secondary context.
-    missing_by_ticker: dict[str, list] = {}
-    for f in no_fills:
+    # Per-ticker KALSHI CONTRACT TOTALS — sum count_fp across every entry
+    # fill for that ticker, however many partial-fill records it took.
+    kalshi_contracts: dict[str, float] = {}
+    kalshi_fill_records: dict[str, list] = {}
+    for f in entry_fills:
         ticker = f.get("ticker", "")
-        if ticker and ticker not in logged_tickers:
-            missing_by_ticker.setdefault(ticker, []).append(f)
+        if not ticker:
+            continue
+        kalshi_contracts[ticker] = (
+            kalshi_contracts.get(ticker, 0.0) + float(f.get("count_fp", 0) or 0)
+        )
+        kalshi_fill_records.setdefault(ticker, []).append(f)
 
-    if missing_by_ticker:
-        n_tickers = len(missing_by_ticker)
-        n_raw = sum(len(v) for v in missing_by_ticker.values())
+    fully_missing: dict[str, list] = {}
+    partially_missing: dict[str, dict] = {}
+    over_logged: dict[str, dict] = {}
+
+    for ticker, k_contracts in kalshi_contracts.items():
+        l_contracts = logged_contracts.get(ticker, 0.0)
+        if ticker not in logged_contracts:
+            fully_missing[ticker] = kalshi_fill_records[ticker]
+        elif k_contracts > l_contracts + 1e-9:
+            partially_missing[ticker] = {
+                "kalshi": k_contracts,
+                "logged": l_contracts,
+                "shortfall": k_contracts - l_contracts,
+                "fills": kalshi_fill_records[ticker],
+                "n_trade_log_entries": logged_entries_count.get(ticker, 0),
+            }
+        elif l_contracts > k_contracts + 1e-9:
+            over_logged[ticker] = {"kalshi": k_contracts, "logged": l_contracts}
+
+    if fully_missing:
+        n_tickers = len(fully_missing)
+        n_raw = sum(len(v) for v in fully_missing.values())
+        n_contracts = sum(
+            sum(float(f.get("count_fp", 0) or 0) for f in flist)
+            for flist in fully_missing.values()
+        )
         print(f"\n*** {n_tickers} DISTINCT ticker(s) with a 'no' fill on Kalshi "
-              f"but NO matching trade_log.json entry ({n_raw} raw fill records "
-              f"— some tickers have multiple partial fills, not separate "
-              f"incidents) — evidence of lost write(s): ***")
-        for ticker, fills in list(missing_by_ticker.items())[:20]:
-            times = [f.get("created_time", f.get("created_at", "?")) for f in fills]
-            print(f"  {ticker}  ({len(fills)} fill record(s))  first_seen={min(times)}")
+              f"but ZERO trade_log.json entries ({n_raw} raw fill records, "
+              f"{n_contracts:.0f} total contracts) — fully lost write(s): ***")
+        for ticker, flist in list(fully_missing.items())[:20]:
+            times = [f.get("created_time", f.get("created_at", "?")) for f in flist]
+            contracts = sum(float(f.get("count_fp", 0) or 0) for f in flist)
+            print(f"  {ticker}  ({contracts:.0f} contract(s), {len(flist)} fill "
+                  f"record(s))  first_seen={min(times)}")
         if n_tickers > 20:
             print(f"  ... and {n_tickers - 20} more distinct tickers")
+    else:
+        print(f"\nNo fully-missing tickers in this window "
+              f"(every ticker with a fill has AT LEAST ONE trade_log.json entry).")
 
-        # NEW: dollar-value summary, filtered to today — directly tests
-        # whether missing fills are large enough to explain a specific
-        # deployed-vs-logged gap (e.g. sweep's $5.43 unexplained deployed
-        # capital on 2026-07-01), using the confirmed real field names
-        # (count_fp, no_price_dollars) rather than the earlier wrong guesses.
+    if partially_missing:
+        n_tickers = len(partially_missing)
+        n_shortfall = sum(v["shortfall"] for v in partially_missing.values())
+        print(f"\n*** {n_tickers} ticker(s) where Kalshi shows MORE contracts "
+              f"than trade_log.json has logged for them — a PARTIAL lost "
+              f"write. These were INVISIBLE to presence-only checking, since "
+              f"they do have at least one trade_log.json entry, just not "
+              f"enough. {n_shortfall:.0f} total under-logged contracts: ***")
+        for ticker, info in sorted(partially_missing.items(),
+                                   key=lambda kv: -kv[1]["shortfall"]):
+            times = [f.get("created_time", "?") for f in info["fills"]]
+            print(f"  {ticker}  kalshi={info['kalshi']:.0f}c  "
+                  f"logged={info['logged']:.0f}c  "
+                  f"({info['n_trade_log_entries']} trade_log.json entr(y/ies))  "
+                  f"shortfall={info['shortfall']:.0f}c  fill_times={times}")
+    else:
+        print(f"\nNo partial-logging mismatches in this window.")
+
+    if over_logged:
+        print(f"\n{len(over_logged)} ticker(s) where trade_log.json shows MORE "
+              f"contracts than Kalshi's fills — worth a look (possible "
+              f"duplicate write?), but lower priority than under-counting, "
+              f"since over-counting doesn't hide real exposure:")
+        for ticker, info in over_logged.items():
+            print(f"  {ticker}  kalshi={info['kalshi']:.0f}c  logged={info['logged']:.0f}c")
+
+    if fully_missing or partially_missing:
+        # Dollar-value summary, filtered to today — directly tests whether
+        # today's missing/under-logged contracts are large enough to explain
+        # a specific deployed-vs-logged gap seen elsewhere (e.g. via
+        # tools/audit_trade_log_today.py).
         from datetime import date as _date, datetime as _dt
         today = str(_date.today())
         today_total = 0.0
-        today_tickers = []
-        for ticker, fills in missing_by_ticker.items():
-            for f in fills:
+        today_tickers = set()
+
+        def _accumulate(flist):
+            nonlocal today_total
+            for f in flist:
                 ct = f.get("created_time", "")
                 try:
                     if _dt.fromisoformat(ct.replace("Z", "+00:00")).date() != _date.today():
@@ -160,19 +238,25 @@ def main():
                 count = float(f.get("count_fp", 0) or 0)
                 price = float(f.get("no_price_dollars", 0) or 0)
                 today_total += count * price
-                if ticker not in today_tickers:
-                    today_tickers.append(ticker)
-        print(f"\n  Missing fills dated TODAY ({today}): {len(today_tickers)} "
-              f"distinct ticker(s), ${today_total:.2f} total notional.")
+                today_tickers.add(f.get("ticker", ""))
+
+        for flist in fully_missing.values():
+            _accumulate(flist)
+        for info in partially_missing.values():
+            _accumulate(info["fills"])
+
+        print(f"\n  Missing/under-logged fills dated TODAY ({today}): "
+              f"{len(today_tickers)} distinct ticker(s), ${today_total:.2f} "
+              f"total notional (this is the FULL fill value for "
+              f"partially-missing tickers, not just the shortfall — compare "
+              f"loosely, not exactly).")
         print(f"  Compare against any known same-day deployed-vs-logged gap "
               f"(e.g. via tools/audit_trade_log_today.py) — a close match is "
               f"strong evidence those specific missing fills explain that gap.")
     else:
-        print(f"\nNo mismatches found in the fills window Kalshi returned — "
-
-              f"every 'no' fill has a matching trade_log.json entry. This is "
-              f"reassuring for the checkable window, but per the rolling-cutoff "
-              f"limitation above, doesn't clear the full historical period.")
+        print(f"\nNo mismatches of any kind found in the fills window Kalshi "
+              f"returned. Per the rolling-cutoff limitation above, this "
+              f"covers only recent history, not the full backtest period.")
 
 
 if __name__ == "__main__":
