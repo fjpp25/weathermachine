@@ -183,26 +183,55 @@ def _locked_json_rmw(path: Path, mutate_fn, default):
     respected process-wide, not just within one interpreter), closing that
     window. See tools/audit_trade_log_today.py / audit_trade_log_vs_kalshi.py
     for how to check whether this already caused a loss historically.
+
+    DIAGNOSTIC LOGGING (2026-07-08): audit_trade_log_vs_kalshi.py's
+    contract-count reconciliation found lost/under-logged writes clustering
+    in tight multi-ticker, multi-engine (HIGH+LOWT) bursts as recently as
+    2026-07-07 — well after this lock was confirmed deployed and running.
+    Two careful code reviews of this function found nothing wrong with it;
+    every caller (_run_pipeline, sweep_engine, peak_scanner, last_bracket,
+    evening_convergence, hourly_nyc_engine) goes through this same locked
+    path, no bypass found. Since reasoning about the code hasn't found the
+    bug, log lock acquire/release with thread identity and hold duration so
+    the NEXT burst can be observed directly instead of theorized about.
+    Remove once the mechanism is actually identified — this is deliberately
+    verbose for a short debugging window, not a permanent addition.
     """
+    import threading, time as _time
+    _tid = threading.current_thread().name
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(json.dumps(default))
 
+    _wait_start = _time.monotonic()
     with open(path, "r+") as f:
         _lock_file(f)
+        _acquired_at = _time.monotonic()
+        log.info("_locked_json_rmw[%s]: lock acquired (waited %.3fs) for %s",
+                  _tid, _acquired_at - _wait_start, path)
         try:
             f.seek(0)
             raw = f.read()
             try:
                 data = json.loads(raw) if raw.strip() else default
             except (json.JSONDecodeError, ValueError):
+                log.warning("_locked_json_rmw[%s]: %s failed to parse as JSON "
+                            "(%d bytes read) — falling back to default, ANY "
+                            "existing content in this file is about to be "
+                            "DISCARDED by the write below", _tid, path, len(raw))
                 data = default
+            n_before = len(data) if isinstance(data, list) else None
             data = mutate_fn(data)
+            n_after = len(data) if isinstance(data, list) else None
             f.seek(0)
             f.truncate()
             json.dump(data, f, indent=2, default=str)
             f.flush()
             os.fsync(f.fileno())
+            _released_at = _time.monotonic()
+            log.info("_locked_json_rmw[%s]: wrote %s (%s -> %s entries, "
+                      "held lock %.3fs)", _tid, path, n_before, n_after,
+                      _released_at - _acquired_at)
             return data
         finally:
             _unlock_file(f)
