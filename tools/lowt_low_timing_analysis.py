@@ -89,6 +89,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", default="data/lowt_observations.csv")
     ap.add_argument("--city", default=None, help="restrict to one city")
+    ap.add_argument("--since", default=None,
+                    help="YYYY-MM-DD — only include trading days on/after this "
+                         "date. Use --since 2026-07-02 to check whether "
+                         "still_falling/med_drop hold up on clean data alone, "
+                         "since 15,642 of 15,783 total violations happened "
+                         "before that date's observation-window fix.")
     args = ap.parse_args()
 
     if not Path(args.csv).exists():
@@ -105,6 +111,9 @@ def main():
     df = df.dropna(subset=["observed_low_f", "poll_time_utc", "ticker"])
     df["trading_date"] = df["ticker"].apply(_ticker_to_date)
     df = df.dropna(subset=["trading_date"])
+    if args.since:
+        since_date = datetime.strptime(args.since, "%Y-%m-%d").date()
+        df = df[df["trading_date"] >= since_date]
     df["poll_time_utc"] = pd.to_datetime(df["poll_time_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["poll_time_utc"])
     # Precise minutes-since-midnight for the cutoff comparison — NOT
