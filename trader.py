@@ -454,7 +454,24 @@ class EngineCapital:
             self._balance = balance
         elif client is not None:
             try:
-                self._balance = get_balance(client)
+                # Use TOTAL PORTFOLIO VALUE (free cash + current value of
+                # open positions), not free cash alone. Fixed 2026-07-09.
+                # Free-cash-only meant every engine's budget shrank simply
+                # because capital was tied up in still-open, not-yet-settled
+                # positions — nothing to do with the account's real size,
+                # and worse right after a restart specifically zeros the
+                # separate _day_open_balance baseline (see _update_day_snapshot,
+                # now retired) to whatever cash happened to be free at that
+                # exact moment. Total value is far less sensitive to timing
+                # relative to settlements.
+                free_cash = get_balance(client)
+                positions = get_positions(client)
+                open_value = sum(
+                    float(p.get("current_price", 0) or 0)
+                    * float(p.get("position_fp", p.get("contracts", 1)) or 1)
+                    for p in positions
+                )
+                self._balance = round(free_cash + open_value, 2)
             except Exception as e:
                 log.warning("EngineCapital: balance fetch failed: %s — using 0", e)
                 self._balance = 0.0
@@ -1221,6 +1238,22 @@ _main_entered:        set[str] = set()   # tickers entered by main engine this s
 # ---------------------------------------------------------------------------
 from datetime import date as _date
 
+# ---------------------------------------------------------------------------
+# RETIRED 2026-07-09 — kept only so tools/probe_budgets.py and
+# tools/probe_engines.py don't break with AttributeError; NOT called by any
+# live gating/recording logic anymore (that's all on EngineCapital now, see
+# above). This was the "second ledger" probe_budgets.py's own docstring
+# warned about: a plain in-memory balance snapshot taken once at the first
+# poll after each restart (or midnight, whichever came first) and never
+# updated again, PLUS separate per-engine "deployed today" globals that
+# were never persisted to disk — meaning a mid-day restart both froze the
+# budget baseline at a stale balance AND silently reset every engine's
+# spent-today counter to zero, risking real over-deployment beyond the
+# intended daily allocation. cascade/lowt/sweep were gated by this; main/
+# topup were already on EngineCapital, which doesn't have either problem.
+# Safe to delete entirely (along with updating the two probe tools) once
+# the EngineCapital-only path has run cleanly for a few days.
+# ---------------------------------------------------------------------------
 _day_open_balance: float      = 0.0
 _day_open_date:    _date|None = None
 _deployed_cascade: float      = 0.0   # cascade engine — persists across polls, resets midnight
@@ -2394,7 +2427,6 @@ def run_pipeline(
 
     try:
         balance                      = get_balance(client)
-        _, cascade_reserve           = _update_day_snapshot(balance)
         set_balance_cached(balance)
         cap = get_engine_capital(client)
         log.info(
@@ -2410,7 +2442,6 @@ def run_pipeline(
     except Exception as e:
         log.warning("balance fetch failed: %s — using $0 cap", e)
         balance          = 0.0
-        cascade_reserve  = 0.0
 
     try:
         live_positions = sync_from_kalshi(client)
@@ -2520,7 +2551,20 @@ def run_pipeline(
 
             cost = price * contracts
 
-            # Engine capital check — session-scoped per engine type
+            # Engine capital check — session-scoped per engine type.
+            # UNIFIED onto EngineCapital 2026-07-09 (was: cascade/lowt/sweep
+            # gated by get_*_deployable(), based on _day_open_balance — a
+            # plain in-memory global, frozen at whatever balance happened to
+            # be free at the moment of the last restart or midnight,
+            # whichever came later, and never updated again until the next
+            # one. "main"/"topup" already used cap.can_deploy() correctly;
+            # cascade/lowt/sweep now do too, for the same reasons: refreshes
+            # every poll from current total portfolio value, and _deployed
+            # is disk-persisted so a mid-day restart doesn't silently zero
+            # out what's already been spent today (the old system's
+            # _deployed_cascade/_deployed_lowt/_deployed_sweep globals were
+            # NOT persisted at all — a restart reset them to 0 even if real
+            # money had already been deployed earlier the same day).
             tier = signal.get("entry_tier", "")
             if tier.startswith("cascade"):
                 engine_key = "cascade"
@@ -2531,28 +2575,10 @@ def run_pipeline(
                 engine_key = "sweep"
             else:
                 engine_key = "main"
-            if engine_key == "cascade":
-                if get_cascade_deployable() < cost:
-                    log.debug("skip %s — cascade session budget exhausted (cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, get_cascade_deployable())
-                    continue
-            elif engine_key == "lowt":
-                if get_lowt_deployable() < cost:
-                    log.debug("skip %s — lowt budget exhausted "
-                              "(cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, get_lowt_deployable())
-                    continue
-            elif engine_key == "sweep":
-                if get_sweep_deployable() < cost:
-                    log.debug("skip %s — sweep budget exhausted "
-                              "(cost=$%.2f  remaining=$%.2f)",
-                              ticker, cost, get_sweep_deployable())
-                    continue
-            else:
-                if not cap.can_deploy("main", cost):
-                    log.debug("skip %s — main budget exhausted (cost=$%.2f)",
-                              ticker, cost)
-                    continue
+            if not cap.can_deploy(engine_key, cost):
+                log.debug("skip %s — %s budget exhausted (cost=$%.2f  remaining=$%.2f)",
+                          ticker, engine_key, cost, cap.remaining(engine_key))
+                continue
 
             log.info("SIGNAL  %s  %s", city, ticker)
             if tier.startswith("cascade"):
@@ -2578,13 +2604,7 @@ def run_pipeline(
                 held_city_map[city]    = held_city_map.get(city, 0) + 1
                 cap.record(engine_key, cost)
                 deployed += cost
-                if engine_key == "cascade":
-                    _deployed_cascade += cost
-                elif engine_key == "lowt":
-                    record_lowt_deployed(cost)
-                elif engine_key == "sweep":
-                    record_sweep_deployed(cost)
-                else:
+                if engine_key == "main":
                     _main_entered.add(ticker)
                 executed += 1
                 _append_trade_log({
