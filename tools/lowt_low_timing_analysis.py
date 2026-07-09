@@ -114,6 +114,24 @@ def main():
     if args.since:
         since_date = datetime.strptime(args.since, "%Y-%m-%d").date()
         df = df[df["trading_date"] >= since_date]
+
+    # Exclude the most recent trading date entirely. It's very likely still
+    # in progress (this script gets run mid-day), and an INCOMPLETE day's
+    # "last observed_low_f update" is trivially whatever the most recent
+    # poll happened to be — i.e. "now" — not a genuine signal about when
+    # the true low locks in. Confirmed via a live run: with --since applied
+    # (small sample), every city's "final low hour" clustered at exactly
+    # the local-time equivalent of one shared UTC timestamp (~23:00-24:00
+    # UTC) — the export's own run time, not a weather pattern. Only
+    # completed days (settlement already happened, no more polls coming)
+    # give a real answer.
+    max_date = df["trading_date"].max()
+    n_before = len(df)
+    df = df[df["trading_date"] < max_date]
+    n_excluded = n_before - len(df)
+    if n_excluded:
+        print(f"Excluding {max_date} (most recent date, {n_excluded:,} rows) "
+              f"as still in-progress — see note in source.")
     df["poll_time_utc"] = pd.to_datetime(df["poll_time_utc"], utc=True, errors="coerce")
     df = df.dropna(subset=["poll_time_utc"])
     # Precise minutes-since-midnight for the cutoff comparison — NOT
