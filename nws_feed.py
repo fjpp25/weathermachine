@@ -284,6 +284,34 @@ def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
     Also captures updateTime from the response properties — this is when
     the NWS forecast office last issued this grid, used to compute forecast
     age at analysis time (forecast_age_hours = poll_time - forecast_issued_at).
+
+    FIXED 2026-07-09: "today" used to mean strictly the city's own current
+    wall-clock local date. That's wrong for a real, confirmed, DAILY,
+    EVERY-CITY gap: Kalshi's own market rollover (kalshi_scanner.py's
+    get_todays_markets()) can start returning the NEXT date's ticker as
+    the active market well before a given city's local clock reaches its
+    own midnight — every US timezone's local midnight comes after UTC
+    midnight, so this isn't an edge case, it's the normal daily pattern.
+    Confirmed live: Chicago (Central, UTC-5) had a fully-populated,
+    already-tradeable KXHIGHCHI-26JUL09 market with real prices from
+    00:10 UTC — but this function kept returning forecast_high_f=None for
+    it until roughly 05:00 UTC, since it was still hunting for a "today"
+    (July 8) daytime period that had already passed hours earlier. That
+    blocked BOTH the main HIGH decision engine AND the dead-bracket sweep
+    signal for the entire window — regardless of price, regardless of
+    budget — for the most valuable part of the day for exactly this kind
+    of signal (two brackets were already priced ≥0.97 the whole time).
+    Western cities see an even longer version of this gap (up to ~7h for
+    Pacific) since their local midnight is furthest behind UTC.
+
+    Fix: try today's local date first (unchanged behavior for the normal
+    case, mid-day through evening). If that finds nothing, explicitly try
+    tomorrow's local date too — this is exactly the already-rolled-over
+    case. Deliberately NOT "just take the first daytime period found
+    regardless of date" — that would silently accept a wrong-day match if
+    something upstream is genuinely broken; trying two specific, known
+    dates preserves the fail-loud behavior for anything stranger than
+    this specific, understood gap.
     """
     data    = get(forecast_url)
     props   = data["properties"]
@@ -293,32 +321,58 @@ def fetch_forecast_high_low(forecast_url: str, tz_name: str) -> dict:
     # ISO 8601 UTC string, e.g. "2026-04-13T06:38:15+00:00"
     forecast_issued_at = props.get("updateTime")
 
-    local_tz   = ZoneInfo(tz_name)
-    today_date = datetime.now(local_tz).date()
+    local_tz    = ZoneInfo(tz_name)
+    today_date  = datetime.now(local_tz).date()
 
-    forecast_high = None
-    forecast_low  = None
+    def _extract(for_date):
+        hi, lo = None, None
+        for period in periods:
+            start = datetime.fromisoformat(period["startTime"]).astimezone(local_tz)
+            if start.date() != for_date:
+                continue
+            temp   = period.get("temperature")
+            is_day = period.get("isDaytime", True)
+            if is_day and hi is None and temp is not None:
+                unit = period.get("temperatureUnit", "F")
+                hi   = c_to_f(temp) if unit == "C" else float(temp)
+            if not is_day and lo is None and temp is not None:
+                unit = period.get("temperatureUnit", "F")
+                lo   = c_to_f(temp) if unit == "C" else float(temp)
+        return hi, lo
 
-    for period in periods:
-        start  = datetime.fromisoformat(period["startTime"]).astimezone(local_tz)
-        if start.date() != today_date:
-            continue
+    forecast_high, forecast_low = _extract(today_date)
+    matched_high_via = "today" if forecast_high is not None else None
+    matched_low_via  = "today" if forecast_low  is not None else None
 
-        temp   = period.get("temperature")
-        is_day = period.get("isDaytime", True)
+    if forecast_high is None or forecast_low is None:
+        tomorrow_date = today_date + timedelta(days=1)
+        hi, lo = _extract(tomorrow_date)
+        if forecast_high is None and hi is not None:
+            forecast_high     = hi
+            matched_high_via  = "tomorrow-fallback"
+        if forecast_low is None and lo is not None:
+            forecast_low      = lo
+            matched_low_via   = "tomorrow-fallback"
+        if matched_high_via == "tomorrow-fallback" or matched_low_via == "tomorrow-fallback":
+            print(f"  [nws] {tz_name}: today's forecast period(s) not fully "
+                  f"found (local date {today_date}, market likely already "
+                  f"rolled over) — used tomorrow's ({tomorrow_date}) for "
+                  f"whichever was missing (high via {matched_high_via}, "
+                  f"low via {matched_low_via}).")
 
-        if is_day and forecast_high is None and temp is not None:
-            unit          = period.get("temperatureUnit", "F")
-            forecast_high = c_to_f(temp) if unit == "C" else float(temp)
-
-        if not is_day and forecast_low is None and temp is not None:
-            unit         = period.get("temperatureUnit", "F")
-            forecast_low = c_to_f(temp) if unit == "C" else float(temp)
+    target_date = today_date
+    matched_via = "today"
+    if "tomorrow-fallback" in (matched_high_via, matched_low_via):
+        matched_via = "mixed" if "today" in (matched_high_via, matched_low_via) else "tomorrow-fallback"
+        if matched_via == "tomorrow-fallback":
+            target_date = today_date + timedelta(days=1)
 
     return {
-        "forecast_high_f":    forecast_high,
-        "forecast_low_f":     forecast_low,
-        "forecast_issued_at": forecast_issued_at,
+        "forecast_high_f":       forecast_high,
+        "forecast_low_f":        forecast_low,
+        "forecast_issued_at":    forecast_issued_at,
+        "forecast_date_matched": target_date.isoformat(),
+        "forecast_matched_via":  matched_via,
     }
 
 
