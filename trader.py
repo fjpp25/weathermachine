@@ -464,11 +464,28 @@ class EngineCapital:
                 # now retired) to whatever cash happened to be free at that
                 # exact moment. Total value is far less sensitive to timing
                 # relative to settlements.
+                #
+                # CORRECTED same day: the first version of this fix summed
+                # p.get("current_price", 0) * p.get("position_fp", 1), which
+                # is wrong on two counts, confirmed against dashboard.py:
+                # (1) get_positions() returns RAW Kalshi data — "current_price"
+                # doesn't exist on it at all, that field only appears after
+                # trader.sync_from_kalshi()'s separate enrichment step, so it
+                # silently defaulted to 0 for every position (open_value
+                # computed to ~$0, budgets stayed free-cash-only — exactly
+                # what was observed live: every engine's "of $X" still
+                # matched BALANCE, not the higher PORTFOLIO figure, even
+                # after confirming a clean restart). (2) position_fp is
+                # SIGNED by side (negative for "no"), so even with a real
+                # price it would have subtracted value for our overwhelmingly
+                # No-side book instead of adding it. market_exposure_dollars
+                # is already a plain, non-negative dollar figure sitting
+                # directly on the raw position object — no extra API call,
+                # no sign handling, no dependency on the enrichment step.
                 free_cash = get_balance(client)
                 positions = get_positions(client)
                 open_value = sum(
-                    float(p.get("current_price", 0) or 0)
-                    * float(p.get("position_fp", p.get("contracts", 1)) or 1)
+                    float(p.get("market_exposure_dollars", 0) or 0)
                     for p in positions
                 )
                 self._balance = round(free_cash + open_value, 2)
