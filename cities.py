@@ -64,6 +64,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)        # observe-only — not yet calibrated
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Chicago": {
         "icao":             "KMDW",
@@ -82,6 +83,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Miami": {
         "icao":             "KMIA",
@@ -100,6 +102,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 1.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Austin": {
         "icao":             "KAUS",
@@ -118,6 +121,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 3.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Los Angeles": {
         "icao":             "KLAX",
@@ -136,6 +140,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "San Francisco": {
         "icao":             "KSFO",
@@ -155,6 +160,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 1.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Denver": {
         "icao":             "KDEN",
@@ -173,6 +179,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Philadelphia": {
         "icao":             "KPHL",
@@ -191,6 +198,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 4.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
 
     # -------------------------------------------------------------------------
@@ -214,6 +222,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Boston": {
         "icao":             "KBOS",
@@ -232,6 +241,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 5.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Washington DC": {
         "icao":             "KDCA",
@@ -250,6 +260,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   9,            # 10am ET expiry → 09:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 3.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Houston": {
         "icao":             "KHOU",
@@ -268,6 +279,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Phoenix": {
         "icao":             "KPHX",
@@ -286,6 +298,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   7,            # 10am ET expiry → 07:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 1.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Las Vegas": {
         "icao":             "KLAS",
@@ -304,6 +317,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Dallas": {
         "icao":             "KDFW",
@@ -322,6 +336,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "San Antonio": {
         "icao":             "KSAT",
@@ -340,6 +355,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    None,        # paused — no close needed
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Seattle": {
         "icao":             "KSEA",
@@ -358,6 +374,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   6,            # 10am ET expiry → 06:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "New Orleans": {
         "icao":             "KMSY",
@@ -376,6 +393,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.5,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Minneapolis": {
         "icao":             "KMSP",
@@ -394,6 +412,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
     "Oklahoma City": {
         "icao":             "KOKC",
@@ -412,6 +431,7 @@ CITIES: dict[str, dict] = {
         "trade_end_high":    24,
         "trade_start_lowt": None,        # observe-only — not yet calibrated
         "trade_end_lowt":   8,            # 10am ET expiry → 08:00 local (1h buffer)
+        "lowt_obs_gap_floor_f": 2.0,  # min obs_low_f - bracket_cap required, added 2026-07-09 per lowt_low_timing_analysis.py
     },
 }
 # fmt: on

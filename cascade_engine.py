@@ -73,6 +73,7 @@ Backtest (Apr 6–23, 18 days, 1 bad day):
   Scaled PnL (2/4/6 contracts): ~$40 over 18 days
 """
 
+import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -82,6 +83,21 @@ from market_utils import (
     no_price   as _no_price,
     yes_price  as _yes_price,
 )
+
+# PRE-EXISTING BUG, fixed 2026-07-09: _log was referenced throughout this
+# file (init position-recovery, cascade signal logging, etc.) but never
+# actually defined or imported anywhere — every _log.info/.warning/.debug
+# call would raise NameError the instant it executed. Checked the first
+# site (init position recovery, ~line 280): the actual dedup work happens
+# BEFORE the broken log call, so that specific case wasn't silently
+# skipping real functionality — but the exception handler's own log call
+# also referenced the undefined _log, so an uncaught NameError has likely
+# been propagating out of cascade's init routine this whole time via
+# whatever catches it further up the call stack. The other ~7 call sites
+# in this file haven't been individually audited for what they might be
+# silently skipping — worth a dedicated look, since this fix only stops
+# the crash going forward, it doesn't tell us what already went wrong.
+_log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -1172,7 +1188,38 @@ def _overnight_distance_signals(city: str, brackets: list[dict],
     return signals
 
 
-def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
+def _apply_obs_gap_gate(signals: list[dict], obs_low_f, floor: float) -> list[dict]:
+    """
+    Filter cascade LOWT signals to those with real physical confirmation.
+    Factored out from evaluate_city_cascade_lowt() so this can be tested
+    directly without needing to trigger the real trigger functions.
+    See evaluate_city_cascade_lowt()'s docstring/comment for the "why".
+    """
+    if obs_low_f is None or not signals:
+        return signals
+    kept = []
+    for s in signals:
+        cap = s.get("cap")
+        if cap is None:
+            kept.append(s)  # can't evaluate — don't silently drop it
+            continue
+        obs_gap = obs_low_f - cap
+        if obs_gap >= floor:
+            s["obs_gap_at_entry"] = round(obs_gap, 1)
+            kept.append(s)
+        else:
+            _log.info(
+                "cascade LOWT: %s dropped by physical confirmation gate "
+                "— obs_low=%.1f°F cap=%.1f°F obs_gap=%.1f°F < required "
+                "floor=%.1f°F (tier=%s)",
+                s.get("ticker"), obs_low_f, cap, obs_gap, floor,
+                s.get("entry_tier"),
+            )
+    return kept
+
+
+def evaluate_city_cascade_lowt(city: str, scan_data: dict,
+                               nws_data: dict = None) -> dict:
     """Evaluate LOWT cascade signals for a single city."""
     result = {
         "city":         city,
@@ -1212,6 +1259,29 @@ def evaluate_city_cascade_lowt(city: str, scan_data: dict) -> dict:
     # despite having KXLOWT... tickers.
     for s in result["signals"]:
         s["market_type"] = "lowt"
+
+    # PHYSICAL CONFIRMATION GATE (added 2026-07-09). Cascade's whole premise
+    # — bottom-up/top-down/ratchet alike — is "this bracket is effectively
+    # already eliminated", inferred INDIRECTLY from an adjacent bracket's
+    # price rather than DIRECTLY from obs_low_f the way Signal A does. That
+    # inference can be wrong even when it looks confident: a real loss on
+    # 2026-07-08 (KXLOWTNYC-26JUL08-B63.5, cascade_lowt_bu, entered at
+    # $0.78) is a confirmed case — the price ladder said "safe", the true
+    # low landed exactly on the bracket being bet against. Since Signal A
+    # and cascade share the same underlying premise, they get the same
+    # per-city safety margin here: require the SAME obs_low_f the rest of
+    # this session's analysis was built on to already clear this bracket's
+    # cap by at least the city's lowt_obs_gap_floor_f, regardless of what
+    # the price-ladder inference concluded on its own.
+    #
+    # Fails OPEN (keeps the signal) if obs_low_f is unavailable — a missing
+    # NWS reading is a different, separate problem this gate isn't meant to
+    # mask; it would otherwise silently disable cascade for that city
+    # whenever the NWS feed has a gap, which is worse than the risk this
+    # gate is meant to catch.
+    obs_low_f = (nws_data or {}).get("observed_low_f")
+    floor = _CITY_REGISTRY.get(city, {}).get("lowt_obs_gap_floor_f", 0.0)
+    result["signals"] = _apply_obs_gap_gate(result["signals"], obs_low_f, floor)
 
     return result
 
@@ -1282,13 +1352,15 @@ def run(kalshi_results: dict, city_filter: str = None, nws_results: dict = None)
 # Display
 # ---------------------------------------------------------------------------
 
-def run_lowt(kalshi_lowt_results: dict, city_filter: str = None) -> list[dict]:
+def run_lowt(kalshi_lowt_results: dict, city_filter: str = None,
+            nws_lowt_results: dict = None) -> list[dict]:
     """Run LOWT cascade evaluation for all cities."""
     evaluations = []
     for city, scan_data in kalshi_lowt_results.items():
         if city_filter and city.lower() != city_filter.lower():
             continue
-        evaluations.append(evaluate_city_cascade_lowt(city, scan_data))
+        nws_city = (nws_lowt_results or {}).get(city, {})
+        evaluations.append(evaluate_city_cascade_lowt(city, scan_data, nws_data=nws_city))
     return evaluations
 
 

@@ -147,17 +147,31 @@ def _bracket_cap(bracket: dict) -> Optional[float]:
 def _check_signal_a(
     bracket:   dict,
     obs_low_f: float,
+    floor:     float = 0.0,
 ) -> bool:
     """
     Return True if this bracket qualifies for Signal A.
 
-    Condition: observed low is already above the bracket cap.
-    The temperature has not reached this bracket — physically cannot resolve Yes.
+    Condition: observed low is already above the bracket cap BY AT LEAST
+    `floor` degrees. The temperature has not reached this bracket —
+    physically cannot resolve Yes — AND there's enough margin that it's
+    very unlikely to be walked back by further cooling before the true
+    daily low locks in.
+
+    `floor` defaults to 0.0 (the original behavior — any positive gap at
+    all qualifies) for backward compatibility, but every live caller should
+    pass cities.py's per-city lowt_obs_gap_floor_f. Added 2026-07-09 after
+    tools/lowt_low_timing_analysis.py found that on a city-dependent 5-17%
+    of days (much higher for a few outlier cities), the true low keeps
+    falling well past a thin gap — a real NYC loss on 2026-07-03
+    (KXLOWTNYC-26JUL03-T77) is a confirmed case of exactly this failure
+    mode. A flat floor of 0 doesn't distinguish "barely eliminated, could
+    still be walked back" from "comfortably eliminated".
     """
     cap = _bracket_cap(bracket)
     if cap is None:
         return False
-    return obs_low_f > cap
+    return obs_low_f > cap + floor
 
 
 # ---------------------------------------------------------------------------
@@ -282,10 +296,12 @@ def evaluate_city_lowt(
         signal_type = None
         skip_reason = None
 
+        city_cfg  = _CITIES.get(city, {})
+        obs_floor = city_cfg.get("lowt_obs_gap_floor_f", 0.0)
+
         if obs_low_f is not None and no_p >= A_NO_MIN and no_p < A_NO_MAX:
-            if _check_signal_a(bracket, obs_low_f):
+            if _check_signal_a(bracket, obs_low_f, floor=obs_floor):
                 # Also respect city trade deadline for Signal A
-                city_cfg  = _CITIES.get(city, {})
                 trade_end = city_cfg.get("trade_end_lowt")
                 if trade_end is None or local_hr < trade_end:
                     signal_type = "A"
@@ -346,6 +362,7 @@ def evaluate_city_lowt(
                     f"obs_low={obs_low_f:.1f}°F",
                     f"bracket_cap={cap:.1f}°F",
                     f"obs_gap={obs_gap:.1f}°F",
+                    f"required_floor={obs_floor:.1f}°F",
                 ]
             else:
                 detail += [
@@ -401,7 +418,8 @@ def run(
     # LOWT cascade — kept for future use, non-fatal if unavailable
     try:
         import cascade_engine
-        lowt_cascade = cascade_engine.run_lowt(kalshi_results, city_filter)
+        lowt_cascade = cascade_engine.run_lowt(kalshi_results, city_filter,
+                                               nws_lowt_results=nws)
         evaluations.extend(lowt_cascade)
     except Exception as e:
         log.debug("LOWT cascade skipped (non-fatal): %s", e)
