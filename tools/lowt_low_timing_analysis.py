@@ -120,6 +120,7 @@ def main():
 
     final_low_hours: dict[str, list] = {}
     still_falling_at_cutoff: dict[str, int] = {}
+    drop_magnitudes: dict[str, list] = {}
     total_days: dict[str, int] = {}
     violations: dict[str, list] = {}  # city -> list of (date, pre/post-fix bool)
 
@@ -151,6 +152,10 @@ def main():
                 )
             prev_val = val
 
+        if (cutoff is not None and low_at_cutoff is not None
+                and running_min is not None and running_min < low_at_cutoff - 1e-9):
+            drop_magnitudes.setdefault(city, []).append(low_at_cutoff - running_min)
+
         if final_low_hour is not None:
             final_low_hours.setdefault(city, []).append(final_low_hour)
 
@@ -160,8 +165,8 @@ def main():
                 still_falling_at_cutoff[city] += 1
 
     print(f"{'city':<16}{'cutoff':>7}{'days':>6}{'med_hr':>8}{'p90_hr':>8}"
-          f"{'max_hr':>8}{'still_falling':>15}{'violations':>12}")
-    print("-" * 88)
+          f"{'max_hr':>8}{'still_falling':>15}{'med_drop':>10}{'violations':>12}")
+    print("-" * 98)
     for city in sorted(total_days.keys()):
         cutoff = CITIES.get(city, {}).get("trade_end_lowt")
         hours = sorted(final_low_hours.get(city, []))
@@ -171,9 +176,23 @@ def main():
         mx = max(hours) if hours else None
         falling = still_falling_at_cutoff.get(city, 0)
         n_viol = len(violations.get(city, []))
+        drops = sorted(drop_magnitudes.get(city, []))
+        med_drop = f"{drops[len(drops)//2]:.2f}°F" if drops else "-"
         print(f"{city:<16}{str(cutoff):>7}{total_days[city]:>6}"
               f"{str(med):>8}{str(p90):>8}{str(mx):>8}"
-              f"{falling:>15}{n_viol:>12}")
+              f"{falling:>15}{med_drop:>10}{n_viol:>12}")
+
+    print(f"\n'med_drop' = median size of the post-cutoff drop, in the "
+          f"'still_falling' cases only (low_at_cutoff minus the eventual "
+          f"final low). This is the key number for telling two very "
+          f"different explanations apart: TINY drops (well under 1°F) look "
+          f"like a rolling-observation-window artifact re-surfacing a "
+          f"nearby reading, not a real event — the fix would be in how "
+          f"observed_low_f is computed, not the trading cutoff. LARGE "
+          f"drops (multiple °F) look like genuine late-day cooling (a cold "
+          f"front or rain arriving after the cutoff) — the fix would be "
+          f"pushing trade_end_lowt later for that city. Check this before "
+          f"acting on 'still_falling' alone.")
 
     all_violations = [v for vs in violations.values() for v in vs]
     if all_violations:
