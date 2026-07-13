@@ -50,12 +50,20 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Make the repo root importable regardless of cwd. This file lives at
+# <repo_root>/tools/loss_attribution.py, so the root is one level up from
+# this file's directory — running `python3 tools/loss_attribution.py` only
+# puts tools/ on sys.path by default, not the root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
 # Reuse the authenticated client + city metadata from the existing codebase.
 try:
     import trader
-    from cities import ALL_CITIES as _ALL_CITIES
+    from cities import CITIES as _ALL_CITIES, SERIES_TO_CITY as _SERIES_TO_CITY
 except ImportError as e:
-    print(f"ERROR: run this from the weathermachine repo root (needs trader.py, cities.py): {e}")
+    print(f"ERROR: could not import repo modules from {_REPO_ROOT} "
+          f"(needs trader.py, cities.py): {e}")
     sys.exit(1)
 
 
@@ -167,12 +175,14 @@ def load_trade_log() -> dict:
 
 
 def city_from_ticker(ticker: str) -> str:
-    # Tickers look like KXHIGHNY-... / KXLOWTNY-... ; city code follows the
-    # market prefix. We match against cities.py's known tickers rather than
-    # guessing string offsets.
-    for city, meta in _ALL_CITIES.items():
-        code = meta.get("ticker_code") or meta.get("code")
-        if code and code in ticker:
+    # cities.py already builds this reverse map (series_ticker -> city) via
+    # build_series_map(), exported as SERIES_TO_CITY. Match on prefix rather
+    # than substring-anywhere, since some series tickers are substrings of
+    # others (e.g. KXHIGHNY could false-match inside a longer unrelated
+    # ticker if checked with plain `in`).
+    upper = ticker.upper()
+    for series, city in _SERIES_TO_CITY.items():
+        if upper.startswith(series.upper() + "-"):
             return city
     return "?"
 
