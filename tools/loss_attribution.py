@@ -44,6 +44,7 @@ import argparse
 import csv as csvmod
 import json
 import math
+import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -355,6 +356,29 @@ def print_table(title: str, rows: list[dict]):
               f"{r['total_pnl']:>11.2f}{r['avg_pnl']:>10.3f}{r['ev_per_dollar']:>9.3f}")
 
 
+def load_config_into_env() -> None:
+    """Load Kalshi credentials from data/config.json into env vars, same
+    pattern as peak_scanner.py / app.py. trader.make_client() reads from
+    the environment, and this repo stores credentials in config.json rather
+    than a .env file, so that has to happen before make_client() is called."""
+    config_file = Path("data/config.json")
+    if not config_file.exists():
+        print(f"WARNING: {config_file} not found (cwd={Path.cwd()}). "
+              "Run this from the repo root, or set KALSHI_KEY_ID / "
+              "KALSHI_KEY_FILE env vars directly.")
+        return
+    try:
+        config = json.loads(config_file.read_text())
+    except Exception as e:
+        print(f"WARNING: could not parse {config_file}: {e}")
+        return
+    if config.get("key_id"):
+        os.environ.setdefault("KALSHI_KEY_ID", config["key_id"])
+    if config.get("key_file"):
+        os.environ.setdefault("KALSHI_KEY_FILE", config["key_file"])
+    os.environ["KALSHI_DEMO"] = "false" if config.get("live_mode") else "true"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--days", type=int, default=60, help="lookback window (default 60)")
@@ -362,6 +386,8 @@ def main():
     ap.add_argument("--top-losses", type=int, default=20, help="show N most expensive losses")
     ap.add_argument("--csv", type=str, default=None, help="dump raw enriched rows to CSV")
     args = ap.parse_args()
+
+    load_config_into_env()
 
     print(f"Fetching settlements (last {args.days} days)...")
     client = trader.make_client(skip_confirmation=True)
